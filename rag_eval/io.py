@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+from typing import Dict, List, Sequence, Tuple
+
+from rag_eval.models import Paragraph, SECTION_RE, Section
+
+EMPTY_TABLE_CELL = "[EMPTY]"
+
+
+def clean_text(text: str) -> str:
+    text = text.replace("\r", "\n")
+    text = re.sub(r"-\n(?=[a-zäöüß])", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def split_paragraphs(text: str) -> List[str]:
+    parts = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    if parts:
+        return parts
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines
+
+
+def normalize_table_cell(cell: str | None) -> str:
+    if cell is None:
+        return EMPTY_TABLE_CELL
+    normalized = clean_text(cell)
+    normalized = normalized.replace("\n", " / ").strip()
+    return normalized or EMPTY_TABLE_CELL
+
+
+def serialize_table_rows(rows: Sequence[Sequence[str | None]], table_index: int) -> str:
+    non_empty_rows = [list(row) for row in rows if any((cell or "").strip() for cell in row)]
+    if not non_empty_rows:
+        return ""
+
+    max_cols = max(len(row) for row in non_empty_rows)
+    lines = [f"[TABLE {table_index}]"]
+    for row in non_empty_rows:
+        padded = list(row) + [None] * (max_cols - len(row))
+        lines.append(" | ".join(normalize_table_cell(cell) for cell in padded))
+    return "\n".join(lines)
+
+
+def extract_page_text_outside_tables(page, table_bboxes: Sequence[Tuple[float, float, float, float]]) -> str:
+    if not table_bboxes:
+        return page.extract_text() or ""
+
+    filtered_page = page
+    try:
+        for bbox in table_bboxes:
+            filtered_page = filtered_page.outside_bbox(bbox)
+        return filtered_page.extract_text() or ""
+    except Exception:
+        return page.extract_text() or ""
+
+
+def extract_pdf_page_content(page) -> str:
+    table_blocks: List[str] = []
+    table_bboxes: List[Tuple[float, float, float, float]] = []
+
+    try:
+        tables = page.find_tables()
+    except Exception:
+        tables = []
+
+    for table_index, table in enumerate(tables, start=1):
+        serialized = serialize_table_rows(table.extract(), table_index)
+        if serialized:
+            table_blocks.append(serialized)
+            bbox = getattr(table, "bbox", None)
+            if bbox:
+                table_bboxes.append(bbox)
+
+    page_text = extract_page_text_outside_tables(page, table_bboxes)
+    parts = [part.strip() for part in [page_text, *table_blocks] if part and part.strip()]
+    return "\n\n".join(parts)
+
+
+def parse_pdf_sections(pdf_path: str) -> Tuple[str, List[Section]]:
+    import pdfplumber
+
+    doc_id = os.path.basename(pdf_path)
+    pages: List[str] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            pages.append(extract_pdf_page_content(page))
+
+    full_text = clean_text("\n\n".join(pages))
+    sections: List[Section] = []
+    cur_id = "PREAMBLE"
+    cur_title = "Preamble"
+    buf: List[str] = []
+
+    for raw_line in full_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            buf.append("")
+            continue
+
+        match = SECTION_RE.match(line)
+        if match:
+            if any(item.strip() for item in buf):
+                sections.append(
+                    Section(
+                        doc_id=doc_id,
+                        section_id=cur_id,
+                        title=cur_title,
+                        text="\n".join(buf).strip(),
+                    )
+                )
+            cur_id = f"§ {match.group(1)}"
+            cur_title = match.group(2).strip()
+            buf = []
+        else:
+            buf.append(line)
+
+    if any(item.strip() for item in buf):
+        sections.append(
+            Section(
+                doc_id=doc_id,
+                section_id=cur_id,
+                title=cur_title,
+                text="\n".join(buf).strip(),
+            )
+        )
+
+    return full_text, [section for section in sections if section.text]
+
+
+def extract_paragraphs(sections: Sequence[Section]) -> List[Paragraph]:
+    paragraphs: List[Paragraph] = []
+    for section in sections:
+        for idx, paragraph_text in enumerate(split_paragraphs(section.text)):
+            paragraphs.append(
+                Paragraph(
+                    paragraph_id=f"{section.doc_id}|{section.section_id}|p{idx}",
+                    doc_id=section.doc_id,
+                    section_id=section.section_id,
+                    title=section.title,
+                    paragraph_index=idx,
+                    text=paragraph_text,
+                )
+            )
+    return paragraphs
+
+
+def load_questions(qa_path: str) -> List[Dict]:
+    with open(qa_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and "questions" in data:
+        items = data["questions"]
+    elif isinstance(data, list):
+        items = data
+    else:
+        raise ValueError("Questions file should be a list or {'questions': [...]} object.")
+
+    normalized: List[Dict] = []
+    for idx, item in enumerate(items):
+        if "question" not in item:
+            raise ValueError(f"Question item at index {idx} is missing 'question'.")
+
+        row = dict(item)
+        row.setdefault("id", f"q{idx + 1}")
+        row.setdefault("gold_answer", "")
+        row.setdefault("expected_keywords", [])
+        normalized.append(row)
+    return normalized
+
+
+def resolve_doc_paths(patterns: str) -> List[str]:
+    matches: List[str] = []
+    for raw_pattern in patterns.split(","):
+        pattern = raw_pattern.strip()
+        if not pattern:
+            continue
+        found = sorted(glob.glob(pattern))
+        if not found and os.path.exists(pattern):
+            found = [pattern]
+        matches.extend(found)
+
+    unique_paths = sorted(dict.fromkeys(matches))
+    if not unique_paths:
+        raise FileNotFoundError(f"No documents matched: {patterns}")
+    return unique_paths
