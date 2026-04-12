@@ -28,6 +28,75 @@ def parse_csv_list(raw_value: str) -> List[int]:
     return [int(item.strip()) for item in raw_value.split(",") if item.strip()]
 
 
+def list_field(value: object) -> List[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item)]
+    return [str(value)]
+
+
+def question_metadata_filter(item: Dict, *, include_document: bool) -> Dict[str, object]:
+    metadata_filter: Dict[str, object] = {}
+    fields = [
+        ("program_id", "program_ids"),
+        ("program_name", "program_names"),
+    ]
+    if include_document:
+        fields.extend(
+            [
+                ("doc_id", "doc_ids"),
+                ("doc_path", "doc_paths"),
+            ]
+        )
+    for singular, plural in fields:
+        values = list_field(item.get(singular)) + list_field(item.get(plural))
+        if values:
+            metadata_filter[singular] = values
+    return metadata_filter
+
+
+def normalize_metadata_value(value: object) -> str:
+    normalized = str(value).casefold()
+    normalized = normalized.replace("&", "and").replace("/", " ")
+    normalized = "".join(char for char in normalized if char.isascii())
+    normalized = "".join(char if char.isalnum() else " " for char in normalized)
+    aliases = {
+        "ba": "bachelor",
+        "bpo": "bachelor",
+        "ma": "master",
+        "mpo": "master",
+        "sciences": "science",
+    }
+    return " ".join(aliases.get(token, token) for token in normalized.split())
+
+
+def metadata_value_matches(actual: object, expected: object) -> bool:
+    actual_norm = normalize_metadata_value(actual)
+    expected_norm = normalize_metadata_value(expected)
+    return (
+        actual_norm == expected_norm
+        or actual_norm in expected_norm
+        or expected_norm in actual_norm
+    )
+
+
+def filter_chunks_by_metadata(chunks: Sequence[Dict], metadata_filter: Dict[str, object]) -> List[Dict]:
+    if not metadata_filter:
+        return list(chunks)
+    filtered: List[Dict] = []
+    for chunk in chunks:
+        matches = True
+        for key, expected in metadata_filter.items():
+            values = expected if isinstance(expected, (list, tuple, set)) else [expected]
+            if not any(metadata_value_matches(chunk.get(key, ""), value) for value in values):
+                matches = False
+                break
+        if matches:
+            filtered.append(chunk)
+    return filtered
+
+
 def build_run_dir(base_output_dir: str, run_name: Optional[str]) -> str:
     run_id = run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(base_output_dir, run_id)
@@ -83,12 +152,22 @@ def run_single_experiment(
     retrieval_metric_rows: List[Dict] = []
     diagnostic_rows: List[Dict] = []
     for item in questions:
+        answer_metadata_filter = question_metadata_filter(item, include_document=False)
+        evaluation_metadata_filter = question_metadata_filter(item, include_document=True)
+        candidate_chunks = filter_chunks_by_metadata(chunks, evaluation_metadata_filter)
+        if evaluation_metadata_filter and not candidate_chunks:
+            raise ValueError(
+                f"Question {item['id']} has evaluation metadata filter {evaluation_metadata_filter}, "
+                "but no chunks match it."
+            )
+        answer_scope_chunks = filter_chunks_by_metadata(chunks, answer_metadata_filter)
         retrieved = retrieve_top_k(
             query=item["question"],
             retriever_state=retriever_state,
             chunks=chunks,
-            k=min(top_k, len(chunks)),
+            k=min(top_k, len(answer_scope_chunks or chunks)),
             hybrid_alpha=hybrid_alpha,
+            metadata_filter=answer_metadata_filter,
         )
         llm_result = generate_answer_with_llm(item["question"], retrieved, llm_config)
         answer = llm_result.answer
@@ -100,8 +179,8 @@ def run_single_experiment(
         retrieval_metrics = evaluate_retrieval_metrics(
             item=item,
             retrieved=retrieved,
-            candidate_chunks=chunks,
-            k=min(top_k, len(chunks)),
+            candidate_chunks=candidate_chunks,
+            k=min(top_k, len(candidate_chunks)),
         )
         auto_flag = answer_metrics.answer_accuracy_label
         diagnostics = diagnose_failure(
@@ -116,12 +195,20 @@ def run_single_experiment(
                 {
                     "question_id": item["id"],
                     "question": item["question"],
+                    "question_program_id": item.get("program_id", ""),
+                    "question_program_name": item.get("program_name", ""),
+                    "question_doc_id": item.get("doc_id", ""),
+                    "answer_scope": json.dumps(answer_metadata_filter, ensure_ascii=False),
+                    "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                     "rank": rank,
                     "auto_flag": auto_flag,
                     "retriever": retriever_type,
                     "chunk_id": row["chunk_id"],
                     "score": row["score"],
                     "doc_id": row["doc_id"],
+                    "doc_path": row.get("doc_path", row["doc_id"]),
+                    "program_id": row.get("program_id", ""),
+                    "program_name": row.get("program_name", ""),
                     "section_id": row["section_id"],
                     "title": row["title"],
                     "chunking_strategy": row["chunking_strategy"],
@@ -134,12 +221,17 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "program_id": item.get("program_id", ""),
+                "program_name": item.get("program_name", ""),
+                "doc_id": item.get("doc_id", ""),
+                "answer_scope": json.dumps(answer_metadata_filter, ensure_ascii=False),
+                "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "answer_accuracy_label": answer_metrics.answer_accuracy_label,
                 "llm_used": llm_result.used,
                 "llm_status": llm_result.status,
                 "llm_error": llm_result.error,
-                "answer_keyword_coverage": answer_metrics.answer_keyword_coverage,
                 "gold_answer_overlap": answer_metrics.gold_answer_overlap,
+                "answer_gold_support": answer_metrics.answer_gold_support,
                 "proxy_faithfulness": answer_metrics.proxy_faithfulness,
                 "proxy_context_relevance": answer_metrics.proxy_context_relevance,
                 "answer_has_gold_substring": answer_metrics.answer_has_gold_substring,
@@ -149,6 +241,11 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "program_id": item.get("program_id", ""),
+                "program_name": item.get("program_name", ""),
+                "doc_id": item.get("doc_id", ""),
+                "answer_scope": json.dumps(answer_metadata_filter, ensure_ascii=False),
+                "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],  # reciprocal rank of first relevant chunk in top-k
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],  # how well relevant chunks are ordered near the top
                 "recall_at_k": retrieval_metrics["recall_at_k"],  # share of all relevant chunks captured in top-k
@@ -156,12 +253,20 @@ def run_single_experiment(
                 "first_relevant_rank": retrieval_metrics["first_relevant_rank"],  # position of first relevant chunk
                 "n_relevant_chunks": retrieval_metrics["n_relevant_chunks"],  # total relevant chunks in the candidate pool
                 "n_retrieved_relevant_chunks": retrieval_metrics["n_retrieved_relevant_chunks"],  # relevant chunks found in top-k
+                "target_doc_retrieved_at_k": retrieval_metrics["target_doc_retrieved_at_k"],  # whether top-k contains the hidden target doc_id
+                "first_target_doc_rank": retrieval_metrics["first_target_doc_rank"],  # first rank from the hidden target doc_id
+                "n_retrieved_target_doc_chunks": retrieval_metrics["n_retrieved_target_doc_chunks"],  # top-k chunks from target doc_id
             }
         )
         diagnostic_rows.append(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "program_id": item.get("program_id", ""),
+                "program_name": item.get("program_name", ""),
+                "doc_id": item.get("doc_id", ""),
+                "answer_scope": json.dumps(answer_metadata_filter, ensure_ascii=False),
+                "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
                 "explanation": diagnostics.explanation,
@@ -172,6 +277,11 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "program_id": item.get("program_id", ""),
+                "program_name": item.get("program_name", ""),
+                "doc_id": item.get("doc_id", ""),
+                "answer_scope": json.dumps(answer_metadata_filter, ensure_ascii=False),
+                "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "gold_answer": item.get("gold_answer", ""),
                 "expected_keywords": json.dumps(item.get("expected_keywords", []), ensure_ascii=False),
                 "retrieved_chunk_ids": json.dumps(
@@ -181,8 +291,13 @@ def run_single_experiment(
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
                 "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
-                "answer_keyword_coverage": answer_metrics.answer_keyword_coverage,
+                "target_doc_retrieved_at_k": retrieval_metrics["target_doc_retrieved_at_k"],
+                "first_target_doc_rank": retrieval_metrics["first_target_doc_rank"],
+                "n_retrieved_target_doc_chunks": retrieval_metrics[
+                    "n_retrieved_target_doc_chunks"
+                ],
                 "gold_answer_overlap": answer_metrics.gold_answer_overlap,
+                "answer_gold_support": answer_metrics.answer_gold_support,
                 "proxy_faithfulness": answer_metrics.proxy_faithfulness,
                 "proxy_context_relevance": answer_metrics.proxy_context_relevance,
                 "llm_status": llm_result.status,

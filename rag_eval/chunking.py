@@ -33,6 +33,9 @@ def make_fixed_chunks(
                 {
                     "chunk_id": f"{item['source_id']}|c{chunk_index}",
                     "doc_id": item["doc_id"],
+                    "doc_path": item["doc_path"],
+                    "program_id": item["program_id"],
+                    "program_name": item["program_name"],
                     "section_id": item["section_id"],
                     "title": item["title"],
                     "text": " ".join(chunk_words),
@@ -61,6 +64,9 @@ def chunk_by_section(sections: Sequence[Section]) -> List[Dict]:
             {
                 "chunk_id": f"{section.doc_id}|{section.section_id}|section",
                 "doc_id": section.doc_id,
+                "doc_path": section.doc_path,
+                "program_id": section.program_id,
+                "program_name": section.program_name,
                 "section_id": section.section_id,
                 "title": section.title,
                 "text": section.text,
@@ -85,6 +91,9 @@ def chunk_by_paragraph(paragraphs: Sequence[Paragraph]) -> List[Dict]:
             {
                 "chunk_id": f"{paragraph.paragraph_id}|paragraph",
                 "doc_id": paragraph.doc_id,
+                "doc_path": paragraph.doc_path,
+                "program_id": paragraph.program_id,
+                "program_name": paragraph.program_name,
                 "section_id": paragraph.section_id,
                 "title": paragraph.title,
                 "text": paragraph.text,
@@ -113,6 +122,9 @@ def build_chunks(
             {
                 "source_id": f"{section.doc_id}|{section.section_id}",
                 "doc_id": section.doc_id,
+                "doc_path": section.doc_path,
+                "program_id": section.program_id,
+                "program_name": section.program_name,
                 "section_id": section.section_id,
                 "title": section.title,
                 "text": section.text,
@@ -128,6 +140,9 @@ def build_chunks(
             {
                 "source_id": paragraph.paragraph_id,
                 "doc_id": paragraph.doc_id,
+                "doc_path": paragraph.doc_path,
+                "program_id": paragraph.program_id,
+                "program_name": paragraph.program_name,
                 "section_id": paragraph.section_id,
                 "title": paragraph.title,
                 "text": paragraph.text,

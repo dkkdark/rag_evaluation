@@ -18,11 +18,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate a baseline RAG pipeline with reusable chunking experiments."
     )
-    parser.add_argument("--docs", required=True, help="PDF path, glob, or comma-separated list.")
+    parser.add_argument(
+        "--docs",
+        default="files/**/*.pdf*",
+        help="PDF path, directory, glob, or comma-separated list. Defaults to files/**/*.pdf*.",
+    )
+    parser.add_argument(
+        "--docs-root",
+        default="files",
+        help="Root directory used to infer program names and stable relative doc_ids.",
+    )
     parser.add_argument(
         "--questions",
-        default="outputs/questions_enriched.json",
-        help="Path to questions JSON. Defaults to outputs/questions_enriched.json.",
+        default="questions_enriched.json",
+        help="Path to questions JSON. Defaults to questions_enriched.json in the project root.",
     )
     parser.add_argument("--output-dir", default="outputs", help="Base directory for run artifacts.")
     parser.add_argument("--run-name", default=None, help="Optional stable run directory name.")
@@ -108,6 +117,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="OPENAI_API_KEY",
         help="Environment variable name containing the OpenAI API key.",
     )
+    parser.add_argument(
+        "--llm-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the answer-generation LLM.",
+    )
     return parser
 
 
@@ -126,13 +141,15 @@ def main() -> None:
         enabled=args.llm_enable,
         model=args.llm_model,
         api_key_env=args.openai_api_key_env,
+        temperature=args.llm_temperature,
     )
 
     all_sections: List[Section] = []
     raw_parts: List[str] = []
     for path in doc_paths:
-        raw_text, sections = parse_pdf_sections(path)
-        raw_parts.append(f"===== {os.path.basename(path)} =====\n{raw_text}")
+        raw_text, sections = parse_pdf_sections(path, docs_root=args.docs_root)
+        title = sections[0].doc_id if sections else os.path.basename(path)
+        raw_parts.append(f"===== {title} =====\n{raw_text}")
         all_sections.extend(sections)
 
     paragraphs = extract_paragraphs(all_sections)
@@ -243,6 +260,7 @@ def main() -> None:
     run_summary = {
         "run_dir": run_dir,
         "documents": doc_paths,
+        "docs_root": args.docs_root,
         "questions_path": args.questions,
         "n_documents": len(doc_paths),
         "n_sections": len(all_sections),
@@ -274,6 +292,9 @@ def main() -> None:
             "required": ["question"],
             "recommended": [
                 "id",
+                "program_id",
+                "program_name",
+                "doc_id",
                 "gold_answer",
                 "expected_keywords",
             ],
@@ -281,9 +302,9 @@ def main() -> None:
         "notes": [
             "Pipeline includes CLI, normalized ingestion, multiple chunking strategies, multiple retrievers, grounded answer generation, answer metrics, diagnostics, and experiment ranking.",
             "Fixed_tokens currently uses whitespace tokenization over paragraphs as an offline-friendly approximation.",
-            "Retrieval metrics are omitted because the simplified question schema no longer includes gold chunk or section annotations.",
+            "Questions can include program_id/program_name for answer-time retrieval scope and doc_id as a hidden evaluation target.",
             "Answer metrics remain heuristic; LLM is used only for grounded answer generation after retrieval.",
-            "Questions are expected to come from a prebuilt enriched dataset such as outputs/questions_enriched.json.",
+            "Questions are expected to come from a prebuilt enriched dataset such as questions_enriched.json in the project root.",
         ],
     }
 

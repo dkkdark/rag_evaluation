@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Dict, List, Sequence, Tuple
 
 from rag_eval.chunking import chunk_by_section
@@ -57,6 +58,43 @@ def get_sentence_transformer(model_name: str):
     model = SentenceTransformer(model_name)
     _SENTENCE_TRANSFORMER_CACHE[model_name] = model
     return model
+
+
+def normalize_metadata_value(value: object) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value).casefold())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.replace("&", "and").replace("/", " ")
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    aliases = {
+        "ba": "bachelor",
+        "bpo": "bachelor",
+        "ma": "master",
+        "mpo": "master",
+        "sciences": "science",
+    }
+    return " ".join(aliases.get(token, token) for token in normalized.split())
+
+
+def metadata_value_matches(actual: object, expected: object) -> bool:
+    actual_norm = normalize_metadata_value(actual)
+    expected_norm = normalize_metadata_value(expected)
+    return (
+        actual_norm == expected_norm
+        or actual_norm in expected_norm
+        or expected_norm in actual_norm
+    )
+
+
+def chunk_matches_filter(chunk: Dict, metadata_filter: Dict[str, object] | None) -> bool:
+    if not metadata_filter:
+        return True
+    for key, expected in metadata_filter.items():
+        if expected is None or expected == "" or expected == []:
+            continue
+        values = expected if isinstance(expected, (list, tuple, set)) else [expected]
+        if not any(metadata_value_matches(chunk.get(key, ""), value) for value in values):
+            return False
+    return True
 
 
 # TF-IDF is a simple lexical retriever: it ranks chunks higher when they share
@@ -142,8 +180,12 @@ def retrieve_top_k(
     chunks: Sequence[Dict],
     k: int,
     hybrid_alpha: float = 0.5,
+    metadata_filter: Dict[str, object] | None = None,
 ) -> List[Dict]:
     import numpy as np
+
+    if k <= 0:
+        return []
 
     if retriever_state["backend"] == "dense":
         q = retriever_state["model"].encode(
@@ -151,37 +193,50 @@ def retrieve_top_k(
             convert_to_numpy=True,
             normalize_embeddings=True,
         ).astype("float32")
-        scores, indices = retriever_state["index"].search(q, min(k, len(chunks)))
+        search_k = len(chunks) if metadata_filter else min(k, len(chunks))
+        scores, indices = retriever_state["index"].search(q, search_k)
         out: List[Dict] = []
         for score, idx in zip(scores[0], indices[0]):
             row = dict(chunks[int(idx)])
+            if not chunk_matches_filter(row, metadata_filter):
+                continue
             row["score"] = float(score)
             row["retriever"] = "dense"
             out.append(row)
+            if len(out) >= k:
+                break
         return out
 
     if retriever_state["backend"] == "tfidf":
         q = retriever_state["vectorizer"].transform([query])
         scores = (retriever_state["matrix"] @ q.T).toarray().ravel()
-        order = np.argsort(-scores)[: min(k, len(chunks))]
+        order = np.argsort(-scores)
         out = []
         for idx in order:
             row = dict(chunks[int(idx)])
+            if not chunk_matches_filter(row, metadata_filter):
+                continue
             row["score"] = float(scores[int(idx)])
             row["retriever"] = "tfidf"
             out.append(row)
+            if len(out) >= k:
+                break
         return out
 
     if retriever_state["backend"] == "bm25":
         tokenized_query = tokenize_for_bm25(query)
         scores = np.asarray(retriever_state["bm25"].get_scores(tokenized_query), dtype=float)
-        order = np.argsort(-scores)[: min(k, len(chunks))]
+        order = np.argsort(-scores)
         out = []
         for idx in order:
             row = dict(chunks[int(idx)])
+            if not chunk_matches_filter(row, metadata_filter):
+                continue
             row["score"] = float(scores[int(idx)])
             row["retriever"] = "bm25"
             out.append(row)
+            if len(out) >= k:
+                break
         return out
 
     if retriever_state["backend"] == "hybrid":
@@ -191,6 +246,7 @@ def retrieve_top_k(
             chunks=chunks,
             k=len(chunks),
             hybrid_alpha=hybrid_alpha,
+            metadata_filter=metadata_filter,
         )
         bm25_rows = retrieve_top_k(
             query=query,
@@ -198,6 +254,7 @@ def retrieve_top_k(
             chunks=chunks,
             k=len(chunks),
             hybrid_alpha=hybrid_alpha,
+            metadata_filter=metadata_filter,
         )
         dense_scores = {row["chunk_id"]: row["score"] for row in dense_rows}
         bm25_scores = {row["chunk_id"]: row["score"] for row in bm25_rows}
@@ -209,6 +266,8 @@ def retrieve_top_k(
         # reward both exact terminology and meaning-level similarity.
         combined: List[Dict] = []
         for chunk in chunks:
+            if not chunk_matches_filter(chunk, metadata_filter):
+                continue
             chunk_id = chunk["chunk_id"]
             dense_score = dense_norm.get(chunk_id, 0.0)
             bm25_score = bm25_norm.get(chunk_id, 0.0)

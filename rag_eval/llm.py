@@ -32,6 +32,7 @@ def call_llm_json(
     client: Any,
     *,
     model: str,
+    temperature: float,
     system_prompt: str,
     user_prompt: str,
     schema_name: str,
@@ -39,6 +40,7 @@ def call_llm_json(
 ) -> Dict:
     response = client.responses.create(
         model=model,
+        temperature=temperature,
         input=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -84,11 +86,12 @@ def generate_answer_with_llm(
     )
     try:
         print(
-            f"[LLM] question={question!r} model={llm_config.model} status=request_started",
+            f"[LLM] question={question!r} model={llm_config.model} temperature={llm_config.temperature} status=request_started",
             file=sys.stderr,
         )
         response = client.responses.create(
             model=llm_config.model,
+            temperature=llm_config.temperature,
             input=[
                 {
                     "role": "system",
@@ -112,7 +115,7 @@ def generate_answer_with_llm(
         answer = answer.strip()
         if not answer:
             print(
-                f"[LLM] question={question!r} model={llm_config.model} status=empty_response",
+                f"[LLM] question={question!r} model={llm_config.model} temperature={llm_config.temperature} status=empty_response",
                 file=sys.stderr,
             )
             return LLMCallResult(
@@ -122,13 +125,13 @@ def generate_answer_with_llm(
                 error="LLM returned an empty response.",
             )
         print(
-            f"[LLM] question={question!r} model={llm_config.model} status=success",
+            f"[LLM] question={question!r} model={llm_config.model} temperature={llm_config.temperature} status=success",
             file=sys.stderr,
         )
         return LLMCallResult(answer=answer, used=True, status="success", error=None)
     except Exception as exc:
         print(
-            f"[LLM] question={question!r} model={llm_config.model} status=error error={exc}",
+            f"[LLM] question={question!r} model={llm_config.model} temperature={llm_config.temperature} status=error error={exc}",
             file=sys.stderr,
         )
         return LLMCallResult(answer=None, used=True, status="error", error=str(exc))

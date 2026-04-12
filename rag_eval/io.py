@@ -4,11 +4,18 @@ import glob
 import json
 import os
 import re
+import unicodedata
 from typing import Dict, List, Sequence, Tuple
 
 from rag_eval.models import Paragraph, SECTION_RE, Section
 
 EMPTY_TABLE_CELL = "[EMPTY]"
+
+
+def slugify(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+    return normalized or "unknown"
 
 
 def clean_text(text: str) -> str:
@@ -84,10 +91,24 @@ def extract_pdf_page_content(page) -> str:
     return "\n\n".join(parts)
 
 
-def parse_pdf_sections(pdf_path: str) -> Tuple[str, List[Section]]:
+def infer_document_metadata(pdf_path: str, docs_root: str | None = None) -> Dict[str, str]:
+    normalized_path = os.path.normpath(pdf_path)
+    doc_path = os.path.relpath(normalized_path, docs_root) if docs_root else normalized_path
+    doc_path = doc_path.replace(os.sep, "/")
+    parent = os.path.dirname(doc_path)
+    program_name = parent.split("/")[0] if parent else "root"
+    return {
+        "doc_id": doc_path,
+        "doc_path": doc_path,
+        "program_id": slugify(program_name),
+        "program_name": program_name,
+    }
+
+
+def parse_pdf_sections(pdf_path: str, docs_root: str | None = None) -> Tuple[str, List[Section]]:
     import pdfplumber
 
-    doc_id = os.path.basename(pdf_path)
+    metadata = infer_document_metadata(pdf_path, docs_root)
     pages: List[str] = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -110,7 +131,10 @@ def parse_pdf_sections(pdf_path: str) -> Tuple[str, List[Section]]:
             if any(item.strip() for item in buf):
                 sections.append(
                     Section(
-                        doc_id=doc_id,
+                        doc_id=metadata["doc_id"],
+                        doc_path=metadata["doc_path"],
+                        program_id=metadata["program_id"],
+                        program_name=metadata["program_name"],
                         section_id=cur_id,
                         title=cur_title,
                         text="\n".join(buf).strip(),
@@ -125,7 +149,10 @@ def parse_pdf_sections(pdf_path: str) -> Tuple[str, List[Section]]:
     if any(item.strip() for item in buf):
         sections.append(
             Section(
-                doc_id=doc_id,
+                doc_id=metadata["doc_id"],
+                doc_path=metadata["doc_path"],
+                program_id=metadata["program_id"],
+                program_name=metadata["program_name"],
                 section_id=cur_id,
                 title=cur_title,
                 text="\n".join(buf).strip(),
@@ -143,6 +170,9 @@ def extract_paragraphs(sections: Sequence[Section]) -> List[Paragraph]:
                 Paragraph(
                     paragraph_id=f"{section.doc_id}|{section.section_id}|p{idx}",
                     doc_id=section.doc_id,
+                    doc_path=section.doc_path,
+                    program_id=section.program_id,
+                    program_name=section.program_name,
                     section_id=section.section_id,
                     title=section.title,
                     paragraph_index=idx,
@@ -172,6 +202,9 @@ def load_questions(qa_path: str) -> List[Dict]:
         row.setdefault("id", f"q{idx + 1}")
         row.setdefault("gold_answer", "")
         row.setdefault("expected_keywords", [])
+        row.setdefault("program_id", "")
+        row.setdefault("program_name", "")
+        row.setdefault("doc_id", "")
         normalized.append(row)
     return normalized
 
@@ -182,7 +215,10 @@ def resolve_doc_paths(patterns: str) -> List[str]:
         pattern = raw_pattern.strip()
         if not pattern:
             continue
-        found = sorted(glob.glob(pattern))
+        if os.path.isdir(pattern):
+            found = sorted(glob.glob(os.path.join(pattern, "**", "*.pdf*"), recursive=True))
+        else:
+            found = sorted(glob.glob(pattern, recursive=True))
         if not found and os.path.exists(pattern):
             found = [pattern]
         matches.extend(found)

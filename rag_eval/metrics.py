@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from functools import lru_cache
 from math import log2
 from typing import Dict, List, Optional, Sequence
 
@@ -35,6 +36,31 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalize_metadata_value(value: object) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value).casefold())
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.replace("&", "and").replace("/", " ")
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    aliases = {
+        "ba": "bachelor",
+        "bpo": "bachelor",
+        "ma": "master",
+        "mpo": "master",
+        "sciences": "science",
+    }
+    return " ".join(aliases.get(token, token) for token in normalized.split())
+
+
+def metadata_value_matches(actual: object, expected: object) -> bool:
+    actual_norm = normalize_metadata_value(actual)
+    expected_norm = normalize_metadata_value(expected)
+    return (
+        actual_norm == expected_norm
+        or actual_norm in expected_norm
+        or expected_norm in actual_norm
+    )
+
+
 # Remove punctuation noise so comparisons depend more on content than formatting.
 def normalize_for_matching(text: str) -> str:
     text = normalize_text(text)
@@ -43,15 +69,65 @@ def normalize_for_matching(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+@lru_cache(maxsize=1)
+def get_spacy_lemmatizer():
+    try:
+        import spacy
+
+        return spacy.load("de_core_news_sm", disable=["parser", "ner"])
+    except Exception:
+        return None
+
+
+def fallback_german_lemma(token: str) -> str:
+    if len(token) <= 4 or any(char.isdigit() for char in token):
+        return token
+    irregular = {
+        "prüfungen": "prüfung",
+        "leistungen": "leistung",
+        "module": "modul",
+        "modulen": "modul",
+        "studiengänge": "studiengang",
+        "studiengängen": "studiengang",
+        "voraussetzungen": "voraussetzung",
+        "kenntnisse": "kenntnis",
+        "punkte": "punkt",
+        "punkten": "punkt",
+        "semester": "semester",
+    }
+    if token in irregular:
+        return irregular[token]
+    for suffix in ["innen", "ungen", "heiten", "keiten", "ischen", "lichem", "licher", "liche", "ungen", "ern", "en", "er", "es", "e", "n", "s"]:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            return token[: -len(suffix)]
+    return token
+
+
+def lemmatize_text(text: str) -> str:
+    normalized = normalize_for_matching(text)
+    if not normalized:
+        return ""
+
+    nlp = get_spacy_lemmatizer()
+    if nlp is not None:
+        return " ".join(
+            token.lemma_.casefold()
+            for token in nlp(normalized)
+            if token.lemma_.strip()
+        )
+
+    return " ".join(fallback_german_lemma(token) for token in normalized.split())
+
+
 # Produce reusable normalized tokens for overlap checks and keyword matching.
 def matching_tokens(text: str) -> List[str]:
-    return re.findall(r"\w+", normalize_for_matching(text), flags=re.UNICODE)
+    return re.findall(r"\w+", lemmatize_text(text), flags=re.UNICODE)
 
 
 # Match either by normalized phrase or by token inclusion to allow mild paraphrasing.
 def text_matches_keyword(text: str, keyword: str) -> bool:
-    normalized_text = normalize_for_matching(text)
-    normalized_keyword = normalize_for_matching(keyword)
+    normalized_text = lemmatize_text(text)
+    normalized_keyword = lemmatize_text(keyword)
     if not normalized_keyword:
         return False
     if normalized_keyword in normalized_text:
@@ -88,36 +164,25 @@ def token_overlap_fraction(source_text: str, reference_text: str) -> Optional[fl
     return len(source_tokens.intersection(reference_tokens)) / len(source_tokens)
 
 
-# Relax the threshold for long keyword lists because long checklist answers are
-# harder to reproduce fully.
-def keyword_threshold(keyword_count: int) -> float:
-    if keyword_count <= 5:
-        return 0.8
-    if keyword_count <= 10:
-        return 0.7
-    if keyword_count <= 16:
-        return 0.6
-    return 0.5
-
-
-# Partial-credit threshold is lower so concise but useful answers are not
-# over-penalized.
-def partial_keyword_threshold(keyword_count: int) -> float:
-    if keyword_count <= 5:
-        return 0.5
-    if keyword_count <= 10:
-        return 0.45
-    if keyword_count <= 16:
-        return 0.4
-    return 0.3
+def answer_new_information_support(answer: str, question: str, gold_answer: str) -> Optional[float]:
+    answer_tokens = set(informative_tokens(answer))
+    if not answer_tokens:
+        return None
+    question_tokens = set(informative_tokens(question))
+    new_answer_tokens = answer_tokens.difference(question_tokens)
+    if not new_answer_tokens:
+        new_answer_tokens = answer_tokens
+    gold_tokens = set(informative_tokens(gold_answer))
+    if not gold_tokens:
+        return 0.0
+    return len(new_answer_tokens.intersection(gold_tokens)) / len(new_answer_tokens)
 
 
 # Combine coverage and grounding signals into one practical label for evaluation.
 def classify_answer(
     *,
-    keyword_count: int,
-    keyword_coverage: Optional[float],
     gold_answer_overlap: Optional[float],
+    answer_gold_support: Optional[float],
     answer_has_gold_substring: Optional[bool],
     faithfulness: Optional[float],
 ) -> str:
@@ -130,13 +195,12 @@ def classify_answer(
     strong_signal = False
     partial_signal = False
 
-    if keyword_coverage is not None:
-        strong_signal = keyword_coverage >= keyword_threshold(keyword_count)
-        partial_signal = keyword_coverage >= partial_keyword_threshold(keyword_count)
-
     if gold_answer_overlap is not None:
         strong_signal = strong_signal or gold_answer_overlap >= 0.55
         partial_signal = partial_signal or gold_answer_overlap >= 0.35
+    if answer_gold_support is not None:
+        strong_signal = strong_signal or answer_gold_support >= 0.7
+        partial_signal = partial_signal or answer_gold_support >= 0.55
 
     if clearly_unsupported and (strong_signal or partial_signal):
         return "unsupported"
@@ -157,29 +221,32 @@ def evaluate_answer_metrics(
     retrieved: Sequence[Dict],
 ) -> AnswerMetricResult:
     context_text = "\n".join(row["text"] for row in retrieved) # retrieved chuncks in one text
-    expected_keywords = item.get("expected_keywords", [])
-    answer_keyword_coverage = fraction_present(expected_keywords, answer)
     context_relevance = token_overlap_fraction(item["question"], context_text) if context_text.strip() else None
     faithfulness = token_overlap_fraction(answer, context_text) if context_text.strip() else None
     gold_answer = str(item.get("gold_answer", "")).strip()
     answer_has_gold_substring = None
     gold_answer_overlap = None
+    answer_gold_support = None
     if gold_answer:
         answer_has_gold_substring = normalize_text(gold_answer) in normalize_text(answer)
         gold_answer_overlap = token_overlap_fraction(gold_answer, answer)
+        answer_gold_support = answer_new_information_support(
+            answer=answer,
+            question=item["question"],
+            gold_answer=gold_answer,
+        )
 
     final_label = classify_answer(
-        keyword_count=len(expected_keywords),
-        keyword_coverage=answer_keyword_coverage,
         gold_answer_overlap=gold_answer_overlap,
+        answer_gold_support=answer_gold_support,
         answer_has_gold_substring=answer_has_gold_substring,
         faithfulness=faithfulness,
     )
 
     return AnswerMetricResult(
         answer_accuracy_label=final_label,
-        answer_keyword_coverage=answer_keyword_coverage, # number of keywords found / total number of keywords
         gold_answer_overlap=gold_answer_overlap, # the proportion of gold answer to the actual answer
+        answer_gold_support=answer_gold_support, # the proportion of the actual answer that is covered by the gold answer
         proxy_faithfulness=faithfulness, # the proportion of answer to the retrieved context
         proxy_context_relevance=context_relevance, # the proportion of question to the retrieved context
         answer_has_gold_substring=answer_has_gold_substring, # whether the actual answer fully contains the gold answer
@@ -341,8 +408,8 @@ def summarize_average(metric_rows: Sequence[Dict], key: str) -> Optional[float]:
 # Aggregate answer metrics into a compact experiment-level summary.
 def summarize_answer_metrics(metric_rows: Sequence[Dict]) -> Dict:
     return {
-        "mean_answer_keyword_coverage": summarize_average(metric_rows, "answer_keyword_coverage"),
         "mean_gold_answer_overlap": summarize_average(metric_rows, "gold_answer_overlap"),
+        "mean_answer_gold_support": summarize_average(metric_rows, "answer_gold_support"),
         "mean_proxy_faithfulness": summarize_average(metric_rows, "proxy_faithfulness"),
         "mean_proxy_context_relevance": summarize_average(metric_rows, "proxy_context_relevance"),
         "n_correct": sum(1 for row in metric_rows if row["answer_accuracy_label"] == "correct"),
@@ -413,6 +480,9 @@ def summarize_retrieval_metrics(metric_rows: Sequence[Dict]) -> Dict:
         "questions_with_relevant_chunk": sum(
             1 for row in metric_rows if row.get("first_relevant_rank") is not None
         ),
+        "questions_with_target_doc_at_k": sum(
+            1 for row in metric_rows if row.get("target_doc_retrieved_at_k") is True
+        ),
     }
 
 
@@ -429,8 +499,20 @@ def evaluate_retrieval_metrics(
     retrieved_context = "\n".join(row["text"] for row in retrieved)
     ragas_recall_at_k = fraction_present(reference_units, retrieved_context)
 
-    retrieved_grades = [weak_chunk_relevance_grade(item, row["text"]) for row in retrieved[:k]]
-    all_candidate_grades = [weak_chunk_relevance_grade(item, row["text"]) for row in candidate_chunks]
+    def scoped_grade(row: Dict) -> int:
+        target_doc_id = item.get("doc_id")
+        if target_doc_id and not metadata_value_matches(row.get("doc_id", ""), target_doc_id):
+            return 0
+        return weak_chunk_relevance_grade(item, row["text"])
+
+    retrieved_grades = [scoped_grade(row) for row in retrieved[:k]]
+    all_candidate_grades = [scoped_grade(row) for row in candidate_chunks]
+    target_doc_id = item.get("doc_id")
+    target_doc_ranks = [
+        rank
+        for rank, row in enumerate(retrieved[:k], start=1)
+        if target_doc_id and metadata_value_matches(row.get("doc_id", ""), target_doc_id)
+    ]
 
     first_relevant_rank = next(
         (rank for rank, grade in enumerate(retrieved_grades, start=1) if grade > 0),
@@ -450,13 +532,16 @@ def evaluate_retrieval_metrics(
     )
 
     return {
-        "mrr_at_k": mrr_at_k,  # reciprocal rank of the first relevant retrieved chunk within top-k
+        "mrr_at_k": mrr_at_k,  # reciprocal rank of the first relevant retrieved chunk within top-k. Relevant chunk in 1st place → 1.0
         "ndcg_at_k": ndcg_at_k,  # ranking quality at top-k, rewarding highly relevant chunks near the top
         "recall_at_k": recall_at_k,  # relevant retrieved chunks / all relevant chunks in the candidate pool
         "ragas_recall_at_k": ragas_recall_at_k,  # reference facts from gold_answer+keywords covered by retrieved top-k context
         "first_relevant_rank": first_relevant_rank,  # 1-based position of the first relevant retrieved chunk
         "n_relevant_chunks": relevant_chunk_count,  # how many chunks in the full candidate pool are treated as relevant
         "n_retrieved_relevant_chunks": retrieved_relevant_count,  # how many relevant chunks appear inside retrieved top-k
+        "target_doc_retrieved_at_k": bool(target_doc_ranks) if target_doc_id else None,  # whether top-k contains any chunk from the hidden target doc_id
+        "first_target_doc_rank": target_doc_ranks[0] if target_doc_ranks else None,  # first top-k rank from the hidden target doc_id
+        "n_retrieved_target_doc_chunks": len(target_doc_ranks) if target_doc_id else None,  # top-k chunks from the hidden target doc_id
     }
 
 
