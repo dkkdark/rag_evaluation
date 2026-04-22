@@ -48,6 +48,16 @@ def format_dense_query(query: str, model_name: str) -> str:
     return query
 
 
+def chunk_search_text(chunk: Dict) -> str:
+    title = str(chunk.get("title", "")) if int(chunk.get("chunk_index", 0)) == 0 else ""
+    parts = [
+        str(chunk.get("section_id", "")),
+        title,
+        str(chunk.get("text", "")),
+    ]
+    return "\n".join(part for part in parts if part.strip())
+
+
 def get_sentence_transformer(model_name: str):
     from sentence_transformers import SentenceTransformer
 
@@ -103,7 +113,7 @@ def chunk_matches_filter(chunk: Dict, metadata_filter: Dict[str, object] | None)
 def build_tfidf_retriever(chunks: Sequence[Dict]) -> Dict:
     from sklearn.feature_extraction.text import TfidfVectorizer
 
-    texts = [chunk["text"] for chunk in chunks]
+    texts = [chunk_search_text(chunk) for chunk in chunks]
     vectorizer = TfidfVectorizer(
         lowercase=True,
         ngram_range=(1, 2),
@@ -120,7 +130,7 @@ def build_tfidf_retriever(chunks: Sequence[Dict]) -> Dict:
 def build_bm25_retriever(chunks: Sequence[Dict]) -> Dict:
     from rank_bm25 import BM25Okapi
 
-    tokenized_corpus = [tokenize_for_bm25(chunk["text"]) for chunk in chunks]
+    tokenized_corpus = [tokenize_for_bm25(chunk_search_text(chunk)) for chunk in chunks]
     return {
         "backend": "bm25",
         "bm25": BM25Okapi(tokenized_corpus),
@@ -135,7 +145,7 @@ def build_bm25_retriever(chunks: Sequence[Dict]) -> Dict:
 def build_dense_retriever(chunks: Sequence[Dict], model_name: str) -> Dict:
     import faiss
 
-    texts = format_dense_documents([chunk["text"] for chunk in chunks], model_name)
+    texts = format_dense_documents([chunk_search_text(chunk) for chunk in chunks], model_name)
     model = get_sentence_transformer(model_name)
     embeddings = model.encode(
         texts,

@@ -12,6 +12,7 @@ from rag_eval.io import extract_paragraphs, load_questions, parse_pdf_sections, 
 from rag_eval.metrics import build_recommendation, rank_experiments, score_experiment
 from rag_eval.models import LLMConfig, Section
 from rag_eval.retrieval import DEFAULT_EMBEDDING_MODEL
+from rag_eval.visualization import write_run_showcase_index
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -30,8 +31,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--questions",
-        default="questions_enriched.json",
-        help="Path to questions JSON. Defaults to questions_enriched.json in the project root.",
+        default="questions_by_file.json",
+        help="Path to questions JSON. Defaults to questions_by_file.json in the project root.",
     )
     parser.add_argument("--output-dir", default="outputs", help="Base directory for run artifacts.")
     parser.add_argument("--run-name", default=None, help="Optional stable run directory name.")
@@ -85,6 +86,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Weight for dense scores in hybrid retrieval; BM25 gets (1-alpha).",
     )
     parser.add_argument(
+        "--create-strategy-visualization",
+        action="store_true",
+        help="Write an SVG score-profile visualization for each experiment/strategy.",
+    )
+    parser.add_argument(
+        "--create-strategy-showcase",
+        action="store_true",
+        help="Write a showcase report with multiple charts and improvement summary for each experiment/strategy.",
+    )
+    parser.add_argument(
         "--weight-answer",
         type=float,
         default=0.45,
@@ -122,6 +133,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Sampling temperature for the answer-generation LLM.",
+    )
+    parser.add_argument(
+        "--kg-enable",
+        action="store_true",
+        help="Build a provenance-aware knowledge graph, use it for graph-augmented retrieval, and write KG metrics.",
+    )
+    parser.add_argument(
+        "--neo4j-enable",
+        action="store_true",
+        help="Export the knowledge graph to Neo4j. Requires --kg-enable and Neo4j credentials.",
+    )
+    parser.add_argument(
+        "--neo4j-uri",
+        default=None,
+        help="Neo4j URI. Falls back to NEO4J_URI when omitted.",
+    )
+    parser.add_argument(
+        "--neo4j-user",
+        default=None,
+        help="Neo4j username. Falls back to NEO4J_USER when omitted.",
+    )
+    parser.add_argument(
+        "--neo4j-password",
+        default=None,
+        help="Neo4j password. Falls back to NEO4J_PASSWORD when omitted.",
+    )
+    parser.add_argument(
+        "--neo4j-database",
+        default=None,
+        help="Optional Neo4j database. Falls back to NEO4J_DATABASE when omitted.",
+    )
+    parser.add_argument(
+        "--neo4j-clear",
+        action="store_true",
+        help="Clear the target Neo4j database before importing the graph.",
     )
     return parser
 
@@ -203,6 +249,15 @@ def main() -> None:
                     embedding_model=args.embedding_model,
                     hybrid_alpha=args.hybrid_alpha,
                     llm_config=llm_config,
+                    create_strategy_visualization=args.create_strategy_visualization,
+                    create_strategy_showcase=args.create_strategy_showcase,
+                    kg_enabled=args.kg_enable,
+                    neo4j_enabled=args.kg_enable and args.neo4j_enable,
+                    neo4j_uri=args.neo4j_uri,
+                    neo4j_user=args.neo4j_user,
+                    neo4j_password=args.neo4j_password,
+                    neo4j_database=args.neo4j_database,
+                    neo4j_clear=args.neo4j_clear,
                 )
             )
 
@@ -216,6 +271,12 @@ def main() -> None:
 
     ranking_csv = os.path.join(run_dir, "experiment_ranking.csv")
     pd.DataFrame(ranked_experiments).to_csv(ranking_csv, index=False)
+    strategy_showcase_index_md = None
+    if args.create_strategy_showcase:
+        strategy_showcase_index_md = write_run_showcase_index(
+            experiment_summaries,
+            os.path.join(run_dir, "strategy_showcase_index.md"),
+        )
 
     best_config_json = os.path.join(run_dir, "best_config.json")
     best_config_md = os.path.join(run_dir, "best_config.md")
@@ -273,6 +334,16 @@ def main() -> None:
             "model": llm_config.model if llm_config.enabled else None,
             "answer_generation": llm_config.enabled,
         },
+        "visualization": {
+            "enabled": args.create_strategy_visualization or args.create_strategy_showcase,
+        },
+        "showcase": {
+            "enabled": args.create_strategy_showcase,
+        },
+        "kg": {
+            "enabled": args.kg_enable,
+            "neo4j_enabled": args.kg_enable and args.neo4j_enable,
+        },
         "experiments": experiment_summaries,
         "ranking_weights": ranking_weights,
         "best_experiment": best_experiment,
@@ -287,6 +358,7 @@ def main() -> None:
             "questions_json": args.questions,
             "rag_results_csv": run_rag_results_csv if best_experiment is not None else None,
             "latest_rag_results_csv": latest_rag_results_csv if best_experiment is not None else None,
+            "strategy_showcase_index_md": strategy_showcase_index_md,
         },
         "question_schema": {
             "required": ["question"],
@@ -304,7 +376,9 @@ def main() -> None:
             "Fixed_tokens currently uses whitespace tokenization over paragraphs as an offline-friendly approximation.",
             "Questions can include program_id/program_name for answer-time retrieval scope and doc_id as a hidden evaluation target.",
             "Answer metrics remain heuristic; LLM is used only for grounded answer generation after retrieval.",
-            "Questions are expected to come from a prebuilt enriched dataset such as questions_enriched.json in the project root.",
+            "Questions are expected to come from a prebuilt file-level dataset such as questions_by_file.json in the project root.",
+            "When --kg-enable is used, each experiment also writes KG entities, relations, and triple-coverage metrics; Neo4j export is optional.",
+            "With --kg-enable, RAG context is graph-augmented: initial text retrieval seeds KG expansion, then vector and graph scores are fused before answer generation.",
         ],
     }
 
@@ -312,3 +386,7 @@ def main() -> None:
         json.dump(run_summary, f, ensure_ascii=False, indent=2)
 
     print(json.dumps(run_summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

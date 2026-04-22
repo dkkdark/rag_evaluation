@@ -6,6 +6,13 @@ from datetime import datetime
 from typing import Dict, List, Optional, Sequence
 
 from rag_eval.chunking import build_chunks
+from rag_eval.kg import (
+    build_knowledge_graph,
+    evaluate_kg_for_question,
+    graph_augmented_retrieval,
+    maybe_export_graph_to_neo4j,
+    summarize_kg_metrics,
+)
 from rag_eval.llm import generate_answer_with_llm
 from rag_eval.metrics import (
     diagnose_failure,
@@ -18,6 +25,10 @@ from rag_eval.metrics import (
 )
 from rag_eval.models import LLMConfig, Paragraph, Section
 from rag_eval.retrieval import build_retriever, retrieve_top_k
+from rag_eval.visualization import (
+    write_strategy_score_profile_svg,
+    write_strategy_showcase_bundle,
+)
 
 
 def ensure_dir(path: str) -> None:
@@ -118,6 +129,15 @@ def run_single_experiment(
     embedding_model: str,
     hybrid_alpha: float,
     llm_config: LLMConfig,
+    create_strategy_visualization: bool,
+    create_strategy_showcase: bool,
+    kg_enabled: bool,
+    neo4j_enabled: bool,
+    neo4j_uri: str | None,
+    neo4j_user: str | None,
+    neo4j_password: str | None,
+    neo4j_database: str | None,
+    neo4j_clear: bool,
 ) -> Dict:
     import pandas as pd
 
@@ -132,6 +152,27 @@ def run_single_experiment(
     chunks_df = pd.DataFrame(chunks)
     chunks_csv = os.path.join(experiment_dir, "chunks.csv")
     chunks_df.to_csv(chunks_csv, index=False)
+
+    kg_graph = build_knowledge_graph(chunks) if kg_enabled else {"entities": [], "relations": []}
+    kg_entities_csv: Optional[str] = None
+    kg_relations_csv: Optional[str] = None
+    kg_metrics_csv: Optional[str] = None
+    kg_summary_json: Optional[str] = None
+    kg_neo4j_status: Dict = {"status": "disabled"}
+    if kg_enabled:
+        kg_entities_csv = os.path.join(experiment_dir, "kg_entities.csv")
+        kg_relations_csv = os.path.join(experiment_dir, "kg_relations.csv")
+        pd.DataFrame(kg_graph["entities"]).to_csv(kg_entities_csv, index=False)
+        pd.DataFrame(kg_graph["relations"]).to_csv(kg_relations_csv, index=False)
+        kg_neo4j_status = maybe_export_graph_to_neo4j(
+            kg_graph,
+            enabled=neo4j_enabled,
+            uri=neo4j_uri,
+            user=neo4j_user,
+            password=neo4j_password,
+            database=neo4j_database,
+            clear=neo4j_clear,
+        )
 
     retriever_state = build_retriever(chunks, retriever_type, embedding_model)
     faiss_path: Optional[str] = None
@@ -150,6 +191,7 @@ def run_single_experiment(
     retrieved_rows: List[Dict] = []
     answer_metric_rows: List[Dict] = []
     retrieval_metric_rows: List[Dict] = []
+    kg_metric_rows: List[Dict] = []
     diagnostic_rows: List[Dict] = []
     for item in questions:
         answer_metadata_filter = question_metadata_filter(item, include_document=False)
@@ -161,7 +203,7 @@ def run_single_experiment(
                 "but no chunks match it."
             )
         answer_scope_chunks = filter_chunks_by_metadata(chunks, answer_metadata_filter)
-        retrieved = retrieve_top_k(
+        base_retrieved = retrieve_top_k(
             query=item["question"],
             retriever_state=retriever_state,
             chunks=chunks,
@@ -169,6 +211,24 @@ def run_single_experiment(
             hybrid_alpha=hybrid_alpha,
             metadata_filter=answer_metadata_filter,
         )
+        kg_retrieval = {
+            "enabled": False,
+            "seed_entities": [],
+            "added_chunk_ids": [],
+            "supporting_relations": [],
+            "base_chunk_ids": [row["chunk_id"] for row in base_retrieved],
+            "fused_chunk_ids": [row["chunk_id"] for row in base_retrieved],
+        }
+        if kg_enabled:
+            retrieved, kg_retrieval = graph_augmented_retrieval(
+                query=item["question"],
+                retrieved=base_retrieved,
+                graph=kg_graph,
+                chunks=answer_scope_chunks or chunks,
+                k=min(top_k, len(answer_scope_chunks or chunks)),
+            )
+        else:
+            retrieved = base_retrieved
         llm_result = generate_answer_with_llm(item["question"], retrieved, llm_config)
         answer = llm_result.answer
         answer_mode = "llm_grounded"
@@ -182,6 +242,40 @@ def run_single_experiment(
             candidate_chunks=candidate_chunks,
             k=min(top_k, len(candidate_chunks)),
         )
+        kg_metrics = None
+        if kg_enabled:
+            base_kg_metrics = evaluate_kg_for_question(item, base_retrieved, kg_graph)
+            kg_metrics = evaluate_kg_for_question(item, retrieved, kg_graph)
+            # Compare relation-evidence coverage before and after graph expansion.
+            # A positive delta means KG added context that contains more gold facts.
+            base_relation_recall = base_kg_metrics["gold_kg_relation_evidence_recall"]
+            final_relation_recall = kg_metrics["gold_kg_relation_evidence_recall"]
+            relation_recall_delta = (
+                final_relation_recall - base_relation_recall
+                if base_relation_recall is not None and final_relation_recall is not None
+                else None
+            )
+            kg_metrics.update(
+                {
+                    "base_gold_kg_doc_recall": base_kg_metrics["gold_kg_doc_recall"],  # doc coverage before KG expansion
+                    "base_gold_kg_section_recall": base_kg_metrics["gold_kg_section_recall"],  # section coverage before KG expansion
+                    "base_gold_kg_entity_pair_recall": base_kg_metrics[
+                        "gold_kg_entity_pair_recall"
+                    ],  # subject+object coverage before KG expansion
+                    "base_gold_kg_relation_evidence_recall": base_relation_recall,  # relation evidence before KG expansion
+                    "kg_relation_evidence_recall_delta": relation_recall_delta,  # final relation evidence minus base relation evidence
+                    "kg_retrieval_added_chunk_count": len(kg_retrieval["added_chunk_ids"]),  # graph-only chunks added to context
+                    "kg_retrieval_seed_entities": json.dumps(
+                        kg_retrieval["seed_entities"], ensure_ascii=False
+                    ),  # entities used to start KG traversal
+                    "kg_retrieval_added_chunk_ids": json.dumps(
+                        kg_retrieval["added_chunk_ids"], ensure_ascii=False
+                    ),  # chunk ids pulled in by KG expansion
+                    "kg_retrieval_supporting_relations": json.dumps(
+                        kg_retrieval["supporting_relations"], ensure_ascii=False
+                    ),  # graph edges that justified added chunks
+                }
+            )
         auto_flag = answer_metrics.answer_accuracy_label
         diagnostics = diagnose_failure(
             answer_metrics=answer_metrics,
@@ -205,6 +299,9 @@ def run_single_experiment(
                     "retriever": retriever_type,
                     "chunk_id": row["chunk_id"],
                     "score": row["score"],
+                    "base_retrieval_score": row.get("base_retrieval_score", row["score"]),  # original text-retriever score
+                    "kg_graph_score": row.get("kg_graph_score", 0.0),  # graph relevance score used in fusion
+                    "retrieval_source": row.get("retrieval_source", "vector"),  # vector, graph, or vector+graph
                     "doc_id": row["doc_id"],
                     "doc_path": row.get("doc_path", row["doc_id"]),
                     "program_id": row.get("program_id", ""),
@@ -258,6 +355,8 @@ def run_single_experiment(
                 "n_retrieved_target_doc_chunks": retrieval_metrics["n_retrieved_target_doc_chunks"],  # top-k chunks from target doc_id
             }
         )
+        if kg_metrics is not None:
+            kg_metric_rows.append(kg_metrics)
         diagnostic_rows.append(
             {
                 "question_id": item["id"],
@@ -287,6 +386,19 @@ def run_single_experiment(
                 "retrieved_chunk_ids": json.dumps(
                     [row["chunk_id"] for row in retrieved], ensure_ascii=False
                 ),
+                "base_retrieved_chunk_ids": json.dumps(
+                    [row["chunk_id"] for row in base_retrieved], ensure_ascii=False
+                ),  # chunks returned before KG expansion
+                "kg_retrieval_added_chunk_ids": (
+                    json.dumps(kg_retrieval["added_chunk_ids"], ensure_ascii=False)
+                    if kg_enabled
+                    else None
+                ),  # extra chunks added from KG traversal
+                "kg_retrieval_seed_entities": (
+                    json.dumps(kg_retrieval["seed_entities"], ensure_ascii=False)
+                    if kg_enabled
+                    else None
+                ),  # query/context entities used as graph seeds
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
@@ -296,6 +408,23 @@ def run_single_experiment(
                 "n_retrieved_target_doc_chunks": retrieval_metrics[
                     "n_retrieved_target_doc_chunks"
                 ],
+                "kg_entity_recall": kg_metrics["entity_recall"] if kg_metrics else None,
+                "kg_relation_recall": kg_metrics["relation_recall"] if kg_metrics else None,
+                "kg_relation_gap_count": kg_metrics["relation_gap_count"] if kg_metrics else None,
+                "kg_has_relation_gap": kg_metrics["has_relation_gap"] if kg_metrics else None,
+                "gold_kg_doc_recall": kg_metrics["gold_kg_doc_recall"] if kg_metrics else None,  # final context contains gold evidence doc
+                "gold_kg_section_recall": kg_metrics["gold_kg_section_recall"] if kg_metrics else None,  # final context contains gold section
+                "gold_kg_entity_pair_recall": kg_metrics["gold_kg_entity_pair_recall"] if kg_metrics else None,  # final context contains subject+object
+                "gold_kg_relation_evidence_recall": (
+                    kg_metrics["gold_kg_relation_evidence_recall"] if kg_metrics else None
+                ),  # final context contains subject+object+relation cue
+                "base_gold_kg_relation_evidence_recall": (
+                    kg_metrics["base_gold_kg_relation_evidence_recall"] if kg_metrics else None
+                ),  # same relation-evidence metric before KG expansion
+                "kg_relation_evidence_recall_delta": (
+                    kg_metrics["kg_relation_evidence_recall_delta"] if kg_metrics else None
+                ),  # improvement from KG expansion
+                "kg_error_type": kg_metrics["kg_error_type"] if kg_metrics else None,  # first missing KG evidence layer
                 "gold_answer_overlap": answer_metrics.gold_answer_overlap,
                 "answer_gold_support": answer_metrics.answer_gold_support,
                 "proxy_faithfulness": answer_metrics.proxy_faithfulness,
@@ -342,6 +471,25 @@ def run_single_experiment(
     with open(retrieval_metrics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_retrieval_metrics, f, ensure_ascii=False, indent=2)
 
+    aggregate_kg_metrics = summarize_kg_metrics(kg_metric_rows) if kg_enabled else {}
+    if kg_enabled:
+        kg_metrics_df = pd.DataFrame(kg_metric_rows)
+        kg_metrics_csv = os.path.join(experiment_dir, "kg_metrics.csv")
+        kg_metrics_df.to_csv(kg_metrics_csv, index=False)
+        kg_summary_json = os.path.join(experiment_dir, "kg_summary.json")
+        with open(kg_summary_json, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "n_entities": len(kg_graph["entities"]),
+                    "n_relations": len(kg_graph["relations"]),
+                    "metrics": aggregate_kg_metrics,
+                    "neo4j": kg_neo4j_status,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
     diagnostics_df = pd.DataFrame(diagnostic_rows)
     diagnostics_csv = os.path.join(experiment_dir, "diagnostics.csv")
     diagnostics_df.to_csv(diagnostics_csv, index=False)
@@ -374,11 +522,30 @@ def run_single_experiment(
         "n_incorrect": int((results_df["auto_flag"] == "incorrect").sum()),
         "answer_metrics": aggregate_answer_metrics,
         "retrieval_metrics": aggregate_retrieval_metrics,
+        "kg": {
+            "enabled": kg_enabled,
+            "n_entities": len(kg_graph["entities"]),
+            "n_relations": len(kg_graph["relations"]),
+            "metrics": aggregate_kg_metrics,
+            "neo4j": kg_neo4j_status,
+        },
         "diagnostics": aggregate_diagnostics,
         "llm": {
             "enabled": llm_config.enabled,
             "model": llm_config.model if llm_config.enabled else None,
             "answer_generation": llm_config.enabled,
+        },
+        "visualization": {
+            "enabled": create_strategy_visualization,
+            "strategy_score_profile_svg": None,
+        },
+        "showcase": {
+            "enabled": False,
+            "score_profile_svg": None,
+            "metric_overview_svg": None,
+            "diagnostics_svg": None,
+            "showcase_md": None,
+            "improvement_summary": None,
         },
         "outputs": {
             "chunks_csv": chunks_csv,
@@ -389,11 +556,44 @@ def run_single_experiment(
             "answer_metrics_summary_json": answer_metrics_json,
             "retrieval_metrics_csv": retrieval_metrics_csv,
             "retrieval_metrics_summary_json": retrieval_metrics_json,
+            "kg_entities_csv": kg_entities_csv,
+            "kg_relations_csv": kg_relations_csv,
+            "kg_metrics_csv": kg_metrics_csv,
+            "kg_summary_json": kg_summary_json,
             "diagnostics_csv": diagnostics_csv,
             "diagnostics_summary_json": diagnostics_json,
             "error_report_md": error_report_md,
+            "strategy_score_profile_svg": None,
+            "strategy_metric_overview_svg": None,
+            "strategy_diagnostics_svg": None,
+            "strategy_showcase_md": None,
         },
     }
+
+    if create_strategy_visualization:
+        score_profile_svg = write_strategy_score_profile_svg(
+            retrieved_rows,
+            os.path.join(experiment_dir, "strategy_score_profile.svg"),
+            experiment_slug=experiment_slug,
+            top_k=top_k,
+        )
+        summary["visualization"]["strategy_score_profile_svg"] = score_profile_svg
+        summary["outputs"]["strategy_score_profile_svg"] = score_profile_svg
+
+    if create_strategy_showcase:
+        showcase_bundle = write_strategy_showcase_bundle(
+            summary=summary,
+            retrieved_rows=retrieved_rows,
+            experiment_dir=experiment_dir,
+        )
+        summary["showcase"] = showcase_bundle
+        summary["visualization"]["enabled"] = True
+        summary["visualization"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
+        summary["outputs"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
+        summary["outputs"]["strategy_metric_overview_svg"] = showcase_bundle["metric_overview_svg"]
+        summary["outputs"]["strategy_diagnostics_svg"] = showcase_bundle["diagnostics_svg"]
+        summary["outputs"]["strategy_showcase_md"] = showcase_bundle["showcase_md"]
+
     with open(os.path.join(experiment_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     return summary

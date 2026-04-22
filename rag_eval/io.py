@@ -27,6 +27,38 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def is_toc_line(line: str) -> bool:
+    if re.search(r"\.{5,}\s*\d*\s*$", line):
+        return True
+    if re.match(r"^[IVX]+\.\s+\S+", line) and len(line.split()) <= 6:
+        return True
+    if re.match(r"^Anlage(?:\(n\))?:", line) and re.search(r"\b\d+\b", line):
+        return True
+    return False
+
+
+def is_valid_section_heading(
+    line: str,
+    match: re.Match[str],
+    seen_first_section: bool,
+    next_line: str = "",
+) -> bool:
+    section_number = match.group(1)
+    title = match.group(2).strip()
+    if is_toc_line(line):
+        return False
+    if not seen_first_section:
+        if section_number != "1":
+            return False
+        if "(1)" not in f"{line} {next_line}":
+            return False
+    if re.match(r"^(Abs\.|Absatz|Satz)(?:\s|$)", title):
+        return False
+    if title and title[0].islower():
+        return False
+    return True
+
+
 def split_paragraphs(text: str) -> List[str]:
     parts = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
     if parts:
@@ -119,15 +151,29 @@ def parse_pdf_sections(pdf_path: str, docs_root: str | None = None) -> Tuple[str
     cur_id = "PREAMBLE"
     cur_title = "Preamble"
     buf: List[str] = []
+    seen_first_section = False
 
-    for raw_line in full_text.splitlines():
+    lines = full_text.splitlines()
+    for line_index, raw_line in enumerate(lines):
         line = raw_line.strip()
         if not line:
             buf.append("")
             continue
+        next_lines: List[str] = []
+        for candidate in lines[line_index + 1 :]:
+            if candidate.strip():
+                next_lines.append(candidate.strip())
+                if len(next_lines) >= 3:
+                    break
+        next_line = " ".join(next_lines)
 
         match = SECTION_RE.match(line)
         if match:
+            if not is_valid_section_heading(line, match, seen_first_section, next_line):
+                if not seen_first_section:
+                    continue
+                buf.append(line)
+                continue
             if any(item.strip() for item in buf):
                 sections.append(
                     Section(
@@ -143,7 +189,10 @@ def parse_pdf_sections(pdf_path: str, docs_root: str | None = None) -> Tuple[str
             cur_id = f"§ {match.group(1)}"
             cur_title = match.group(2).strip()
             buf = []
+            seen_first_section = True
         else:
+            if not seen_first_section and is_toc_line(line):
+                continue
             buf.append(line)
 
     if any(item.strip() for item in buf):
