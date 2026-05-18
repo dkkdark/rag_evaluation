@@ -7,7 +7,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Sequence
 
-from rag_eval.metrics import text_matches_keyword
+from rag_eval.evaluation.metrics import text_matches_keyword
 
 
 ENTITY_PATTERNS = {

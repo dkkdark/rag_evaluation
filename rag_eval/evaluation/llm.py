@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Dict, Optional, Sequence
+from typing import Dict, Sequence
 
-from rag_eval.models import LLMCallResult, LLMConfig
+from rag_eval.core.models import LLMCallResult, LLMConfig
 
 
 def get_openai_client(llm_config: LLMConfig):
@@ -16,48 +16,7 @@ def get_openai_client(llm_config: LLMConfig):
 
     from openai import OpenAI
 
-    return OpenAI(
-        api_key=api_key, 
-        #base_url="https://chat-ai.academiccloud.de/v1"
-    )
-
-
-def parse_json_response(text: str) -> Dict:
-    import json
-
-    return json.loads(text.strip())
-
-
-def call_llm_json(
-    client: Any,
-    *,
-    model: str,
-    temperature: float,
-    system_prompt: str,
-    user_prompt: str,
-    schema_name: str,
-    schema: Dict,
-) -> Dict:
-    response = client.responses.create(
-        model=model,
-        temperature=temperature,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": schema_name,
-                "strict": True,
-                "schema": schema,
-            }
-        },
-    )
-    response_text = getattr(response, "output_text", "") or ""
-    if not response_text:
-        raise ValueError("LLM returned an empty response.")
-    return parse_json_response(response_text)
+    return OpenAI(api_key=api_key)
 
 
 def generate_answer_with_llm(

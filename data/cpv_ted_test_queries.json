@@ -1,0 +1,430 @@
+{
+  "queries": [
+    {
+      "id": "158254-2023",
+      "query": "Copernicus Global Land Cover and Tropical Forest Mapping and Monitoring",
+      "gold_cpv_code": "72319000",
+      "notes": "Italy – Data supply services – Copernicus Global Land Cover and Tropical Forest Mapping and Monitoring"
+    },
+    {
+      "id": "170073-2023",
+      "query": "FRAMEWORK SERVICE CONTRACT FOR COPERNICUS EMERGENCY MANAGEMENT SERVICE (CEMS) RISK AND RECOVERY MAPPING (RRM) TAILOR-MADE PRODUCTS (FLEX)",
+      "gold_cpv_code": "71354100",
+      "notes": "Italy – Digital mapping services – FRAMEWORK SERVICE CONTRACT FOR COPERNICUS EMERGENCY MANAGEMENT SERVICE (CEMS) RISK AND RECOVERY MAPPING (RRM) TAILOR-MADE PRODUCTS (FLEX)"
+    },
+    {
+      "id": "291844-2023",
+      "query": "Elektrienergia ostmine Kambja vallale",
+      "gold_cpv_code": "09310000",
+      "notes": "Estonia – Electricity – Elektrienergia ostmine Kambja vallale"
+    },
+    {
+      "id": "291853-2023",
+      "query": "Saaremaa valla koolide õpilaste transport aastatel 2023-2025",
+      "gold_cpv_code": "60130000",
+      "notes": "Estonia – Special-purpose road passenger-transport services – Saaremaa valla koolide õpilaste transport aastatel 2023-2025"
+    },
+    {
+      "id": "291858-2023",
+      "query": "Power BI raamlepingu hange",
+      "gold_cpv_code": "72262000",
+      "notes": "Estonia – Software development services – Power BI raamlepingu hange"
+    },
+    {
+      "id": "295399-2023",
+      "query": "21. Kooli toitlustushange",
+      "gold_cpv_code": "55520000",
+      "notes": "Estonia – Catering services – 21. Kooli toitlustushange"
+    },
+    {
+      "id": "295402-2023",
+      "query": "Elektrigeneraatorite ja kütusemahutite ostmine koos paigaldusega L. Puusepa 8, Tartu",
+      "gold_cpv_code": "31120000",
+      "notes": "Estonia – Generators – Elektrigeneraatorite ja kütusemahutite ostmine koos paigaldusega L. Puusepa 8, Tartu"
+    },
+    {
+      "id": "295418-2023",
+      "query": "Koagulaatori tarvikud",
+      "gold_cpv_code": "33162200",
+      "notes": "Estonia – Operating-theatre instruments – Koagulaatori tarvikud"
+    },
+    {
+      "id": "295420-2023",
+      "query": "Süstlad ja süstlanõelad, veenikanüülid ning infusioonravi tarvikud 3",
+      "gold_cpv_code": "33141000",
+      "notes": "Estonia – Disposable non-chemical medical consumables and haematological consumables – Süstlad ja süstlanõelad, veenikanüülid ning infusioonravi tarvikud 3"
+    },
+    {
+      "id": "295423-2023",
+      "query": "Eestis müügiluba mitteomavate ravimite ostmine",
+      "gold_cpv_code": "33600000",
+      "notes": "Estonia – Pharmaceutical products – Eestis müügiluba mitteomavate ravimite ostmine"
+    },
+    {
+      "id": "295428-2023",
+      "query": "Liigituvastustarkvara arendus ja hooldus 2023-2027",
+      "gold_cpv_code": "72200000",
+      "notes": "Estonia – Software programming and consultancy services – Liigituvastustarkvara arendus ja hooldus 2023-2027"
+    },
+    {
+      "id": "302067-2023",
+      "query": "Kultuuri- ja hariduskeskus Viimsi Artium koristusteenuse ostmine",
+      "gold_cpv_code": "90911000",
+      "notes": "Estonia – Accommodation, building and window cleaning services – Kultuuri- ja hariduskeskus Viimsi Artium koristusteenuse ostmine"
+    },
+    {
+      "id": "302069-2023",
+      "query": "Atesolizumab, ipilimumab ja nivolumab",
+      "gold_cpv_code": "33600000",
+      "notes": "Estonia – Pharmaceutical products – Atesolizumab, ipilimumab ja nivolumab"
+    },
+    {
+      "id": "302078-2023",
+      "query": "Digioskuste algtaseme koolitus",
+      "gold_cpv_code": "80400000",
+      "notes": "Estonia – Adult and other education services – Digioskuste algtaseme koolitus"
+    },
+    {
+      "id": "302083-2023",
+      "query": "Metallilõikepinkide (CNC) operaatori koolitus Narva linnas",
+      "gold_cpv_code": "80400000",
+      "notes": "Estonia – Adult and other education services – Metallilõikepinkide (CNC) operaatori koolitus Narva linnas"
+    },
+    {
+      "id": "302088-2023",
+      "query": "Avaliku bussiliiniveo korraldamine Harju maakonna Saku valla bussiliinidel",
+      "gold_cpv_code": "60112000",
+      "notes": "Estonia – Public road transport services – Avaliku bussiliiniveo korraldamine Harju maakonna Saku valla bussiliinidel"
+    },
+    {
+      "id": "302090-2023",
+      "query": "M1 kategooria täiselektrilise sõiduauto kasutusrent",
+      "gold_cpv_code": "34110000",
+      "notes": "Estonia – Passenger cars – M1 kategooria täiselektrilise sõiduauto kasutusrent"
+    },
+    {
+      "id": "307354-2023",
+      "query": "Hanke eesmärk on hankida riigihanke alusdokumentides(RHAD) seatud tingimustele vastavad bürootarbed, trükised ja kontoritehnika kulumaterjalid, igal osale sõlmitakse eraldi raamleping 3 aastaks.",
+      "gold_cpv_code": "30190000",
+      "notes": "Estonia – Various office equipment and supplies – Bürootarbed"
+    },
+    {
+      "id": "307358-2023",
+      "query": "Loodusdirektiivi metsaelupaikade inventuur tuuleenergeetika eelisarendusalade leidmiseks (Keskkonnaagentuur)",
+      "gold_cpv_code": "73110000",
+      "notes": "Estonia – Research services – Loodusdirektiivi metsaelupaikade inventuur tuuleenergeetika eelisarendusalade leidmiseks (Keskkonnaagentuur)"
+    },
+    {
+      "id": "307363-2023",
+      "query": "Randmepaelte printimise süsteem",
+      "gold_cpv_code": "33100000",
+      "notes": "Estonia – Medical equipments – Randmepaelte printimise süsteem"
+    },
+    {
+      "id": "307374-2023",
+      "query": "Tugikeskus Juks Kadaka tee 153 projekteerimine",
+      "gold_cpv_code": "71240000",
+      "notes": "Estonia – Architectural, engineering and planning services – Tugikeskus Juks Kadaka tee 153 projekteerimine"
+    },
+    {
+      "id": "307375-2023",
+      "query": "Endoskoopiliste ja ultrahelikirurgia instrumentide ostmine",
+      "gold_cpv_code": "33169000",
+      "notes": "Estonia – Surgical instruments – Endoskoopiliste ja ultrahelikirurgia instrumentide ostmine"
+    },
+    {
+      "id": "307379-2023",
+      "query": "Auvere elektrijaama suitsuimeja elektrimootori ostmine",
+      "gold_cpv_code": "31110000",
+      "notes": "Estonia – Electric motors – Auvere elektrijaama suitsuimeja elektrimootori ostmine"
+    },
+    {
+      "id": "307380-2023",
+      "query": "Reaktiivide ostmine PCR meetodil haigustekitajate määramiseks",
+      "gold_cpv_code": "33600000",
+      "notes": "Estonia – Pharmaceutical products – Reaktiivide ostmine PCR meetodil haigustekitajate määramiseks"
+    },
+    {
+      "id": "307396-2023",
+      "query": "Loodusvaatluste mobiilse rakenduse arendus- ja hooldustööd",
+      "gold_cpv_code": "72200000",
+      "notes": "Estonia – Software programming and consultancy services – Loodusvaatluste mobiilse rakenduse arendus- ja hooldustööd"
+    },
+    {
+      "id": "307405-2023",
+      "query": "Liikuma Kutsuva Kooli programmi ja projekti \"Kooliõpilaste liikumisaktiivsuse toetamine\" suurürituse korraldamine 4.-5. oktoobril 2023",
+      "gold_cpv_code": "79952000",
+      "notes": "Estonia – Event services – Liikuma Kutsuva Kooli programmi ja projekti \"Kooliõpilaste liikumisaktiivsuse toetamine\" suurürituse korraldamine 4.-5. oktoobril 2023"
+    },
+    {
+      "id": "307410-2023",
+      "query": "Estonia – Disposable non-chemical medical consumables and haematological consumables – ECMO tarvikud 2",
+      "gold_cpv_code": "33141000",
+      "notes": "Estonia – Disposable non-chemical medical consumables and haematological consumables – ECMO tarvikud 2"
+    },
+    {
+      "id": "307420-2023",
+      "query": "Riigitee 2 (E263) Tallinn–Tartu–Võru–Luhamaa km 168,36-176,84 asuva Kardla–Tartu lõigu põhiprojekti koostamine",
+      "gold_cpv_code": "71320000",
+      "notes": "Estonia – Engineering design services – Riigitee 2 (E263) Tallinn–Tartu–Võru–Luhamaa km 168,36-176,84 asuva Kardla–Tartu lõigu põhiprojekti koostamine"
+    },
+    {
+      "id": "307430-2023",
+      "query": "Riigimaadel jäätmete likvideerimine (I piiratud hankemenetlus)",
+      "gold_cpv_code": "90510000",
+      "notes": "Estonia – Refuse disposal and treatment – Riigimaadel jäätmete likvideerimine (I piiratud hankemenetlus)"
+    },
+    {
+      "id": "309742-2023",
+      "query": "\"Oskuste Süsteemi\" esimene arendusetapp - oskuste kirjeldamise keskkond (SA Kutsekoda)",
+      "gold_cpv_code": "72200000",
+      "notes": "Estonia – Software programming and consultancy services – \"Oskuste Süsteemi\" esimene arendusetapp - oskuste kirjeldamise keskkond (SA Kutsekoda)"
+    },
+    {
+      "id": "309749-2023",
+      "query": "Tallinna Arte Gümnaasiumi toitlustushange",
+      "gold_cpv_code": "55520000",
+      "notes": "Estonia – Catering services – Tallinna Arte Gümnaasiumi toitlustushange"
+    },
+    {
+      "id": "309760-2023",
+      "query": "Võõrkeelsete teavikute ostmine, 27.04.2023",
+      "gold_cpv_code": "22100000",
+      "notes": "Estonia – Printed books, brochures and leaflets – Võõrkeelsete teavikute ostmine, 27.04.2023"
+    },
+    {
+      "id": "309761-2023",
+      "query": "Radiofarmatseutikumi 18F-Fluorodeoksüglükoos",
+      "gold_cpv_code": "33600000",
+      "notes": "Estonia – Pharmaceutical products – Radiofarmatseutikumi 18F-Fluorodeoksüglükoos"
+    },
+    {
+      "id": "309887-2023",
+      "query": "Linnamööbli soetamine 2023",
+      "gold_cpv_code": "34928400",
+      "notes": "Estonia – Urban furniture – Linnamööbli soetamine 2023"
+    },
+    {
+      "id": "309908-2023",
+      "query": "E-teenuste disainisüsteemi jätkuarendustööd",
+      "gold_cpv_code": "72200000",
+      "notes": "Estonia – Software programming and consultancy services – E-teenuste disainisüsteemi jätkuarendustööd"
+    },
+    {
+      "id": "319384-2023",
+      "query": "Estonia – Office furniture – Mööbli ostmine",
+      "gold_cpv_code": "39130000",
+      "notes": "Estonia – Office furniture – Mööbli ostmine"
+    },
+    {
+      "id": "319389-2023",
+      "query": "Tänavavalgustite vahetus LED valgustite vastu",
+      "gold_cpv_code": "45316110",
+      "notes": "Estonia – Installation of road lighting equipment – Tänavavalgustite vahetus LED valgustite vastu"
+    },
+    {
+      "id": "319393-2023",
+      "query": "Õppehoonete koristusteenus 2023/2024 ja 2024/2025 õppeaastal",
+      "gold_cpv_code": "90911000",
+      "notes": "Estonia – Accommodation, building and window cleaning services – Õppehoonete koristusteenus 2023/2024 ja 2024/2025 õppeaastal"
+    },
+    {
+      "id": "322531-2023",
+      "query": "Hanke eesmärk on leida raamlepingu partner Estfeed Datahub arendus- ja hooldustööde teostamiseks. Estfeed Datahub on elektri- ja gaasituru andmevahetusplatvorm, mis tagab turu toimimiseks vajaliku andmevahetuse turuosaliste vahel, võimaldades turuosalistel edastada platvormile õigusaktides defineeritud andmeid ning saades ligipääsu andmetele, millele turuosalisel on õigus ligi pääseda.",
+      "gold_cpv_code": "72262000",
+      "notes": "Estonia – Software development services – Estfeed Datahub"
+    },
+    {
+      "id": "322539-2023",
+      "query": "Ravimi eliglustaat ostmine madalaima hinnaga vastava pakkumuse teinud pakkujalt raamlepingu alusel",
+      "gold_cpv_code": "33600000",
+      "notes": "Estonia – Pharmaceutical products – Ravim eliglustaat"
+    },
+    {
+      "id": "326034-2023",
+      "query": "Katastrimõõdistamise tellimine Rail Baltica projekti raames: pakkumuse esitamise kutse nr 4 (Harju maakond, Rae vald)",
+      "gold_cpv_code": "71354300",
+      "notes": "Estonia – Cadastral surveying services – Katastrimõõdistamise tellimine Rail Baltica projekti raames: pakkumuse esitamise kutse nr 4 (Harju maakond, Rae vald)"
+    },
+    {
+      "id": "326035-2023",
+      "query": "Sisseastumise infosüsteemi arendustööd",
+      "gold_cpv_code": "72200000",
+      "notes": "Estonia – Software programming and consultancy services – Sisseastumise infosüsteemi arendustööd"
+    },
+    {
+      "id": "326039-2023",
+      "query": "Konzession Tabakfachgeschäft an der Adresse Ausseer Straße 43a, 8940 Liezen",
+      "gold_cpv_code": "55900000",
+      "notes": "Austria – Retail trade services – Konzession Tabakfachgeschäft an der Adresse Ausseer Straße 43a, 8940 Liezen"
+    },
+    {
+      "id": "326043-2023",
+      "query": "Tallinna Õismäe Vene Lütseumi ruumide puhastusteenuse tellimine",
+      "gold_cpv_code": "90910000",
+      "notes": "Estonia – Cleaning services – Tallinna Õismäe Vene Lütseumi ruumide puhastusteenuse tellimine"
+    },
+    {
+      "id": "326048-2023",
+      "query": "Tehnilise vedela 100%-lise naatriumhüdroksiidi ostmine",
+      "gold_cpv_code": "24311520",
+      "notes": "Estonia – Sodium hydroxide – Tehnilise vedela 100%-lise naatriumhüdroksiidi ostmine"
+    },
+    {
+      "id": "326062-2023",
+      "query": "Toidu-, esmatarbe- ja majapidamiskaubad Sotsiaalkindlustusametile",
+      "gold_cpv_code": "15800000",
+      "notes": "Estonia – Miscellaneous food products – Toidu-, esmatarbe- ja majapidamiskaubad Sotsiaalkindlustusametile"
+    },
+    {
+      "id": "326064-2023",
+      "query": "IT-vahendite ostmine Tallinna haridusasutustele",
+      "gold_cpv_code": "30190000",
+      "notes": "Estonia – Various office equipment and supplies – IT-vahendite ostmine Tallinna haridusasutustele"
+    },
+    {
+      "id": "326197-2023",
+      "query": "Kindlustusteenuse ostmine Põhja-Eesti Regionaalhaigla SA (edaspidi PERH), Raplamaa Haiglale, Läänemaa Haiglale ja Hiiumaa Haiglale:",
+      "gold_cpv_code": "66510000",
+      "notes": "Estonia – Insurance services – Kindlustusteenused"
+    },
+    {
+      "id": "326204-2023",
+      "query": "Reaktiivide, hooldus- ja remonditeenuse ostmine analüsaatori GeneXpert (tootja: Cepheid) jaoks",
+      "gold_cpv_code": "33600000",
+      "notes": "Estonia – Pharmaceutical products – Reaktiivide, hooldus- ja remonditeenuse ostmine analüsaatori GeneXpert (tootja: Cepheid) jaoks"
+    },
+    {
+      "id": "331112-2023",
+      "query": "Katastrimõõdistamine maakorraldustoimingute läbiviimise eesmärgil Võru ja Valga maakonnas",
+      "gold_cpv_code": "71354300",
+      "notes": "Estonia – Cadastral surveying services – Katastrimõõdistamine maakorraldustoimingute läbiviimise eesmärgil Võru ja Valga maakonnas"
+    },
+    {
+      "id": "331138-2023",
+      "query": "Riigimaadel jäätmete likvideerimine (II piiratud hankemenetlus)",
+      "gold_cpv_code": "90510000",
+      "notes": "Estonia – Refuse disposal and treatment – Riigimaadel jäätmete likvideerimine (II piiratud hankemenetlus)"
+    },
+    {
+      "id": "331150-2023",
+      "query": "Võsasaetööd Edela metsakasvatuse piirkonnas 2023-2025",
+      "gold_cpv_code": "77210000",
+      "notes": "Estonia – Logging services – Võsasaetööd Edela metsakasvatuse piirkonnas 2023-2025"
+    },
+    {
+      "id": "334366-2023",
+      "query": "Lasnamäe linnaosa mänguväljakute liiva sõelumine ja hooldamine",
+      "gold_cpv_code": "50800000",
+      "notes": "Estonia – Miscellaneous repair and maintenance services – Lasnamäe linnaosa mänguväljakute liiva sõelumine ja hooldamine"
+    },
+    {
+      "id": "334369-2023",
+      "query": "Väikese väina teise 110kV kaabelliini ehitamine",
+      "gold_cpv_code": "45231400",
+      "notes": "Estonia – Construction work for electricity power lines – Väikese väina teise 110kV kaabelliini ehitamine"
+    },
+    {
+      "id": "334380-2023",
+      "query": "Haabersti linnaosa mänguväljakute elementide vahetused ja remonttööd.",
+      "gold_cpv_code": "50800000",
+      "notes": "Estonia – Miscellaneous repair and maintenance services – Haabersti linnaosa mänguväljakute elementide vahetused ja remonttööd."
+    },
+    {
+      "id": "334383-2023",
+      "query": "Rakvere linnas Arvo Pärdi muusikamaja ehitamine",
+      "gold_cpv_code": "45212300",
+      "notes": "Estonia – Construction work for art and cultural buildings – Rakvere linnas Arvo Pärdi muusikamaja ehitamine"
+    },
+    {
+      "id": "334389-2023",
+      "query": "Laenude ja käenduse dokumentide menetlemise veebirakenduse hooldus ja arendustööd",
+      "gold_cpv_code": "72200000",
+      "notes": "Estonia – Software programming and consultancy services – Laenude ja käenduse dokumentide menetlemise veebirakenduse hooldus ja arendustööd"
+    },
+    {
+      "id": "334399-2023",
+      "query": "Elektrienergia ostmine 2024-2026",
+      "gold_cpv_code": "09310000",
+      "notes": "Estonia – Electricity – Elektrienergia ostmine 2024-2026"
+    },
+    {
+      "id": "337440-2023",
+      "query": "Framework Contract for EU policy lab",
+      "gold_cpv_code": "73210000",
+      "notes": "Belgium – Research consultancy services – Framework Contract for EU policy lab"
+    },
+    {
+      "id": "337457-2023",
+      "query": "Jõgeva Valla õpilasliinide teenindamine 2023–2026",
+      "gold_cpv_code": "60130000",
+      "notes": "Estonia – Special-purpose road passenger-transport services – Jõgeva Valla õpilasliinide teenindamine 2023–2026"
+    },
+    {
+      "id": "340488-2023",
+      "query": "Konzession Tabakfachgeschäft an der Adresse Dorfstraße 1, 5322 Hof bei Salzburg",
+      "gold_cpv_code": "55900000",
+      "notes": "Austria – Retail trade services – Konzession Tabakfachgeschäft an der Adresse Dorfstraße 1, 5322 Hof bei Salzburg"
+    },
+    {
+      "id": "340497-2023",
+      "query": "Saue valla hoonete puhastusteenus",
+      "gold_cpv_code": "90910000",
+      "notes": "Estonia – Cleaning services – Saue valla hoonete puhastusteenus"
+    },
+    {
+      "id": "340500-2023",
+      "query": "Saku põhikooli ja spordikompleksi ehitustööd",
+      "gold_cpv_code": "45214200",
+      "notes": "Estonia – Construction work for school buildings – Saku põhikooli ja spordikompleksi ehitustööd"
+    },
+    {
+      "id": "340504-2023",
+      "query": "Öövaatlusseadmete ost koos elutsükli tagamisega",
+      "gold_cpv_code": "38632000",
+      "notes": "Estonia – Nightglasses – Öövaatlusseadmed"
+    },
+    {
+      "id": "340514-2023",
+      "query": "Metsatakseerimine (Võru ja Valga maakond)",
+      "gold_cpv_code": "71310000",
+      "notes": "Estonia – Consultative engineering and construction services – Metsatakseerimine (Võru ja Valga maakond)"
+    },
+    {
+      "id": "340517-2023",
+      "query": "Karuputke võõrliikide tõrje tellimine Eestis 2023. aastal (Keskkonnaamet)",
+      "gold_cpv_code": "77312100",
+      "notes": "Estonia – Weed-killing services – Karuputke võõrliikide tõrje tellimine Eestis 2023. aastal (Keskkonnaamet)"
+    },
+    {
+      "id": "340518-2023",
+      "query": "Tallinna Laste Turvakeskuse (Rivi tn 3) uue hoone projekteerimine",
+      "gold_cpv_code": "71240000",
+      "notes": "Estonia – Architectural, engineering and planning services – Tallinna Laste Turvakeskuse (Rivi tn 3) uue hoone projekteerimine"
+    },
+    {
+      "id": "340635-2023",
+      "query": "Ballistilise kaitsega taktikalise kandesüsteemi tekstiilosade ostmine (kordus)",
+      "gold_cpv_code": "18143000",
+      "notes": "Estonia – Protective gear – Ballistilise kaitsega taktikalise kandesüsteemi tekstiilosade ostmine (kordus)"
+    },
+    {
+      "id": "340648-2023",
+      "query": "100 kVA 21(10,5)/0,41 kV jaotustrafode ostmine (IP4768)",
+      "gold_cpv_code": "31213200",
+      "notes": "Estonia – Distribution transformers – 100 kVA 21(10,5)/0,41 kV jaotustrafode ostmine (IP4768)"
+    },
+    {
+      "id": "340656-2023",
+      "query": "Olustvere TMK toiduainete ost sööklale 2023",
+      "gold_cpv_code": "15800000",
+      "notes": "Estonia – Miscellaneous food products – Olustvere TMK toiduainete ost sööklale 2023"
+    },
+    {
+      "id": "340661-2023",
+      "query": "1000 kVA 21 (10,5)/0,41kV jaotustrafode ostmine (IP4768)",
+      "gold_cpv_code": "31213200",
+      "notes": "Estonia – Distribution transformers – 1000 kVA 21 (10,5)/0,41kV jaotustrafode ostmine (IP4768)"
+    }
+  ]
+}

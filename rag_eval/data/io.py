@@ -7,7 +7,7 @@ import re
 import unicodedata
 from typing import Dict, List, Sequence, Tuple
 
-from rag_eval.models import Paragraph, SECTION_RE, Section
+from rag_eval.core.models import Paragraph, SECTION_RE, Section
 
 EMPTY_TABLE_CELL = "[EMPTY]"
 

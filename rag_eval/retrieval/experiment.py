@@ -5,27 +5,35 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional, Sequence
 
-from rag_eval.chunking import build_chunks
-from rag_eval.kg import (
+from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
+from rag_eval.retrieval.chunking import build_chunks
+from rag_eval.retrieval.kg import (
     build_knowledge_graph,
     evaluate_kg_for_question,
     graph_augmented_retrieval,
     maybe_export_graph_to_neo4j,
     summarize_kg_metrics,
 )
-from rag_eval.llm import generate_answer_with_llm
-from rag_eval.metrics import (
+from rag_eval.evaluation.judge import judge_claims_with_llm
+from rag_eval.evaluation.llm import generate_answer_with_llm
+from rag_eval.evaluation.metrics import (
     diagnose_failure,
     evaluate_answer_metrics,
     evaluate_retrieval_metrics,
+    is_relevant_grade,
     keyword_extractive_answer,
+    retrieval_relevance_grade,
+    runtime_retrieval_evaluation,
     summarize_answer_metrics,
+    summarize_confidence_calibration,
     summarize_diagnostics,
     summarize_retrieval_metrics,
 )
-from rag_eval.models import LLMConfig, Paragraph, Section
-from rag_eval.retrieval import build_retriever, retrieve_top_k
-from rag_eval.visualization import (
+from rag_eval.core.models import LLMConfig, Paragraph, Section
+from rag_eval.retrieval.engines import build_retriever, rerank_with_lexical_signal, retrieve_top_k
+from rag_eval.core.text_utils import metadata_value_matches
+from rag_eval.reporting.visualization import (
+    write_chunk_relevance_comparison_svg,
     write_strategy_score_profile_svg,
     write_strategy_showcase_bundle,
 )
@@ -67,31 +75,6 @@ def question_metadata_filter(item: Dict, *, include_document: bool) -> Dict[str,
     return metadata_filter
 
 
-def normalize_metadata_value(value: object) -> str:
-    normalized = str(value).casefold()
-    normalized = normalized.replace("&", "and").replace("/", " ")
-    normalized = "".join(char for char in normalized if char.isascii())
-    normalized = "".join(char if char.isalnum() else " " for char in normalized)
-    aliases = {
-        "ba": "bachelor",
-        "bpo": "bachelor",
-        "ma": "master",
-        "mpo": "master",
-        "sciences": "science",
-    }
-    return " ".join(aliases.get(token, token) for token in normalized.split())
-
-
-def metadata_value_matches(actual: object, expected: object) -> bool:
-    actual_norm = normalize_metadata_value(actual)
-    expected_norm = normalize_metadata_value(expected)
-    return (
-        actual_norm == expected_norm
-        or actual_norm in expected_norm
-        or expected_norm in actual_norm
-    )
-
-
 def filter_chunks_by_metadata(chunks: Sequence[Dict], metadata_filter: Dict[str, object]) -> List[Dict]:
     if not metadata_filter:
         return list(chunks)
@@ -129,6 +112,7 @@ def run_single_experiment(
     embedding_model: str,
     hybrid_alpha: float,
     llm_config: LLMConfig,
+    judge_config: LLMConfig | None,
     create_strategy_visualization: bool,
     create_strategy_showcase: bool,
     kg_enabled: bool,
@@ -138,6 +122,10 @@ def run_single_experiment(
     neo4j_password: str | None,
     neo4j_database: str | None,
     neo4j_clear: bool,
+    runtime_retrieval_evaluator_enabled: bool = True,
+    abstain_on_weak_evidence: bool = False,
+    rerank_top_n: int = 0,
+    rerank_weight: float = 0.25,
 ) -> Dict:
     import pandas as pd
 
@@ -193,6 +181,8 @@ def run_single_experiment(
     retrieval_metric_rows: List[Dict] = []
     kg_metric_rows: List[Dict] = []
     diagnostic_rows: List[Dict] = []
+    judge_rows: List[Dict] = []
+    claim_evidence_rows: List[Dict] = []
     for item in questions:
         answer_metadata_filter = question_metadata_filter(item, include_document=False)
         evaluation_metadata_filter = question_metadata_filter(item, include_document=True)
@@ -207,9 +197,16 @@ def run_single_experiment(
             query=item["question"],
             retriever_state=retriever_state,
             chunks=chunks,
-            k=min(top_k, len(answer_scope_chunks or chunks)),
+            k=min(max(top_k, rerank_top_n or top_k), len(answer_scope_chunks or chunks)),
             hybrid_alpha=hybrid_alpha,
             metadata_filter=answer_metadata_filter,
+        )
+        base_retrieved = rerank_with_lexical_signal(
+            query=item["question"],
+            rows=base_retrieved,
+            top_k=min(top_k, len(base_retrieved)),
+            rerank_top_n=rerank_top_n,
+            rerank_weight=rerank_weight,
         )
         kg_retrieval = {
             "enabled": False,
@@ -229,13 +226,46 @@ def run_single_experiment(
             )
         else:
             retrieved = base_retrieved
-        llm_result = generate_answer_with_llm(item["question"], retrieved, llm_config)
-        answer = llm_result.answer
-        answer_mode = "llm_grounded"
-        if answer is None:
-            answer = keyword_extractive_answer(item["question"], retrieved)
-            answer_mode = "extractive_fallback"
-        answer_metrics = evaluate_answer_metrics(item, answer, retrieved)
+        runtime_retrieval_result = runtime_retrieval_evaluation(
+            question=item["question"],
+            retrieved=retrieved,
+        )
+        should_abstain = (
+            runtime_retrieval_evaluator_enabled
+            and abstain_on_weak_evidence
+            and runtime_retrieval_result["status"] in {"missing_evidence", "weak_evidence"}
+        )
+        if should_abstain:
+            from rag_eval.core.models import LLMCallResult
+
+            llm_result = LLMCallResult(
+                answer=None,
+                used=False,
+                status="runtime_retrieval_abstained",
+                error=str(runtime_retrieval_result["reason"]),
+            )
+            answer = "Not enough evidence in the retrieved context to answer reliably."
+            answer_mode = "runtime_abstention"
+        else:
+            llm_result = generate_answer_with_llm(item["question"], retrieved, llm_config)
+            answer = llm_result.answer
+            answer_mode = "llm_grounded"
+            if answer is None:
+                answer = keyword_extractive_answer(item["question"], retrieved)
+                answer_mode = "extractive_fallback"
+        claim_judge_result = judge_claims_with_llm(
+            item=item,
+            answer=answer,
+            retrieved=retrieved,
+            config=judge_config or LLMConfig(False, "", llm_config.api_key_env, 0.0),
+        )
+        answer_metrics = evaluate_answer_metrics(
+            item,
+            answer,
+            retrieved,
+            claim_judge_result=claim_judge_result,
+            runtime_retrieval_result=runtime_retrieval_result,
+        )
         retrieval_metrics = evaluate_retrieval_metrics(
             item=item,
             retrieved=retrieved,
@@ -285,6 +315,7 @@ def run_single_experiment(
         )
 
         for rank, row in enumerate(retrieved, start=1):
+            relevance_grade = retrieval_relevance_grade(item, row)
             retrieved_rows.append(
                 {
                     "question_id": item["id"],
@@ -311,6 +342,8 @@ def run_single_experiment(
                     "chunking_strategy": row["chunking_strategy"],
                     "source_type": row["source_type"],
                     "text": row["text"],
+                    "relevance_grade": relevance_grade,
+                    "is_relevant": is_relevant_grade(relevance_grade),
                 }
             )
 
@@ -324,6 +357,16 @@ def run_single_experiment(
                 "answer_scope": json.dumps(answer_metadata_filter, ensure_ascii=False),
                 "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "answer_accuracy_label": answer_metrics.answer_accuracy_label,
+                "expected_answerable": answer_metrics.expected_answerable,
+                "abstained": answer_metrics.abstained,
+                "abstention_correct": answer_metrics.abstention_correct,
+                "over_answered": answer_metrics.over_answered,
+                "false_refusal": answer_metrics.false_refusal,
+                "answerability_confidence": answer_metrics.answerability_confidence,
+                "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
+                "runtime_retrieval_action": answer_metrics.runtime_retrieval_action,
+                "runtime_retrieval_score": answer_metrics.runtime_retrieval_score,
+                "runtime_retrieval_reason": answer_metrics.runtime_retrieval_reason,
                 "llm_used": llm_result.used,
                 "llm_status": llm_result.status,
                 "llm_error": llm_result.error,
@@ -332,6 +375,37 @@ def run_single_experiment(
                 "proxy_faithfulness": answer_metrics.proxy_faithfulness,
                 "proxy_context_relevance": answer_metrics.proxy_context_relevance,
                 "answer_has_gold_substring": answer_metrics.answer_has_gold_substring,
+                "claim_judge_used": answer_metrics.claim_judge_used,
+                "claim_judge_status": answer_metrics.claim_judge_status,
+                "claim_judge_error": answer_metrics.claim_judge_error,
+                "claim_judge_model": answer_metrics.claim_judge_model,
+                "gold_claim_count": answer_metrics.gold_claim_count,
+                "answer_claim_count": answer_metrics.answer_claim_count,
+                "context_claim_recall": answer_metrics.context_claim_recall,
+                "answer_claim_recall": answer_metrics.answer_claim_recall,
+                "answer_claim_precision": answer_metrics.answer_claim_precision,
+                "answer_claim_f1": answer_metrics.answer_claim_f1,
+                "factual_correctness_precision": answer_metrics.factual_correctness_precision,
+                "factual_correctness_recall": answer_metrics.factual_correctness_recall,
+                "factual_correctness_f1": answer_metrics.factual_correctness_f1,
+                "grounded_claim_ratio": answer_metrics.grounded_claim_ratio,
+                "hallucinated_claim_ratio": answer_metrics.hallucinated_claim_ratio,
+                "noise_sensitivity_relevant": answer_metrics.noise_sensitivity_relevant,
+                "noise_sensitivity_irrelevant": answer_metrics.noise_sensitivity_irrelevant,
+                "context_utilization": answer_metrics.context_utilization,
+                "context_entities_recall": answer_metrics.context_entities_recall,
+                "answer_entity_precision": answer_metrics.answer_entity_precision,
+                "evidence_attribution_precision": answer_metrics.evidence_attribution_precision,
+                "evidence_attribution_recall": answer_metrics.evidence_attribution_recall,
+                "evidence_attribution_f1": answer_metrics.evidence_attribution_f1,
+                "evidence_coverage": answer_metrics.evidence_coverage,
+                "attributed_answer_claim_count": answer_metrics.attributed_answer_claim_count,
+                "attributed_gold_claim_count": answer_metrics.attributed_gold_claim_count,
+                "invalid_attribution_count": answer_metrics.invalid_attribution_count,
+                "unsupported_claim_count": answer_metrics.unsupported_claim_count,
+                "missing_gold_claim_count": answer_metrics.missing_gold_claim_count,
+                "contradicted_claim_count": answer_metrics.contradicted_claim_count,
+                "claim_diagnostic": answer_metrics.claim_diagnostic,
             }
         )
         retrieval_metric_rows.append(
@@ -368,27 +442,60 @@ def run_single_experiment(
                 "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
+                "expected_answerable": answer_metrics.expected_answerable,
+                "abstained": answer_metrics.abstained,
+                "over_answered": answer_metrics.over_answered,
+                "false_refusal": answer_metrics.false_refusal,
+                "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
+                "runtime_retrieval_action": answer_metrics.runtime_retrieval_action,
+                "runtime_retrieval_score": answer_metrics.runtime_retrieval_score,
+                "claim_judge_used": answer_metrics.claim_judge_used,
+                "claim_judge_status": answer_metrics.claim_judge_status,
+                "claim_diagnostic": answer_metrics.claim_diagnostic,
+                "context_claim_recall": answer_metrics.context_claim_recall,
+                "answer_claim_recall": answer_metrics.answer_claim_recall,
+                "answer_claim_precision": answer_metrics.answer_claim_precision,
+                "grounded_claim_ratio": answer_metrics.grounded_claim_ratio,
+                "hallucinated_claim_ratio": answer_metrics.hallucinated_claim_ratio,
+                "noise_sensitivity_relevant": answer_metrics.noise_sensitivity_relevant,
+                "noise_sensitivity_irrelevant": answer_metrics.noise_sensitivity_irrelevant,
+                "context_utilization": answer_metrics.context_utilization,
+                "context_entities_recall": answer_metrics.context_entities_recall,
+                "answer_entity_precision": answer_metrics.answer_entity_precision,
+                "evidence_attribution_precision": answer_metrics.evidence_attribution_precision,
+                "evidence_attribution_recall": answer_metrics.evidence_attribution_recall,
+                "evidence_attribution_f1": answer_metrics.evidence_attribution_f1,
+                "evidence_coverage": answer_metrics.evidence_coverage,
+                "invalid_attribution_count": answer_metrics.invalid_attribution_count,
                 "explanation": diagnostics.explanation,
             }
         )
 
-        results.append(
-            {
+        result_row = {
                 "question_id": item["id"],
                 "question": item["question"],
                 "program_id": item.get("program_id", ""),
-                "program_name": item.get("program_name", ""),
-                "doc_id": item.get("doc_id", ""),
-                "answer_scope": json.dumps(answer_metadata_filter, ensure_ascii=False),
-                "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "gold_answer": item.get("gold_answer", ""),
                 "expected_keywords": json.dumps(item.get("expected_keywords", []), ensure_ascii=False),
                 "retrieved_chunk_ids": json.dumps(
                     [row["chunk_id"] for row in retrieved], ensure_ascii=False
                 ),
-                "base_retrieved_chunk_ids": json.dumps(
-                    [row["chunk_id"] for row in base_retrieved], ensure_ascii=False
-                ),  # chunks returned before KG expansion
+                "prediction_confidence": float(retrieved[0]["score"]) if retrieved else None,
+                "retrieved_chunks": json.dumps(
+                    [
+                        {
+                            "rank": rank,
+                            "chunk_id": row["chunk_id"],
+                            "score": row.get("score"),
+                            "section_id": row.get("section_id", ""),
+                            "title": row.get("title", ""),
+                            "retrieval_source": row.get("retrieval_source", "vector"),
+                            "text": row.get("text", ""),
+                        }
+                        for rank, row in enumerate(retrieved, start=1)
+                    ],
+                    ensure_ascii=False,
+                ),
                 "kg_retrieval_added_chunk_ids": (
                     json.dumps(kg_retrieval["added_chunk_ids"], ensure_ascii=False)
                     if kg_enabled
@@ -403,7 +510,16 @@ def run_single_experiment(
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
                 "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
-                "target_doc_retrieved_at_k": retrieval_metrics["target_doc_retrieved_at_k"],
+                "expected_answerable": answer_metrics.expected_answerable,
+                "abstained": answer_metrics.abstained,
+                "abstention_correct": answer_metrics.abstention_correct,
+                "over_answered": answer_metrics.over_answered,
+                "false_refusal": answer_metrics.false_refusal,
+                "answerability_confidence": answer_metrics.answerability_confidence,
+                "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
+                "runtime_retrieval_action": answer_metrics.runtime_retrieval_action,
+                "runtime_retrieval_score": answer_metrics.runtime_retrieval_score,
+                "runtime_retrieval_reason": answer_metrics.runtime_retrieval_reason,
                 "first_target_doc_rank": retrieval_metrics["first_target_doc_rank"],
                 "n_retrieved_target_doc_chunks": retrieval_metrics[
                     "n_retrieved_target_doc_chunks"
@@ -429,24 +545,83 @@ def run_single_experiment(
                 "answer_gold_support": answer_metrics.answer_gold_support,
                 "proxy_faithfulness": answer_metrics.proxy_faithfulness,
                 "proxy_context_relevance": answer_metrics.proxy_context_relevance,
-                "llm_status": llm_result.status,
-                "llm_error": llm_result.error,
+                "gold_claim_count": answer_metrics.gold_claim_count,
+                "answer_claim_count": answer_metrics.answer_claim_count,
+                "context_claim_recall": answer_metrics.context_claim_recall,
+                "answer_claim_recall": answer_metrics.answer_claim_recall,
+                "answer_claim_precision": answer_metrics.answer_claim_precision,
+                "answer_claim_f1": answer_metrics.answer_claim_f1,
+                "factual_correctness_precision": answer_metrics.factual_correctness_precision,
+                "factual_correctness_recall": answer_metrics.factual_correctness_recall,
+                "factual_correctness_f1": answer_metrics.factual_correctness_f1,
+                "grounded_claim_ratio": answer_metrics.grounded_claim_ratio,
+                "hallucinated_claim_ratio": answer_metrics.hallucinated_claim_ratio,
+                "noise_sensitivity_relevant": answer_metrics.noise_sensitivity_relevant,
+                "noise_sensitivity_irrelevant": answer_metrics.noise_sensitivity_irrelevant,
+                "context_utilization": answer_metrics.context_utilization,
+                "context_entities_recall": answer_metrics.context_entities_recall,
+                "answer_entity_precision": answer_metrics.answer_entity_precision,
+                "evidence_attribution_precision": answer_metrics.evidence_attribution_precision,
+                "evidence_attribution_recall": answer_metrics.evidence_attribution_recall,
+                "evidence_attribution_f1": answer_metrics.evidence_attribution_f1,
+                "evidence_coverage": answer_metrics.evidence_coverage,
+                "attributed_answer_claim_count": answer_metrics.attributed_answer_claim_count,
+                "attributed_gold_claim_count": answer_metrics.attributed_gold_claim_count,
+                "invalid_attribution_count": answer_metrics.invalid_attribution_count,
+                "claim_evidence_map": json.dumps(
+                    answer_metrics.claim_evidence_map,
+                    ensure_ascii=False,
+                ),
+                "unsupported_claim_count": answer_metrics.unsupported_claim_count,
+                "missing_gold_claim_count": answer_metrics.missing_gold_claim_count,
+                "contradicted_claim_count": answer_metrics.contradicted_claim_count,
+                "claim_diagnostic": answer_metrics.claim_diagnostic,
                 "answer": answer,
-                "answer_mode": answer_mode,
                 "auto_flag": auto_flag,
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
                 "diagnostic_explanation": diagnostics.explanation,
-                "manual_flag": "",
-                "manual_comment": "",
             }
-        )
+        results.append(apply_question_recommendations(result_row))
+        if claim_judge_result.used or claim_judge_result.status not in {"disabled", "no_claims"}:
+            judge_rows.append(
+                {
+                    "question_id": item["id"],
+                    "status": claim_judge_result.status,
+                    "error": claim_judge_result.error,
+                    "model": claim_judge_result.model,
+                    "metrics": claim_judge_result.metrics,
+                    "raw_response": claim_judge_result.raw_response,
+                }
+            )
+        for claim_index, claim_row in enumerate(answer_metrics.claim_evidence_map, start=1):
+            claim_evidence_rows.append(
+                {
+                    "question_id": item["id"],
+                    "question": item["question"],
+                    "claim_index": claim_index,
+                    "claim_type": claim_row.get("claim_type"),
+                    "claim": claim_row.get("claim"),
+                    "context_nli": claim_row.get("context_nli"),
+                    "answer_nli": claim_row.get("answer_nli"),
+                    "gold_nli": claim_row.get("gold_nli"),
+                    "supporting_chunk_ids": json.dumps(
+                        claim_row.get("supporting_chunk_ids", []),
+                        ensure_ascii=False,
+                    ),
+                    "raw_supporting_chunk_ids": json.dumps(
+                        claim_row.get("raw_supporting_chunk_ids", claim_row.get("supporting_chunk_ids", [])),
+                        ensure_ascii=False,
+                    ),
+                    "invalid_attribution_count": claim_row.get("invalid_attribution_count", 0),
+                    "supporting_chunks": json.dumps(
+                        claim_row.get("supporting_chunks", []),
+                        ensure_ascii=False,
+                    ),
+                }
+            )
 
     results_df = pd.DataFrame(results)
-    if not results_df.empty:
-        max_manual = min(10, len(results_df))
-        results_df.loc[: max_manual - 1, "manual_flag"] = "reviewed"
-        results_df.loc[: max_manual - 1, "manual_comment"] = "fill_correct_or_incorrect"
 
     results_csv = os.path.join(experiment_dir, "rag_results.csv")
     results_df.to_csv(results_csv, index=False)
@@ -462,6 +637,16 @@ def run_single_experiment(
     answer_metrics_json = os.path.join(experiment_dir, "answer_metrics_summary.json")
     with open(answer_metrics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_answer_metrics, f, ensure_ascii=False, indent=2)
+
+    claim_evidence_csv: Optional[str] = None
+    claim_evidence_jsonl: Optional[str] = None
+    if claim_evidence_rows:
+        claim_evidence_csv = os.path.join(experiment_dir, "claim_evidence_map.csv")
+        pd.DataFrame(claim_evidence_rows).to_csv(claim_evidence_csv, index=False)
+        claim_evidence_jsonl = os.path.join(experiment_dir, "claim_evidence_map.jsonl")
+        with open(claim_evidence_jsonl, "w", encoding="utf-8") as f:
+            for row in claim_evidence_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     retrieval_metrics_df = pd.DataFrame(retrieval_metric_rows)
     retrieval_metrics_csv = os.path.join(experiment_dir, "retrieval_metrics.csv")
@@ -494,9 +679,21 @@ def run_single_experiment(
     diagnostics_csv = os.path.join(experiment_dir, "diagnostics.csv")
     diagnostics_df.to_csv(diagnostics_csv, index=False)
     aggregate_diagnostics = summarize_diagnostics(diagnostic_rows)
+    prediction_calibration = summarize_confidence_calibration(
+        results,
+        confidence_key="prediction_confidence",
+        correct_fn=lambda row: row.get("auto_flag") == "correct",
+    )
     diagnostics_json = os.path.join(experiment_dir, "diagnostics_summary.json")
     with open(diagnostics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_diagnostics, f, ensure_ascii=False, indent=2)
+
+    claim_judge_jsonl: Optional[str] = None
+    if judge_rows:
+        claim_judge_jsonl = os.path.join(experiment_dir, "claim_judge_results.jsonl")
+        with open(claim_judge_jsonl, "w", encoding="utf-8") as f:
+            for row in judge_rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     error_report_md = os.path.join(experiment_dir, "error_report.md")
     with open(error_report_md, "w", encoding="utf-8") as f:
@@ -516,6 +713,12 @@ def run_single_experiment(
         "chunk_overlap": chunk_overlap,
         "hybrid_alpha": hybrid_alpha if retriever_type == "hybrid" else None,
         "top_k": top_k,
+        "reranker": {
+            "enabled": rerank_top_n > 1 and rerank_weight > 0.0,
+            "type": "lexical_overlap",
+            "top_n": rerank_top_n,
+            "weight": rerank_weight,
+        },
         "n_chunks": len(chunks),
         "n_questions": len(questions),
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
@@ -535,13 +738,30 @@ def run_single_experiment(
             "model": llm_config.model if llm_config.enabled else None,
             "answer_generation": llm_config.enabled,
         },
+        "runtime_retrieval_evaluator": {
+            "enabled": runtime_retrieval_evaluator_enabled,
+            "abstain_on_weak_evidence": abstain_on_weak_evidence,
+        },
+        "judge": {
+            "enabled": bool(judge_config and judge_config.enabled),
+            "model": judge_config.model if judge_config and judge_config.enabled else None,
+            "status_counts": aggregate_diagnostics.get("counts_by_claim_judge_status", {}),
+            "claim_judge_results_jsonl": claim_judge_jsonl,
+            "claim_evidence_map_csv": claim_evidence_csv,
+            "claim_evidence_map_jsonl": claim_evidence_jsonl,
+        },
+        "calibration": {
+            "prediction_confidence": prediction_calibration,
+        },
         "visualization": {
             "enabled": create_strategy_visualization,
             "strategy_score_profile_svg": None,
+            "strategy_chunk_alignment_svg": None,
         },
         "showcase": {
             "enabled": False,
             "score_profile_svg": None,
+            "chunk_alignment_svg": None,
             "metric_overview_svg": None,
             "diagnostics_svg": None,
             "showcase_md": None,
@@ -554,6 +774,8 @@ def run_single_experiment(
             "retrieved_chunks_csv": retrieved_csv,
             "answer_metrics_csv": answer_metrics_csv,
             "answer_metrics_summary_json": answer_metrics_json,
+            "claim_evidence_map_csv": claim_evidence_csv,
+            "claim_evidence_map_jsonl": claim_evidence_jsonl,
             "retrieval_metrics_csv": retrieval_metrics_csv,
             "retrieval_metrics_summary_json": retrieval_metrics_json,
             "kg_entities_csv": kg_entities_csv,
@@ -562,13 +784,27 @@ def run_single_experiment(
             "kg_summary_json": kg_summary_json,
             "diagnostics_csv": diagnostics_csv,
             "diagnostics_summary_json": diagnostics_json,
+            "claim_judge_results_jsonl": claim_judge_jsonl,
             "error_report_md": error_report_md,
             "strategy_score_profile_svg": None,
+            "strategy_chunk_alignment_svg": None,
             "strategy_metric_overview_svg": None,
             "strategy_diagnostics_svg": None,
             "strategy_showcase_md": None,
         },
     }
+    quality_advisor = build_run_advisor(summary, results)
+    quality_advisor_json = os.path.join(experiment_dir, "quality_advisor.json")
+    with open(quality_advisor_json, "w", encoding="utf-8") as f:
+        json.dump(quality_advisor, f, ensure_ascii=False, indent=2)
+    quality_report_md = write_quality_report(
+        os.path.join(experiment_dir, "quality_report.md"),
+        quality_advisor,
+        summary,
+    )
+    summary["advisor"] = quality_advisor
+    summary["outputs"]["quality_advisor_json"] = quality_advisor_json
+    summary["outputs"]["quality_report_md"] = quality_report_md
 
     if create_strategy_visualization:
         score_profile_svg = write_strategy_score_profile_svg(
@@ -577,8 +813,16 @@ def run_single_experiment(
             experiment_slug=experiment_slug,
             top_k=top_k,
         )
+        chunk_alignment_svg = write_chunk_relevance_comparison_svg(
+            retrieved_rows,
+            os.path.join(experiment_dir, "strategy_chunk_alignment.svg"),
+            top_k=top_k,
+            chart_label=experiment_slug,
+        )
         summary["visualization"]["strategy_score_profile_svg"] = score_profile_svg
+        summary["visualization"]["strategy_chunk_alignment_svg"] = chunk_alignment_svg
         summary["outputs"]["strategy_score_profile_svg"] = score_profile_svg
+        summary["outputs"]["strategy_chunk_alignment_svg"] = chunk_alignment_svg
 
     if create_strategy_showcase:
         showcase_bundle = write_strategy_showcase_bundle(
@@ -589,7 +833,9 @@ def run_single_experiment(
         summary["showcase"] = showcase_bundle
         summary["visualization"]["enabled"] = True
         summary["visualization"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
+        summary["visualization"]["strategy_chunk_alignment_svg"] = showcase_bundle["chunk_alignment_svg"]
         summary["outputs"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
+        summary["outputs"]["strategy_chunk_alignment_svg"] = showcase_bundle["chunk_alignment_svg"]
         summary["outputs"]["strategy_metric_overview_svg"] = showcase_bundle["metric_overview_svg"]
         summary["outputs"]["strategy_diagnostics_svg"] = showcase_bundle["diagnostics_svg"]
         summary["outputs"]["strategy_showcase_md"] = showcase_bundle["showcase_md"]

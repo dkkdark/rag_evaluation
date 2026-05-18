@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import re
-import unicodedata
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
-from rag_eval.chunking import chunk_by_section
-from rag_eval.models import Section
+from rag_eval.core.text_utils import metadata_value_matches
 
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 _SENTENCE_TRANSFORMER_CACHE: Dict[str, object] = {}
@@ -27,13 +25,14 @@ def tokenize_for_bm25(text: str) -> List[str]:
     return re.findall(r"[A-Za-zÄÖÜäöüß0-9]+", text.lower())
 
 
-def is_e5_model(model_name: str) -> bool:
-    return "e5" in model_name.casefold()
-
-
-def is_e5_mistral_model(model_name: str) -> bool:
-    lowered = model_name.casefold()
-    return "e5" in lowered and "mistral" in lowered
+def lexical_overlap_score(query: str, text: str) -> float:
+    query_tokens = set(tokenize_for_bm25(query))
+    if not query_tokens:
+        return 0.0
+    text_tokens = set(tokenize_for_bm25(text))
+    if not text_tokens:
+        return 0.0
+    return len(query_tokens.intersection(text_tokens)) / len(query_tokens)
 
 
 def format_dense_documents(texts: Sequence[str], model_name: str) -> List[str]:
@@ -68,31 +67,6 @@ def get_sentence_transformer(model_name: str):
     model = SentenceTransformer(model_name)
     _SENTENCE_TRANSFORMER_CACHE[model_name] = model
     return model
-
-
-def normalize_metadata_value(value: object) -> str:
-    normalized = unicodedata.normalize("NFKD", str(value).casefold())
-    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
-    normalized = normalized.replace("&", "and").replace("/", " ")
-    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
-    aliases = {
-        "ba": "bachelor",
-        "bpo": "bachelor",
-        "ma": "master",
-        "mpo": "master",
-        "sciences": "science",
-    }
-    return " ".join(aliases.get(token, token) for token in normalized.split())
-
-
-def metadata_value_matches(actual: object, expected: object) -> bool:
-    actual_norm = normalize_metadata_value(actual)
-    expected_norm = normalize_metadata_value(expected)
-    return (
-        actual_norm == expected_norm
-        or actual_norm in expected_norm
-        or expected_norm in actual_norm
-    )
 
 
 def chunk_matches_filter(chunk: Dict, metadata_filter: Dict[str, object] | None) -> bool:
@@ -295,8 +269,39 @@ def retrieve_top_k(
     raise ValueError(f"Unsupported retriever backend: {retriever_state['backend']}")
 
 
-# Build a lightweight section-level retriever when coarse document navigation is enough.
-def build_section_retriever_for_enrichment(sections: Sequence[Section]) -> Tuple[List[Dict], Dict]:
-    section_chunks = chunk_by_section(sections)
-    retriever_state = build_retriever(section_chunks, "tfidf", "")
-    return section_chunks, retriever_state
+def rerank_with_lexical_signal(
+    *,
+    query: str,
+    rows: Sequence[Dict],
+    top_k: int,
+    rerank_top_n: int,
+    rerank_weight: float,
+) -> List[Dict]:
+    if top_k <= 0:
+        return []
+    if rerank_top_n <= 1 or rerank_weight <= 0.0 or not rows:
+        return list(rows[:top_k])
+
+    limited_top_n = min(len(rows), max(top_k, rerank_top_n))
+    head = [dict(row) for row in rows[:limited_top_n]]
+    tail = [dict(row) for row in rows[limited_top_n:]]
+
+    base_scores = [float(row.get("score") or 0.0) for row in head]
+    base_norm = min_max_normalize(base_scores)
+    lexical_scores = [
+        lexical_overlap_score(query, f"{row.get('title', '')}\n{row.get('text', '')}")
+        for row in head
+    ]
+
+    reranked: List[Dict] = []
+    for row, base_score, lexical_score in zip(head, base_norm, lexical_scores):
+        final_score = (1.0 - rerank_weight) * base_score + rerank_weight * lexical_score
+        row["base_score_before_rerank"] = float(row.get("score") or 0.0)
+        row["lexical_rerank_score"] = lexical_score
+        row["score"] = float(final_score)
+        row["reranked"] = True
+        reranked.append(row)
+
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    combined = reranked + tail
+    return combined[:top_k]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Dict, Iterable, List, Sequence
 
-from rag_eval.models import Paragraph, Section
+from rag_eval.core.models import Paragraph, Section
 
 
 # Use a simple whitespace tokenizer so chunking stays offline and predictable.
