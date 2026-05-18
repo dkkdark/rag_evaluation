@@ -301,5 +301,3 @@ Start with these files:
 4. `retrieved_chunks.csv`: what the retriever/classifier actually returned.
 5. `answer_metrics_summary.json` and `retrieval_metrics_summary.json`: aggregate scores.
 6. `diagnostics.csv`: why each row failed or needs review.
-
-For CPV classifiers, focus first on `exact_top1_accuracy`, `hit_at_k`, `mrr_at_k`, and hierarchy similarity. For PDF RAG, focus first on `recall_at_k`, `ndcg_at_k`, `context_claim_recall`, `grounded_claim_ratio`, and the diagnostic columns.
