@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
+import math
 import os
 import re
 import time
@@ -10,6 +12,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Dict, List
 
+from rag_eval.core.models import DiagnosticResult
 from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
 from rag_eval.classifiers.cpv_baseline import build_cpv_chunks, build_parent_lookup, load_cpv_catalog, load_queries
 from rag_eval.evaluation.adapters import build_items_from_cpv_queries
@@ -17,6 +20,7 @@ from rag_eval.evaluation.core import (
     EvaluationItem,
     PredictionRecord,
     RankedCandidate,
+    best_cpv_hierarchy_match,
     cpv_common_prefix_length,
     cpv_structural_distance,
     cpv_structural_similarity,
@@ -29,7 +33,6 @@ from rag_eval.evaluation.metrics import (
     is_relevant_grade,
     retrieval_relevance_grade,
     runtime_retrieval_evaluation,
-    summarize_answer_metrics,
     summarize_diagnostics,
     summarize_retrieval_metrics,
     summarize_confidence_calibration,
@@ -46,6 +49,9 @@ DUPLICATE_METRIC_COLUMNS = [
     "normalized_hierarchical_distance_top1",
     "cpv_hierarchy_distance_top1",
     "cpv_common_prefix_length_top1",
+    "hierarchy_match_level_top1",
+    "hierarchy_match_label_top1",
+    "hierarchy_score_top1",
     "same_division_top1",
     "same_group_top1",
     "same_class_top1",
@@ -78,6 +84,7 @@ DUPLICATE_METRIC_COLUMNS = [
     "target_doc_retrieved_at_k",
     "first_target_doc_rank",
     "n_retrieved_target_doc_chunks",
+    "partial_correct",
 ]
 
 
@@ -86,8 +93,10 @@ def _apply_showcase_bundle(summary: Dict[str, object], showcase_bundle: Dict[str
     summary["visualization"]["enabled"] = True
     summary["visualization"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
     summary["visualization"]["strategy_chunk_alignment_svg"] = showcase_bundle["chunk_alignment_svg"]
+    summary["visualization"]["strategy_unique_chunk_alignment_svg"] = showcase_bundle.get("unique_chunk_alignment_svg")
     summary["outputs"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
     summary["outputs"]["strategy_chunk_alignment_svg"] = showcase_bundle["chunk_alignment_svg"]
+    summary["outputs"]["strategy_unique_chunk_alignment_svg"] = showcase_bundle.get("unique_chunk_alignment_svg")
     summary["outputs"]["strategy_metric_overview_svg"] = showcase_bundle["metric_overview_svg"]
     summary["outputs"]["strategy_diagnostics_svg"] = showcase_bundle["diagnostics_svg"]
     summary["outputs"]["strategy_showcase_md"] = showcase_bundle["showcase_md"]
@@ -255,12 +264,44 @@ def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> 
             ],
         )
         base_score = _parse_float(score_raw, fallback=max(0.0, 1.0 - rank * 0.001))
+        chunk_id = _first_present(
+            row,
+            [
+                f"chunkid{rank}",
+                f"chunkids{rank}",
+                f"retrievedchunkid{rank}",
+                f"retrievedchunkids{rank}",
+            ],
+        )
+        chunk_title = _first_present(
+            row,
+            [
+                f"chunktitel{rank}",
+                f"chunktitle{rank}",
+                f"title{rank}",
+                f"retrievedchunktitle{rank}",
+            ],
+        )
+        chunk_text = _first_present(
+            row,
+            [
+                f"chunktext{rank}",
+                f"chunk{rank}",
+                f"chunks{rank}",
+                f"retrievedchunktext{rank}",
+                f"retrievedchunks{rank}",
+                f"context{rank}",
+            ],
+        )
         for offset, predicted_code in enumerate(predicted_codes):
             candidates.append(
                 {
                     "label": predicted_code,
                     "score": float(base_score or 0.0) - (offset * 0.000001),
                     "rank": rank,
+                    "chunk_id": str(chunk_id).strip() if chunk_id else "",
+                    "chunk_title": str(chunk_title).strip() if chunk_title else "",
+                    "chunk_text": str(chunk_text).strip() if chunk_text else "",
                     "source_row": row,
                     "source_row_index": row_index,
                 }
@@ -285,11 +326,32 @@ def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> 
             "label": predicted_code,
             "score": float(base_score or 0.0) - (offset * 0.000001),
             "rank": rank_value,
+            "chunk_id": str(
+                _first_present(row, ["chunkid", "chunkids", "retrievedchunkids", "retrievedchunkid"])
+            ).strip(),
+            "chunk_title": str(_first_present(row, ["chunktitel", "chunktitle", "title"])).strip(),
+            "chunk_text": str(
+                _first_present(
+                    row,
+                    ["chunk", "chunks", "chunktext", "retrievedchunks", "retrievedchunktext", "context", "contexts"],
+                )
+            ).strip(),
             "source_row": row,
             "source_row_index": row_index,
         }
         for offset, predicted_code in enumerate(predicted_codes)
     ]
+
+
+def _rank_prepared_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    return sorted(
+        [candidate for candidate in candidates if str(candidate.get("label") or "").strip()],
+        key=lambda candidate: (
+            int(candidate.get("rank") or 999999),
+            -float(candidate.get("score") or 0.0),
+            int(candidate.get("source_row_index") or 0),
+        ),
+    )
 
 
 def _dedupe_ranked_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -320,12 +382,13 @@ def _dedupe_ranked_candidates(candidates: List[Dict[str, object]]) -> List[Dict[
 
 def _prepared_candidate_row(
     *,
+    query_id: str,
     candidate_label: str,
     score: float,
     rank: int,
     query_text: str,
     catalog_by_code: Dict[str, object],
-    source_row: Dict[str, object],
+    candidate: Dict[str, object],
 ) -> Dict[str, object]:
     row = _catalog_row_from_prediction(
         predicted_label=candidate_label,
@@ -337,12 +400,24 @@ def _prepared_candidate_row(
     row["retriever"] = "prepared_rag_results"
     row["chunking_strategy"] = "prepared_result"
     row["source_type"] = "prepared_rag_result"
+    source_row = candidate["source_row"]
     chunk_id = _first_present(source_row, ["chunkid", "chunkids", "retrievedchunkids", "retrievedchunkid"])
     chunk_text = _first_present(source_row, ["chunk", "chunks", "chunktext", "retrievedchunks", "retrievedchunktext", "context", "contexts"])
+    chunk_title = _first_present(source_row, ["chunktitel", "chunktitle", "title", "retrievedchunktitle"])
+    if candidate.get("chunk_id"):
+        chunk_id = candidate["chunk_id"]
+    if candidate.get("chunk_text"):
+        chunk_text = candidate["chunk_text"]
+    if candidate.get("chunk_title"):
+        chunk_title = candidate["chunk_title"]
     if chunk_id:
-        row["chunk_id"] = str(chunk_id)
+        row["chunk_id"] = str(chunk_id).strip()
+    elif chunk_text:
+        row["chunk_id"] = f"{query_id}|rank_{rank}|{candidate_label}"
     if chunk_text:
         row["text"] = str(chunk_text)
+    if chunk_title:
+        row["title"] = str(chunk_title)
     return row
 
 
@@ -382,6 +457,60 @@ CPV_IRRELEVANT_COLUMNS = [
     "abstention_correct",
     "over_answered",
     "false_refusal",
+    "ragas_recall_at_k",
+    "mean_ragas_recall_at_k",
+    "gold_answer",
+    "expected_keywords",
+    "answer",
+    "gold_answer_overlap",
+    "answer_gold_support",
+    "proxy_faithfulness",
+    "proxy_context_relevance",
+    "answer_has_gold_substring",
+    "answerability_confidence",
+    "runtime_retrieval_status",
+    "runtime_retrieval_action",
+    "runtime_retrieval_reason",
+    "runtime_retrieval_score",
+    "gold_claim_count",
+    "answer_claim_count",
+    "context_claim_recall",
+    "answer_claim_recall",
+    "answer_claim_precision",
+    "answer_claim_f1",
+    "factual_correctness_precision",
+    "factual_correctness_recall",
+    "factual_correctness_f1",
+    "grounded_claim_ratio",
+    "hallucinated_claim_ratio",
+    "noise_sensitivity_relevant",
+    "noise_sensitivity_irrelevant",
+    "context_utilization",
+    "context_entities_recall",
+    "answer_entity_precision",
+    "evidence_attribution_precision",
+    "evidence_attribution_recall",
+    "evidence_attribution_f1",
+    "evidence_coverage",
+    "attributed_answer_claim_count",
+    "attributed_gold_claim_count",
+    "invalid_attribution_count",
+    "unsupported_claim_count",
+    "missing_gold_claim_count",
+    "contradicted_claim_count",
+    "claim_diagnostic",
+    "claim_judge_used",
+    "claim_judge_status",
+    "claim_judge_error",
+    "claim_judge_model",
+    "recommendations",
+    "recommendation_count",
+    "recommended_component",
+    "recommendation_priority",
+    "recommended_action",
+    "recommendation_reason",
+    "recommended_experiment",
+    "needs_manual_review",
 ]
 
 
@@ -391,6 +520,43 @@ def _drop_irrelevant_classifier_columns(df, *, classifier_type: str):
     if classifier_type not in {"ted_cpv", "api_classifier", "prepared_rag_results"}:
         return df
     return df.drop(columns=[column for column in CPV_IRRELEVANT_COLUMNS if column in df.columns])
+
+
+def _clean_cpv_rows(rows: List[Dict[str, object]], *, keep_recommendations: bool = False) -> List[Dict[str, object]]:
+    dropped_columns = set(CPV_IRRELEVANT_COLUMNS)
+    if keep_recommendations:
+        dropped_columns -= {
+            "recommendations",
+            "recommendation_count",
+            "recommended_component",
+            "recommendation_priority",
+            "recommended_action",
+            "recommendation_reason",
+            "recommended_experiment",
+            "needs_manual_review",
+        }
+    return [
+        {key: value for key, value in row.items() if key not in dropped_columns}
+        for row in rows
+    ]
+
+
+def _cpv_outcome_summary(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    n_items = len(rows)
+    n_correct = sum(1 for row in rows if row.get("auto_flag") == "correct")
+    n_incorrect = sum(1 for row in rows if row.get("auto_flag") == "incorrect")
+    return {
+        "n_items": n_items,
+        "n_correct": n_correct,
+        "n_incorrect": n_incorrect,
+        "accuracy": (n_correct / n_items) if n_items else None,
+    }
+
+
+def _cpv_retrieval_summary(metric_rows: List[Dict[str, object]]) -> Dict[str, object]:
+    summary = summarize_retrieval_metrics(metric_rows)
+    summary.pop("mean_ragas_recall_at_k", None)
+    return summary
 
 
 def _standardize_rag_results_columns(df):
@@ -478,15 +644,64 @@ def _cpv_classification_metrics(
     ]
     hierarchy_similarity = max(similarities) if similarities else None
     common_prefix_length = max(prefix_lengths) if prefix_lengths else None
-    same_group_top1 = bool(common_prefix_length is not None and common_prefix_length >= 3)
-    partial_correct = bool(same_group_top1 and not exact_top1_match)
+    hierarchy_match = best_cpv_hierarchy_match(top1_label, list(gold_set)) if top1_label else None
+    hierarchy_match_level = int(hierarchy_match["level"]) if hierarchy_match else None
+    hierarchy_match_label = str(hierarchy_match["label"]) if hierarchy_match else None
+    hierarchy_score = float(hierarchy_match["score"]) if hierarchy_match else None
+    same_division_top1 = bool(hierarchy_match_level is not None and hierarchy_match_level >= 2)
+    same_group_top1 = bool(hierarchy_match_level is not None and hierarchy_match_level >= 4)
+    same_class_top1 = bool(hierarchy_match_level is not None and hierarchy_match_level >= 6)
+    same_category_top1 = bool(hierarchy_match_level is not None and hierarchy_match_level >= 8)
     return {
         "exact_top1_match": exact_top1_match,
         "cpv_hierarchy_similarity_top1": hierarchy_similarity,
-        "partial_correct": partial_correct,
+        "cpv_common_prefix_length_top1": common_prefix_length,
+        "hierarchy_match_level_top1": hierarchy_match_level,
+        "hierarchy_match_label_top1": hierarchy_match_label,
+        "hierarchy_score_top1": hierarchy_score,
+        "same_division_top1": same_division_top1,
+        "same_group_top1": same_group_top1,
+        "same_class_top1": same_class_top1,
+        "same_category_top1": same_category_top1,
         "top1_predicted_cpv": top1_label,
         "expected_cpv_codes": json.dumps(list(gold_set), ensure_ascii=False),
     }
+
+
+def _cpv_auto_flag(classification_metrics: Dict[str, object]) -> str:
+    if classification_metrics.get("exact_top1_match") is True:
+        return "correct"
+    return "incorrect"
+
+
+def _cpv_diagnostics(
+    classification_metrics: Dict[str, object],
+    retrieval_metrics: Dict[str, object],
+) -> DiagnosticResult:
+    if classification_metrics.get("exact_top1_match") is True:
+        return DiagnosticResult(
+            primary_error_reason="ok",
+            secondary_error_reason="exact_match",
+            explanation="The top-1 answer matches the expected answer.",
+        )
+    hierarchy_score = _parse_float(classification_metrics.get("hierarchy_score_top1"), fallback=0.0)
+    if hierarchy_score and hierarchy_score > 0.0:
+        return DiagnosticResult(
+            primary_error_reason="hierarchy_near_miss",
+            secondary_error_reason=str(classification_metrics.get("hierarchy_match_label_top1") or "partial_hierarchy_match"),
+            explanation="The top-1 answer is not exact, but it lands in the same hierarchy branch.",
+        )
+    if retrieval_metrics.get("target_doc_retrieved_at_k") is True:
+        return DiagnosticResult(
+            primary_error_reason="gold_present_but_not_ranked_first",
+            secondary_error_reason="reranking_error",
+            explanation="The expected answer appears in top-k, but it was not selected as top-1.",
+        )
+    return DiagnosticResult(
+        primary_error_reason="gold_missing_from_top_k",
+        secondary_error_reason="candidate_generation_error",
+        explanation="The expected answer is missing from the top-k candidates.",
+    )
 
 
 def _all_answer_metric_fields(answer_metrics) -> Dict[str, object]:
@@ -521,7 +736,201 @@ def _all_retrieval_metric_fields(retrieval_metrics: Dict[str, object]) -> Dict[s
         "mrr_at_k": retrieval_metrics["mrr_at_k"],
         "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
         "recall_at_k": retrieval_metrics["recall_at_k"],
-        "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
+    }
+
+
+def _cpv_division(code: str) -> str:
+    normalized = re.sub(r"\D", "", str(code or ""))
+    return normalized[:2] if len(normalized) >= 2 else ""
+
+
+def _score_entropy(scores: List[float]) -> float | None:
+    usable = [max(float(score), 0.0) for score in scores if score is not None]
+    if len(usable) <= 1:
+        return None
+    total = sum(usable)
+    if total <= 0:
+        return None
+    probabilities = [score / total for score in usable if score > 0]
+    if not probabilities:
+        return None
+    entropy = -sum(probability * math.log(probability) for probability in probabilities)
+    return entropy / math.log(len(usable)) if len(usable) > 1 else 0.0
+
+
+def _cpv_rank_diagnostics(
+    *,
+    expected_codes: List[str],
+    ranked_labels: List[str],
+    scores: List[float],
+    query_text: str,
+    top_k: int,
+    prediction_confidence: float | None,
+) -> Dict[str, object]:
+    gold_set = {str(code).strip() for code in expected_codes if str(code).strip()}
+    labels = [str(label).strip() for label in ranked_labels[:top_k] if str(label).strip()]
+    top1 = labels[0] if labels else ""
+    exact_top1 = bool(top1 and top1 in gold_set)
+    gold_rank = next((rank for rank, label in enumerate(labels, start=1) if label in gold_set), None)
+    unique_labels = list(dict.fromkeys(labels))
+    unique_divisions = list(dict.fromkeys(_cpv_division(label) for label in labels if _cpv_division(label)))
+    duplicate_count = max(0, len(labels) - len(unique_labels))
+    duplicate_rate = duplicate_count / len(labels) if labels else 0.0
+    score_margin = None
+    if len(scores) >= 2 and scores[0] is not None and scores[1] is not None:
+        score_margin = float(scores[0]) - float(scores[1])
+    entropy = _score_entropy(scores[:top_k])
+    match_scores = [
+        float(match["score"])
+        for label in labels
+        for match in [best_cpv_hierarchy_match(label, list(gold_set))]
+        if match is not None
+    ]
+    best_hierarchy_score = max(match_scores) if match_scores else 0.0
+    query_tokens = re.findall(r"\w+", query_text or "", flags=re.UNICODE)
+
+    if exact_top1:
+        failure_mode = "ok"
+        likely_bottleneck = "none"
+    elif gold_rank is not None:
+        failure_mode = "gold_present_but_not_ranked_first"
+        likely_bottleneck = "reranker_or_prompt_selection"
+    elif best_hierarchy_score >= 0.75:
+        failure_mode = "same_class_wrong_code"
+        likely_bottleneck = "sibling_disambiguation"
+    elif best_hierarchy_score >= 0.25:
+        failure_mode = "same_branch_wrong_code"
+        likely_bottleneck = "hierarchy_disambiguation"
+    else:
+        failure_mode = "gold_missing_from_top_k"
+        likely_bottleneck = "candidate_generation_or_retriever"
+
+    high_confidence_wrong = bool(not exact_top1 and prediction_confidence is not None and prediction_confidence >= 0.85)
+    low_margin_decision = bool(score_margin is not None and score_margin <= 0.05)
+    duplicate_candidate_pressure = bool(duplicate_rate >= 0.34)
+    low_diversity_at_k = bool(len(labels) > 1 and len(unique_divisions) <= 1)
+    short_or_ambiguous_query = bool(len(query_tokens) <= 3)
+
+    if high_confidence_wrong:
+        likely_bottleneck = "confidence_calibration"
+    elif not exact_top1 and low_margin_decision and gold_rank is not None:
+        likely_bottleneck = "reranker_or_prompt_selection"
+
+    return {
+        "failure_mode": failure_mode,
+        "likely_bottleneck": likely_bottleneck,
+        "gold_rank": gold_rank,
+        "gold_present_at_k": gold_rank is not None,
+        "score_margin_top1_top2": score_margin,
+        "score_entropy_at_k": entropy,
+        "unique_cpv_at_k": len(unique_labels),
+        "unique_division_at_k": len(unique_divisions),
+        "duplicate_cpv_at_k": duplicate_count,
+        "duplicate_cpv_rate_at_k": duplicate_rate,
+        "best_hierarchy_score_at_k": best_hierarchy_score,
+        "high_confidence_wrong": high_confidence_wrong,
+        "low_margin_decision": low_margin_decision,
+        "duplicate_candidate_pressure": duplicate_candidate_pressure,
+        "low_diversity_at_k": low_diversity_at_k,
+        "short_or_ambiguous_query": short_or_ambiguous_query,
+        "query_token_count": len(query_tokens),
+        "gold_division": _cpv_division(next(iter(gold_set), "")),
+        "top1_division": _cpv_division(top1),
+    }
+
+
+def _average_numeric(rows: List[Dict[str, object]], key: str) -> float | None:
+    values = [
+        float(row[key])
+        for row in rows
+        if row.get(key) is not None and row.get(key) != ""
+    ]
+    return sum(values) / len(values) if values else None
+
+
+def _rate(rows: List[Dict[str, object]], key: str) -> float | None:
+    if not rows:
+        return None
+    return sum(1 for row in rows if row.get(key) is True) / len(rows)
+
+
+def _summarize_cpv_diagnostics(rows: List[Dict[str, object]], *, top_k: int) -> Dict[str, object]:
+    total = len(rows)
+    incorrect = [row for row in rows if row.get("auto_flag") != "correct"]
+    failure_counts = Counter(str(row.get("failure_mode") or "unknown") for row in rows)
+    bottleneck_counts = Counter(str(row.get("likely_bottleneck") or "unknown") for row in rows)
+    error_failure_counts = Counter(str(row.get("failure_mode") or "unknown") for row in incorrect)
+    error_bottleneck_counts = Counter(str(row.get("likely_bottleneck") or "unknown") for row in incorrect)
+    confusion_pairs = Counter(
+        f"{row.get('gold_division') or '?'}->{row.get('top1_division') or '?'}"
+        for row in incorrect
+        if row.get("gold_division") or row.get("top1_division")
+    )
+    data_needs: List[Dict[str, object]] = []
+    if top_k < 10:
+        data_needs.append(
+            {
+                "data": "larger ranked lists",
+                "why": "Top-3 shows whether the expected answer is nearby, but top-10/top-20 is much better for separating retriever coverage from reranker selection.",
+            }
+        )
+    if rows and not any(str(row.get("classifier_explanation") or "").strip() for row in rows):
+        data_needs.append(
+            {
+                "data": "candidate-level explanations",
+                "why": "A short reason for top-1 and contrast against rank-2 would make prompt/selection failures easier to detect.",
+            }
+        )
+    if rows and not any(str(row.get("alternative_gold_cpv_codes") or "").strip() for row in rows):
+        data_needs.append(
+            {
+                "data": "accepted alternative answers",
+                "why": "Some records can be ambiguous; alternate acceptable labels prevent marking plausible answers as pure system errors.",
+            }
+        )
+    if rows and not any(str(row.get("manual_error_type") or "").strip() for row in rows):
+        data_needs.append(
+            {
+                "data": "manual error labels for a small sample",
+                "why": "A 30-50 row audit with labels like retriever miss, prompt issue, ambiguous reference, and catalog gap would calibrate the automatic diagnosis.",
+            }
+        )
+    if rows and not any(str(row.get("prompt_version") or "").strip() for row in rows):
+        data_needs.append(
+            {
+                "data": "prompt/retriever configuration metadata",
+                "why": "Prompt version, retriever type, embedding model, and index version let the evaluator tie failures to concrete system changes.",
+            }
+        )
+
+    return {
+        "n_items": total,
+        "n_errors": len(incorrect),
+        "failure_mode_counts": dict(failure_counts),
+        "likely_bottleneck_counts": dict(bottleneck_counts),
+        "dominant_failure_mode": error_failure_counts.most_common(1)[0][0] if error_failure_counts else None,
+        "dominant_bottleneck": error_bottleneck_counts.most_common(1)[0][0] if error_bottleneck_counts else None,
+        "gold_present_at_k_rate": _rate(rows, "gold_present_at_k"),
+        "high_confidence_wrong_rate": _rate(rows, "high_confidence_wrong"),
+        "low_margin_decision_rate": _rate(rows, "low_margin_decision"),
+        "duplicate_candidate_pressure_rate": _rate(rows, "duplicate_candidate_pressure"),
+        "low_diversity_at_k_rate": _rate(rows, "low_diversity_at_k"),
+        "short_or_ambiguous_query_rate": _rate(rows, "short_or_ambiguous_query"),
+        "error_gold_present_at_k_rate": _rate(incorrect, "gold_present_at_k"),
+        "error_high_confidence_wrong_rate": _rate(incorrect, "high_confidence_wrong"),
+        "error_low_margin_decision_rate": _rate(incorrect, "low_margin_decision"),
+        "error_duplicate_candidate_pressure_rate": _rate(incorrect, "duplicate_candidate_pressure"),
+        "error_low_diversity_at_k_rate": _rate(incorrect, "low_diversity_at_k"),
+        "error_short_or_ambiguous_query_rate": _rate(incorrect, "short_or_ambiguous_query"),
+        "mean_score_margin_top1_top2": _average_numeric(rows, "score_margin_top1_top2"),
+        "mean_score_entropy_at_k": _average_numeric(rows, "score_entropy_at_k"),
+        "mean_unique_cpv_at_k": _average_numeric(rows, "unique_cpv_at_k"),
+        "mean_unique_division_at_k": _average_numeric(rows, "unique_division_at_k"),
+        "top_division_confusions": [
+            {"pair": pair, "count": count}
+            for pair, count in confusion_pairs.most_common(10)
+        ],
+        "additional_data_that_would_help": data_needs,
     }
 
 
@@ -637,7 +1046,7 @@ def evaluate_local_ted_cpv_classifier(
     queries = load_queries(queries_path)
     chunks = build_cpv_chunks(catalog, use_examples=use_examples)
     retriever_state = build_retriever(chunks, retriever, embedding_model)
-    # mean_cpv_hierarchy_similarity_top1 shows how close top-1 is to the gold CPV code.
+    # mean_cpv_hierarchy_similarity_top1 shows how close top-1 is to the reference label.
     parent_lookup = build_parent_lookup(catalog)
     label_by_code = {record.code: record.label for record in catalog}
     description_by_code = {record.code: record.description for record in catalog}
@@ -715,6 +1124,17 @@ def evaluate_local_ted_cpv_classifier(
             expected_codes=[query.gold_cpv_code],
             ranked_labels=[str(row["cpv_code"]) for row in retrieved[:top_k]],
         )
+        classifier_auto_flag = _cpv_auto_flag(classification_metrics)
+        diagnostics = _cpv_diagnostics(classification_metrics, retrieval_metrics)
+        prediction_confidence = float(retrieved[0]["score"]) if retrieved else None
+        cpv_rank_diagnostics = _cpv_rank_diagnostics(
+            expected_codes=[query.gold_cpv_code],
+            ranked_labels=[str(row["cpv_code"]) for row in retrieved[:top_k]],
+            scores=[float(row["score"]) for row in retrieved[:top_k]],
+            query_text=query.query,
+            top_k=top_k,
+            prediction_confidence=prediction_confidence,
+        )
 
         for rank, row in enumerate(retrieved, start=1):
             relevance_grade = retrieval_relevance_grade(item, row)
@@ -723,7 +1143,7 @@ def evaluate_local_ted_cpv_classifier(
                     "question_id": query.id,
                     "question": query.query,
                     "rank": rank,
-                    "auto_flag": answer_metrics.answer_accuracy_label,
+                    "auto_flag": classifier_auto_flag,
                     "retriever": retriever,
                     "chunk_id": row["chunk_id"],
                     "score": row["score"],
@@ -743,7 +1163,7 @@ def evaluate_local_ted_cpv_classifier(
                 "question_id": query.id,
                 "question": query.query,
                 **classification_metrics,
-                "answer_accuracy_label": answer_metrics.answer_accuracy_label,
+                "answer_accuracy_label": classifier_auto_flag,
                 "expected_answerable": answer_metrics.expected_answerable,
                 "abstained": answer_metrics.abstained,
                 "abstention_correct": answer_metrics.abstention_correct,
@@ -797,7 +1217,6 @@ def evaluate_local_ted_cpv_classifier(
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
-                "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
                 "first_relevant_rank": retrieval_metrics["first_relevant_rank"],
                 "n_relevant_chunks": retrieval_metrics["n_relevant_chunks"],
                 "n_retrieved_relevant_chunks": retrieval_metrics["n_retrieved_relevant_chunks"],
@@ -817,6 +1236,7 @@ def evaluate_local_ted_cpv_classifier(
                 "evaluation_scope": json.dumps({"doc_id": [query.gold_cpv_code]}, ensure_ascii=False),
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
+                **cpv_rank_diagnostics,
                 "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
                 "context_claim_recall": answer_metrics.context_claim_recall,
                 "grounded_claim_ratio": answer_metrics.grounded_claim_ratio,
@@ -839,6 +1259,7 @@ def evaluate_local_ted_cpv_classifier(
                 "gold_answer": item["gold_answer"],
                 "expected_keywords": json.dumps(item["expected_keywords"], ensure_ascii=False),
                 **classification_metrics,
+                **cpv_rank_diagnostics,
                 **_all_retrieval_metric_fields(retrieval_metrics),
                 **_all_answer_metric_fields(answer_metrics),
                 "expected_answerable": answer_metrics.expected_answerable,
@@ -846,14 +1267,13 @@ def evaluate_local_ted_cpv_classifier(
                 "abstention_correct": answer_metrics.abstention_correct,
                 "over_answered": answer_metrics.over_answered,
                 "false_refusal": answer_metrics.false_refusal,
-                "prediction_confidence": float(retrieved[0]["score"]) if retrieved else None,
+                "prediction_confidence": prediction_confidence,
                 "retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved], ensure_ascii=False),
                 "retrieved_chunks": _retrieved_chunks_payload(retrieved),
                 "base_retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved], ensure_ascii=False),
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
-                "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
                 "target_doc_retrieved_at_k": retrieval_metrics["target_doc_retrieved_at_k"],
                 "first_target_doc_rank": retrieval_metrics["first_target_doc_rank"],
                 "n_retrieved_target_doc_chunks": retrieval_metrics["n_retrieved_target_doc_chunks"],
@@ -883,7 +1303,7 @@ def evaluate_local_ted_cpv_classifier(
                 "llm_error": None,
                 "answer": answer,
                 "answer_mode": "classifier_label",
-                "auto_flag": answer_metrics.answer_accuracy_label,
+                "auto_flag": classifier_auto_flag,
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
                 "diagnostic_explanation": diagnostics.explanation,
@@ -902,7 +1322,6 @@ def evaluate_local_ted_cpv_classifier(
 
     rag_results_csv = os.path.join(run_dir, "rag_results.csv")
     retrieved_csv = os.path.join(run_dir, "retrieved_chunks.csv")
-    answer_metrics_csv = os.path.join(run_dir, "answer_metrics.csv")
     retrieval_metrics_csv = os.path.join(run_dir, "retrieval_metrics.csv")
     diagnostics_csv = os.path.join(run_dir, "diagnostics.csv")
     results_df.to_csv(rag_results_csv, index=False)
@@ -911,29 +1330,28 @@ def evaluate_local_ted_cpv_classifier(
         classifier_type="ted_cpv",
     ).to_csv(retrieved_csv, index=False)
     _drop_irrelevant_classifier_columns(
-        _drop_duplicate_metric_columns(pd.DataFrame(answer_metric_rows)),
-        classifier_type="ted_cpv",
-    ).to_csv(answer_metrics_csv, index=False)
-    _drop_irrelevant_classifier_columns(
         _drop_duplicate_metric_columns(pd.DataFrame(retrieval_metric_rows)),
         classifier_type="ted_cpv",
     ).to_csv(retrieval_metrics_csv, index=False)
-    pd.DataFrame(diagnostic_rows).to_csv(diagnostics_csv, index=False)
+    _drop_irrelevant_classifier_columns(
+        pd.DataFrame(diagnostic_rows),
+        classifier_type="ted_cpv",
+    ).to_csv(diagnostics_csv, index=False)
 
-    aggregate_answer_metrics = summarize_answer_metrics(answer_metric_rows)
-    aggregate_retrieval_metrics = summarize_retrieval_metrics(retrieval_metric_rows)
+    metric_rows = _clean_cpv_rows(result_rows)
+    advisor_rows = _clean_cpv_rows(result_rows, keep_recommendations=True)
+    aggregate_answer_metrics = _cpv_outcome_summary(metric_rows)
+    aggregate_retrieval_metrics = _cpv_retrieval_summary(retrieval_metric_rows)
     aggregate_diagnostics = summarize_diagnostics(diagnostic_rows)
+    aggregate_cpv_diagnostics = _summarize_cpv_diagnostics(metric_rows, top_k=top_k)
     classifier_calibration = summarize_confidence_calibration(
         result_rows,
         confidence_key="prediction_confidence",
         correct_fn=lambda row: row.get("auto_flag") == "correct",
     )
 
-    answer_metrics_json = os.path.join(run_dir, "answer_metrics_summary.json")
     retrieval_metrics_json = os.path.join(run_dir, "retrieval_metrics_summary.json")
     diagnostics_json = os.path.join(run_dir, "diagnostics_summary.json")
-    with open(answer_metrics_json, "w", encoding="utf-8") as f:
-        json.dump(aggregate_answer_metrics, f, ensure_ascii=False, indent=2)
     with open(retrieval_metrics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_retrieval_metrics, f, ensure_ascii=False, indent=2)
     with open(diagnostics_json, "w", encoding="utf-8") as f:
@@ -972,7 +1390,6 @@ def evaluate_local_ted_cpv_classifier(
         "n_chunks": len(chunks),
         "n_questions": len(queries),
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
-        "n_partial_correct": int((results_df.get("partial_correct") == True).sum()),
         "n_incorrect": int((results_df["auto_flag"] == "incorrect").sum()),
         "answer_metrics": aggregate_answer_metrics,
         "retrieval_metrics": aggregate_retrieval_metrics,
@@ -992,6 +1409,7 @@ def evaluate_local_ted_cpv_classifier(
             "explanation_coverage": 0.0,
             "ranking_metrics": ranking_metrics,
             "calibration": classifier_calibration,
+            "cpv_diagnostics": aggregate_cpv_diagnostics,
         },
         "visualization": {
             "enabled": create_visualization or create_showcase,
@@ -1010,8 +1428,6 @@ def evaluate_local_ted_cpv_classifier(
         "outputs": {
             "rag_results_csv": rag_results_csv,
             "retrieved_chunks_csv": retrieved_csv,
-            "answer_metrics_csv": answer_metrics_csv,
-            "answer_metrics_summary_json": answer_metrics_json,
             "retrieval_metrics_csv": retrieval_metrics_csv,
             "retrieval_metrics_summary_json": retrieval_metrics_json,
             "diagnostics_csv": diagnostics_csv,
@@ -1023,7 +1439,7 @@ def evaluate_local_ted_cpv_classifier(
             "strategy_showcase_md": None,
         },
     }
-    quality_advisor = build_run_advisor(summary, result_rows)
+    quality_advisor = build_run_advisor(summary, advisor_rows)
     quality_advisor_json = os.path.join(run_dir, "quality_advisor.json")
     with open(quality_advisor_json, "w", encoding="utf-8") as f:
         json.dump(quality_advisor, f, ensure_ascii=False, indent=2)
@@ -1117,15 +1533,16 @@ def evaluate_prepared_rag_results_classifier(
         query_id = str(group["id"])
         query_text = str(group["query"])
         expected_codes = [str(code) for code in group["expected_codes"] if str(code).strip()]
-        candidates_raw = _dedupe_ranked_candidates(group["rows"])[:top_k]
+        candidates_raw = _rank_prepared_candidates(group["rows"])[:top_k]
         retrieved_rows_for_query = [
             _prepared_candidate_row(
+                query_id=query_id,
                 candidate_label=str(candidate["label"]),
                 score=float(candidate["score"]),
                 rank=rank,
                 query_text=query_text,
                 catalog_by_code=catalog_by_code,
-                source_row=candidate["source_row"],
+                candidate=candidate,
             )
             for rank, candidate in enumerate(candidates_raw, start=1)
             if str(candidate.get("label", "")).strip()
@@ -1199,6 +1616,25 @@ def evaluate_prepared_rag_results_classifier(
             llm_status="provided" if group.get("llm_answer") else "disabled",
             answer_mode=answer_mode,
         )
+        classifier_auto_flag = _cpv_auto_flag(classification_metrics)
+        diagnostics = _cpv_diagnostics(classification_metrics, retrieval_metrics)
+        prediction_confidence = (
+            float(normalized_candidates[0].score)
+            if normalized_candidates and normalized_candidates[0].score is not None
+            else None
+        )
+        cpv_rank_diagnostics = _cpv_rank_diagnostics(
+            expected_codes=expected_codes,
+            ranked_labels=ranked_labels,
+            scores=[
+                float(candidate.score)
+                for candidate in normalized_candidates[:top_k]
+                if candidate.score is not None
+            ],
+            query_text=query_text,
+            top_k=top_k,
+            prediction_confidence=prediction_confidence,
+        )
 
         for rank, row in enumerate(retrieved_rows_for_query, start=1):
             relevance_grade = retrieval_relevance_grade(item, row)
@@ -1207,7 +1643,7 @@ def evaluate_prepared_rag_results_classifier(
                     "question_id": query_id,
                     "question": query_text,
                     "rank": rank,
-                    "auto_flag": answer_metrics.answer_accuracy_label,
+                    "auto_flag": classifier_auto_flag,
                     "retriever": "prepared_rag_results",
                     "chunk_id": row["chunk_id"],
                     "score": row["score"],
@@ -1227,7 +1663,7 @@ def evaluate_prepared_rag_results_classifier(
                 "question_id": query_id,
                 "question": query_text,
                 **classification_metrics,
-                "answer_accuracy_label": answer_metrics.answer_accuracy_label,
+                "answer_accuracy_label": classifier_auto_flag,
                 "expected_answerable": answer_metrics.expected_answerable,
                 "abstained": answer_metrics.abstained,
                 "abstention_correct": answer_metrics.abstention_correct,
@@ -1286,7 +1722,6 @@ def evaluate_prepared_rag_results_classifier(
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
-                "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
                 "first_relevant_rank": retrieval_metrics["first_relevant_rank"],
                 "n_relevant_chunks": retrieval_metrics["n_relevant_chunks"],
                 "n_retrieved_relevant_chunks": retrieval_metrics["n_retrieved_relevant_chunks"],
@@ -1306,6 +1741,7 @@ def evaluate_prepared_rag_results_classifier(
                 "evaluation_scope": json.dumps({"doc_id": expected_codes}, ensure_ascii=False),
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
+                **cpv_rank_diagnostics,
                 "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
                 "context_claim_recall": answer_metrics.context_claim_recall,
                 "grounded_claim_ratio": answer_metrics.grounded_claim_ratio,
@@ -1328,6 +1764,7 @@ def evaluate_prepared_rag_results_classifier(
                     "gold_answer": item["gold_answer"],
                     "expected_keywords": json.dumps(item["expected_keywords"], ensure_ascii=False),
                     **classification_metrics,
+                    **cpv_rank_diagnostics,
                     **_all_retrieval_metric_fields(retrieval_metrics),
                     **_all_answer_metric_fields(answer_metrics),
                     "expected_answerable": answer_metrics.expected_answerable,
@@ -1335,16 +1772,13 @@ def evaluate_prepared_rag_results_classifier(
                     "abstention_correct": answer_metrics.abstention_correct,
                     "over_answered": answer_metrics.over_answered,
                     "false_refusal": answer_metrics.false_refusal,
-                    "prediction_confidence": (
-                        float(normalized_candidates[0].score) if normalized_candidates and normalized_candidates[0].score is not None else None
-                    ),
+                    "prediction_confidence": prediction_confidence,
                     "retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved_rows_for_query], ensure_ascii=False),
                     "retrieved_chunks": _retrieved_chunks_payload(retrieved_rows_for_query),
                     "base_retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved_rows_for_query], ensure_ascii=False),
                     "mrr_at_k": retrieval_metrics["mrr_at_k"],
                     "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                     "recall_at_k": retrieval_metrics["recall_at_k"],
-                    "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
                     "target_doc_retrieved_at_k": retrieval_metrics["target_doc_retrieved_at_k"],
                     "first_relevant_rank": retrieval_metrics["first_relevant_rank"],
                     "n_relevant_chunks": retrieval_metrics["n_relevant_chunks"],
@@ -1386,7 +1820,7 @@ def evaluate_prepared_rag_results_classifier(
                     "llm_error": None,
                     "answer": answer,
                     "answer_mode": answer_mode,
-                    "auto_flag": answer_metrics.answer_accuracy_label,
+                    "auto_flag": classifier_auto_flag,
                     "primary_error_reason": diagnostics.primary_error_reason,
                     "secondary_error_reason": diagnostics.secondary_error_reason,
                     "diagnostic_explanation": diagnostics.explanation,
@@ -1440,21 +1874,6 @@ def evaluate_prepared_rag_results_classifier(
         ),
         classifier_type="prepared_rag_results",
     )
-    answer_metrics_df = _drop_irrelevant_classifier_columns(_drop_duplicate_metric_columns(_reorder_metric_columns(
-        pd.DataFrame(answer_metric_rows),
-        trailing_columns=[
-            "question_id",
-            "question",
-            "expected_cpv_codes",
-            "top1_predicted_cpv",
-            "answer",
-            "answer_mode",
-            "llm_status",
-            "llm_error",
-            "runtime_retrieval_reason",
-            "claim_diagnostic",
-        ],
-    )), classifier_type="prepared_rag_results")
     retrieval_metrics_df = _drop_irrelevant_classifier_columns(_drop_duplicate_metric_columns(_reorder_metric_columns(
         pd.DataFrame(retrieval_metric_rows),
         trailing_columns=[
@@ -1471,7 +1890,6 @@ def evaluate_prepared_rag_results_classifier(
     )), classifier_type="prepared_rag_results")
     rag_results_csv = os.path.join(run_dir, "rag_results.csv")
     retrieved_csv = os.path.join(run_dir, "retrieved_chunks.csv")
-    answer_metrics_csv = os.path.join(run_dir, "answer_metrics.csv")
     retrieval_metrics_csv = os.path.join(run_dir, "retrieval_metrics.csv")
     diagnostics_csv = os.path.join(run_dir, "diagnostics.csv")
     pd.DataFrame(rows).to_csv(os.path.join(run_dir, "prepared_source_rows.csv"), index=False)
@@ -1480,13 +1898,18 @@ def evaluate_prepared_rag_results_classifier(
         pd.DataFrame(ranking_rows),
         classifier_type="prepared_rag_results",
     ).to_csv(retrieved_csv, index=False)
-    answer_metrics_df.to_csv(answer_metrics_csv, index=False)
     retrieval_metrics_df.to_csv(retrieval_metrics_csv, index=False)
-    pd.DataFrame(diagnostic_rows).to_csv(diagnostics_csv, index=False)
+    _drop_irrelevant_classifier_columns(
+        pd.DataFrame(diagnostic_rows),
+        classifier_type="prepared_rag_results",
+    ).to_csv(diagnostics_csv, index=False)
 
-    aggregate_answer_metrics = summarize_answer_metrics(answer_metric_rows)
-    aggregate_retrieval_metrics = summarize_retrieval_metrics(retrieval_metric_rows)
+    metric_rows = _clean_cpv_rows(result_rows)
+    advisor_rows = _clean_cpv_rows(result_rows, keep_recommendations=True)
+    aggregate_answer_metrics = _cpv_outcome_summary(metric_rows)
+    aggregate_retrieval_metrics = _cpv_retrieval_summary(retrieval_metric_rows)
     aggregate_diagnostics = summarize_diagnostics(diagnostic_rows)
+    aggregate_cpv_diagnostics = _summarize_cpv_diagnostics(metric_rows, top_k=top_k)
     classifier_calibration = summarize_confidence_calibration(
         result_rows,
         confidence_key="prediction_confidence",
@@ -1499,11 +1922,8 @@ def evaluate_prepared_rag_results_classifier(
         distance_fn=cpv_structural_distance,
     )
 
-    answer_metrics_json = os.path.join(run_dir, "answer_metrics_summary.json")
     retrieval_metrics_json = os.path.join(run_dir, "retrieval_metrics_summary.json")
     diagnostics_json = os.path.join(run_dir, "diagnostics_summary.json")
-    with open(answer_metrics_json, "w", encoding="utf-8") as f:
-        json.dump(aggregate_answer_metrics, f, ensure_ascii=False, indent=2)
     with open(retrieval_metrics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_retrieval_metrics, f, ensure_ascii=False, indent=2)
     with open(diagnostics_json, "w", encoding="utf-8") as f:
@@ -1521,7 +1941,6 @@ def evaluate_prepared_rag_results_classifier(
         "n_chunks": len(catalog_chunks),
         "n_questions": len(grouped),
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
-        "n_partial_correct": int((results_df.get("partial_correct") == True).sum()),
         "n_incorrect": int((results_df["auto_flag"] == "incorrect").sum()),
         "answer_metrics": aggregate_answer_metrics,
         "retrieval_metrics": aggregate_retrieval_metrics,
@@ -1537,15 +1956,16 @@ def evaluate_prepared_rag_results_classifier(
             "source_path": prepared_results_path,
             "ranking_metrics": ranking_metrics,
             "calibration": classifier_calibration,
+            "cpv_diagnostics": aggregate_cpv_diagnostics,
             "input_contract": {
-                "current_columns": ["ID", "Query (BANF)", "Expected CPV", "Predicted CPV", "RRF Score"],
+                "current_columns": ["ID", "Query", "Expected answer", "Predicted answer", "Score"],
                 "current_top_k_columns": [
-                    "Predicted CPV #1",
-                    "Vector Score #1",
-                    "Predicted CPV #2",
-                    "Vector Score #2",
-                    "Predicted CPV #3",
-                    "Vector Score #3",
+                    "Predicted answer #1",
+                    "Score #1",
+                    "Predicted answer #2",
+                    "Score #2",
+                    "Predicted answer #3",
+                    "Score #3",
                 ],
                 "supported_future_columns": [
                     "Rank",
@@ -1578,8 +1998,6 @@ def evaluate_prepared_rag_results_classifier(
         "outputs": {
             "rag_results_csv": rag_results_csv,
             "retrieved_chunks_csv": retrieved_csv,
-            "answer_metrics_csv": answer_metrics_csv,
-            "answer_metrics_summary_json": answer_metrics_json,
             "retrieval_metrics_csv": retrieval_metrics_csv,
             "retrieval_metrics_summary_json": retrieval_metrics_json,
             "diagnostics_csv": diagnostics_csv,
@@ -1592,7 +2010,7 @@ def evaluate_prepared_rag_results_classifier(
             "prepared_source_rows_csv": os.path.join(run_dir, "prepared_source_rows.csv"),
         },
     }
-    quality_advisor = build_run_advisor(summary, result_rows)
+    quality_advisor = build_run_advisor(summary, advisor_rows)
     quality_advisor_json = os.path.join(run_dir, "quality_advisor.json")
     with open(quality_advisor_json, "w", encoding="utf-8") as f:
         json.dump(quality_advisor, f, ensure_ascii=False, indent=2)
@@ -1762,6 +2180,25 @@ def evaluate_api_ted_cpv_classifier(
             expected_codes=[query.gold_cpv_code],
             ranked_labels=[candidate.label for candidate in normalized_candidates[:top_k]],
         )
+        classifier_auto_flag = _cpv_auto_flag(classification_metrics)
+        diagnostics = _cpv_diagnostics(classification_metrics, retrieval_metrics)
+        prediction_confidence = (
+            float(normalized_candidates[0].score)
+            if normalized_candidates and normalized_candidates[0].score is not None
+            else None
+        )
+        cpv_rank_diagnostics = _cpv_rank_diagnostics(
+            expected_codes=[query.gold_cpv_code],
+            ranked_labels=[candidate.label for candidate in normalized_candidates[:top_k]],
+            scores=[
+                float(candidate.score)
+                for candidate in normalized_candidates[:top_k]
+                if candidate.score is not None
+            ],
+            query_text=query.query,
+            top_k=top_k,
+            prediction_confidence=prediction_confidence,
+        )
 
         for rank, row in enumerate(retrieved_rows_for_query, start=1):
             relevance_grade = retrieval_relevance_grade(item, row)
@@ -1770,7 +2207,7 @@ def evaluate_api_ted_cpv_classifier(
                     "question_id": query.id,
                     "question": query.query,
                     "rank": rank,
-                    "auto_flag": answer_metrics.answer_accuracy_label,
+                    "auto_flag": classifier_auto_flag,
                     "retriever": "api_classifier",
                     "chunk_id": row["chunk_id"],
                     "score": row["score"],
@@ -1790,7 +2227,7 @@ def evaluate_api_ted_cpv_classifier(
                 "question_id": query.id,
                 "question": query.query,
                 **classification_metrics,
-                "answer_accuracy_label": answer_metrics.answer_accuracy_label,
+                "answer_accuracy_label": classifier_auto_flag,
                 "expected_answerable": answer_metrics.expected_answerable,
                 "abstained": answer_metrics.abstained,
                 "abstention_correct": answer_metrics.abstention_correct,
@@ -1844,7 +2281,6 @@ def evaluate_api_ted_cpv_classifier(
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
-                "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
                 "first_relevant_rank": retrieval_metrics["first_relevant_rank"],
                 "n_relevant_chunks": retrieval_metrics["n_relevant_chunks"],
                 "n_retrieved_relevant_chunks": retrieval_metrics["n_retrieved_relevant_chunks"],
@@ -1864,6 +2300,7 @@ def evaluate_api_ted_cpv_classifier(
                 "evaluation_scope": json.dumps({"doc_id": [query.gold_cpv_code]}, ensure_ascii=False),
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
+                **cpv_rank_diagnostics,
                 "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
                 "context_claim_recall": answer_metrics.context_claim_recall,
                 "grounded_claim_ratio": answer_metrics.grounded_claim_ratio,
@@ -1886,6 +2323,7 @@ def evaluate_api_ted_cpv_classifier(
                     "gold_answer": item["gold_answer"],
                     "expected_keywords": json.dumps(item["expected_keywords"], ensure_ascii=False),
                     **classification_metrics,
+                    **cpv_rank_diagnostics,
                     **_all_retrieval_metric_fields(retrieval_metrics),
                     **_all_answer_metric_fields(answer_metrics),
                     "expected_answerable": answer_metrics.expected_answerable,
@@ -1893,16 +2331,13 @@ def evaluate_api_ted_cpv_classifier(
                     "abstention_correct": answer_metrics.abstention_correct,
                     "over_answered": answer_metrics.over_answered,
                     "false_refusal": answer_metrics.false_refusal,
-                    "prediction_confidence": (
-                        float(normalized_candidates[0].score) if normalized_candidates and normalized_candidates[0].score is not None else None
-                    ),
+                    "prediction_confidence": prediction_confidence,
                     "retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved_rows_for_query], ensure_ascii=False),
                     "retrieved_chunks": _retrieved_chunks_payload(retrieved_rows_for_query),
                     "base_retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved_rows_for_query], ensure_ascii=False),
                     "mrr_at_k": retrieval_metrics["mrr_at_k"],
                     "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                     "recall_at_k": retrieval_metrics["recall_at_k"],
-                    "ragas_recall_at_k": retrieval_metrics["ragas_recall_at_k"],
                     "target_doc_retrieved_at_k": retrieval_metrics["target_doc_retrieved_at_k"],
                     "first_target_doc_rank": retrieval_metrics["first_target_doc_rank"],
                     "n_retrieved_target_doc_chunks": retrieval_metrics["n_retrieved_target_doc_chunks"],
@@ -1932,7 +2367,8 @@ def evaluate_api_ted_cpv_classifier(
                     "llm_error": None,
                     "answer": answer,
                     "answer_mode": "api_classifier_label",
-                    "auto_flag": answer_metrics.answer_accuracy_label,
+                    "classifier_explanation": explanation,
+                    "auto_flag": classifier_auto_flag,
                     "primary_error_reason": diagnostics.primary_error_reason,
                     "secondary_error_reason": diagnostics.secondary_error_reason,
                     "diagnostic_explanation": diagnostics.explanation,
@@ -1953,7 +2389,6 @@ def evaluate_api_ted_cpv_classifier(
 
     rag_results_csv = os.path.join(run_dir, "rag_results.csv")
     retrieved_csv = os.path.join(run_dir, "retrieved_chunks.csv")
-    answer_metrics_csv = os.path.join(run_dir, "answer_metrics.csv")
     retrieval_metrics_csv = os.path.join(run_dir, "retrieval_metrics.csv")
     diagnostics_csv = os.path.join(run_dir, "diagnostics.csv")
     results_df.to_csv(rag_results_csv, index=False)
@@ -1962,29 +2397,28 @@ def evaluate_api_ted_cpv_classifier(
         classifier_type="api_classifier",
     ).to_csv(retrieved_csv, index=False)
     _drop_irrelevant_classifier_columns(
-        _drop_duplicate_metric_columns(pd.DataFrame(answer_metric_rows)),
-        classifier_type="api_classifier",
-    ).to_csv(answer_metrics_csv, index=False)
-    _drop_irrelevant_classifier_columns(
         _drop_duplicate_metric_columns(pd.DataFrame(retrieval_metric_rows)),
         classifier_type="api_classifier",
     ).to_csv(retrieval_metrics_csv, index=False)
-    pd.DataFrame(diagnostic_rows).to_csv(diagnostics_csv, index=False)
+    _drop_irrelevant_classifier_columns(
+        pd.DataFrame(diagnostic_rows),
+        classifier_type="api_classifier",
+    ).to_csv(diagnostics_csv, index=False)
 
-    aggregate_answer_metrics = summarize_answer_metrics(answer_metric_rows)
-    aggregate_retrieval_metrics = summarize_retrieval_metrics(retrieval_metric_rows)
+    metric_rows = _clean_cpv_rows(result_rows)
+    advisor_rows = _clean_cpv_rows(result_rows, keep_recommendations=True)
+    aggregate_answer_metrics = _cpv_outcome_summary(metric_rows)
+    aggregate_retrieval_metrics = _cpv_retrieval_summary(retrieval_metric_rows)
     aggregate_diagnostics = summarize_diagnostics(diagnostic_rows)
+    aggregate_cpv_diagnostics = _summarize_cpv_diagnostics(metric_rows, top_k=top_k)
     classifier_calibration = summarize_confidence_calibration(
         result_rows,
         confidence_key="prediction_confidence",
         correct_fn=lambda row: row.get("auto_flag") == "correct",
     )
 
-    answer_metrics_json = os.path.join(run_dir, "answer_metrics_summary.json")
     retrieval_metrics_json = os.path.join(run_dir, "retrieval_metrics_summary.json")
     diagnostics_json = os.path.join(run_dir, "diagnostics_summary.json")
-    with open(answer_metrics_json, "w", encoding="utf-8") as f:
-        json.dump(aggregate_answer_metrics, f, ensure_ascii=False, indent=2)
     with open(retrieval_metrics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_retrieval_metrics, f, ensure_ascii=False, indent=2)
     with open(diagnostics_json, "w", encoding="utf-8") as f:
@@ -2023,7 +2457,6 @@ def evaluate_api_ted_cpv_classifier(
         "n_chunks": len(catalog),
         "n_questions": len(queries),
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
-        "n_partial_correct": int((results_df.get("partial_correct") == True).sum()),
         "n_incorrect": int((results_df["auto_flag"] == "incorrect").sum()),
         "answer_metrics": aggregate_answer_metrics,
         "retrieval_metrics": aggregate_retrieval_metrics,
@@ -2046,6 +2479,7 @@ def evaluate_api_ted_cpv_classifier(
             ),
             "ranking_metrics": ranking_metrics,
             "calibration": classifier_calibration,
+            "cpv_diagnostics": aggregate_cpv_diagnostics,
             "response_contract": {
                 "required": ["id", "query", "predictions[].label|cpv_code|answer", "predictions[].score|confidence"],
                 "optional": [
@@ -2075,8 +2509,6 @@ def evaluate_api_ted_cpv_classifier(
         "outputs": {
             "rag_results_csv": rag_results_csv,
             "retrieved_chunks_csv": retrieved_csv,
-            "answer_metrics_csv": answer_metrics_csv,
-            "answer_metrics_summary_json": answer_metrics_json,
             "retrieval_metrics_csv": retrieval_metrics_csv,
             "retrieval_metrics_summary_json": retrieval_metrics_json,
             "diagnostics_csv": diagnostics_csv,
@@ -2088,7 +2520,7 @@ def evaluate_api_ted_cpv_classifier(
             "strategy_showcase_md": None,
         },
     }
-    quality_advisor = build_run_advisor(summary, result_rows)
+    quality_advisor = build_run_advisor(summary, advisor_rows)
     quality_advisor_json = os.path.join(run_dir, "quality_advisor.json")
     with open(quality_advisor_json, "w", encoding="utf-8") as f:
         json.dump(quality_advisor, f, ensure_ascii=False, indent=2)

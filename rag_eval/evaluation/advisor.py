@@ -63,6 +63,27 @@ def pick_primary(recommendations: Sequence[Dict[str, str]]) -> Dict[str, str] | 
     )[0]
 
 
+def _display_failure_mode(value: object) -> str:
+    mapping = {
+        "gold_missing_from_top_k": "expected_answer_missing_from_top_k",
+        "gold_present_but_not_ranked_first": "expected_answer_present_but_not_ranked_first",
+        "same_class_wrong_code": "same_close_branch_wrong_answer",
+        "same_branch_wrong_code": "same_branch_wrong_answer",
+    }
+    return mapping.get(str(value or ""), str(value or ""))
+
+
+def _display_bottleneck(value: object) -> str:
+    mapping = {
+        "sibling_disambiguation": "close_candidate_disambiguation",
+        "hierarchy_disambiguation": "hierarchy_disambiguation",
+        "candidate_generation_or_retriever": "candidate_generation_or_retriever",
+        "reranker_or_prompt_selection": "reranker_or_prompt_selection",
+        "confidence_calibration": "confidence_calibration",
+    }
+    return mapping.get(str(value or ""), str(value or ""))
+
+
 def _non_none_recommendations(recommendations: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
     return [rec for rec in recommendations if rec.get("component") != "none"]
 
@@ -148,6 +169,132 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
         and grounded_claim_ratio is not None
         and grounded_claim_ratio >= 0.90
     )
+    failure_mode = str(row.get("failure_mode") or "")
+    likely_bottleneck = str(row.get("likely_bottleneck") or "")
+    display_failure_mode = _display_failure_mode(failure_mode)
+    gold_rank = as_float(row.get("gold_rank"))
+    score_margin = as_float(row.get("score_margin_top1_top2"))
+    duplicate_rate = as_float(row.get("duplicate_cpv_rate_at_k"))
+    unique_cpv = as_float(row.get("unique_cpv_at_k"))
+    unique_division = as_float(row.get("unique_division_at_k"))
+    best_hierarchy_score = as_float(row.get("best_hierarchy_score_at_k"))
+    low_margin_decision = as_bool(row.get("low_margin_decision")) is True
+    duplicate_pressure = as_bool(row.get("duplicate_candidate_pressure")) is True
+    low_diversity = as_bool(row.get("low_diversity_at_k")) is True
+    short_query = as_bool(row.get("short_or_ambiguous_query")) is True
+
+    if failure_mode and failure_mode != "ok":
+        if likely_bottleneck == "candidate_generation_or_retriever":
+            recs.append(
+                recommendation(
+                    component="retriever",
+                    priority="P1",
+                    issue="Expected answer is missing from the candidate list",
+                    evidence=f"failure_mode={display_failure_mode}, best_hierarchy_score_at_k={best_hierarchy_score}",
+                    recommendation_text="Treat this as a candidate generation problem before tuning the final prompt.",
+                    next_experiment="Increase top-k to 10 or 20 and compare expected-answer coverage; then test richer candidate text and alternative embeddings.",
+                    implementation_hint="Add descriptions, examples, synonyms, and parent/child labels to the retriever text. If coverage stays low, compare dense vs BM25/hybrid retrieval.",
+                    success_signal="Expected-answer coverage and hit@k rise, even before top-1 accuracy improves.",
+                )
+            )
+        elif likely_bottleneck == "reranker_or_prompt_selection":
+            recs.append(
+                recommendation(
+                    component="selection",
+                    priority="P1",
+                    issue="Expected answer is retrieved but not selected",
+                    evidence=f"expected_answer_rank={gold_rank}, score_margin_top1_top2={score_margin}",
+                    recommendation_text="Focus on the decision layer: reranker, score fusion, or a contrastive prompt over the top candidates.",
+                    next_experiment="Freeze retrieval, then compare current top-1 selection against a reranker or prompt that must contrast rank-1 vs candidates containing the expected answer.",
+                    implementation_hint="Ask the selector to justify why the winning answer is better than close alternatives, especially when the score margin is small.",
+                    success_signal="top-1 accuracy rises while hit@k stays roughly stable.",
+                )
+            )
+        elif likely_bottleneck in {"sibling_disambiguation", "hierarchy_disambiguation"}:
+            recs.append(
+                recommendation(
+                    component="hierarchy",
+                    priority="P2",
+                    issue="Prediction is in a related hierarchy branch but still wrong",
+                    evidence=f"failure_mode={display_failure_mode}, best_hierarchy_score_at_k={best_hierarchy_score}",
+                recommendation_text="Improve hierarchy-aware disambiguation instead of treating these as random retrieval misses.",
+                next_experiment="Add branch definitions/examples and run a hierarchy-aware reranker for related alternatives.",
+                implementation_hint="For each candidate, include parent labels, exclusions, domain-specific examples, and contrastive descriptions for related alternatives.",
+                success_signal="same-branch misses convert into exact matches and mean_hierarchy_score_top1 stays high.",
+            )
+        )
+        elif likely_bottleneck == "confidence_calibration":
+            recs.append(
+                recommendation(
+                    component="calibration",
+                    priority="P1",
+                    issue="Wrong answer is predicted with high confidence",
+                    evidence=f"prediction_confidence={prediction_confidence}, failure_mode={display_failure_mode}",
+                    recommendation_text="Do not auto-accept high-confidence predictions until scores are calibrated.",
+                    next_experiment="Fit threshold/reliability bins on a labeled validation set and route uncertain or overconfident-wrong bands to review.",
+                    implementation_hint="Track high_confidence_wrong_rate by score bucket and compare raw score against score margin features.",
+                    success_signal="High-confidence wrong rate drops and ECE/Brier score improve.",
+                )
+            )
+
+    if failure_mode and failure_mode != "ok" and low_margin_decision:
+        recs.append(
+            recommendation(
+                component="prompt",
+                priority="P2",
+                issue="Top candidates are too close to choose blindly",
+                evidence=f"score_margin_top1_top2={score_margin}",
+                recommendation_text="Use a contrastive selection prompt or reranker on low-margin cases instead of trusting rank 1.",
+                next_experiment="Only rerank examples where score_margin_top1_top2 <= 0.05 and compare accuracy/cost.",
+                implementation_hint="Prompt the model with top candidates, their hierarchy or category context, and a required reason for rejecting each close alternative.",
+                success_signal="Low-margin accuracy improves without adding cost to easy cases.",
+            )
+        )
+
+    if failure_mode and failure_mode != "ok" and duplicate_pressure:
+        recs.append(
+            recommendation(
+                component="retriever",
+                priority="P2",
+                issue="Candidate list contains duplicate answers",
+                evidence=f"unique_answers_at_k={unique_cpv}, unique_branches_at_k={unique_division}, duplicate_answer_rate_at_k={duplicate_rate}",
+                recommendation_text="Deduplicate repeated candidates before final selection so top-k contains more real alternatives.",
+                next_experiment="Compare raw top-k against a unique-answer top-k candidate set.",
+                implementation_hint="Collapse duplicate answers, keep the best score per answer, and then evaluate whether coverage or selection improves.",
+                success_signal="Higher unique answer count and better hit@k without lowering top-1 accuracy.",
+            )
+        )
+
+    if failure_mode and failure_mode != "ok" and low_diversity and not duplicate_pressure:
+        recs.append(
+            recommendation(
+                component="retriever",
+                priority="P2",
+                issue="Candidate list stays inside one broad branch",
+                evidence=f"unique_answers_at_k={unique_cpv}, unique_branches_at_k={unique_division}, duplicate_answer_rate_at_k={duplicate_rate}",
+                recommendation_text="Check whether candidate generation is over-committing to one branch before the final decision step.",
+                next_experiment="Compare current top-k against a diversity-aware candidate set, then rerank both.",
+                implementation_hint="This is not a duplicate problem; use it as a diagnostic to see whether the expected answer's branch is excluded too early.",
+                success_signal="More candidate branches are available when needed, without reducing exact top-1 accuracy.",
+            )
+        )
+
+    if failure_mode and failure_mode != "ok" and short_query:
+        recs.append(
+            recommendation(
+                component="benchmark",
+                priority="P3",
+                issue="Query may be too short or ambiguous",
+                evidence=f"query_token_count={row.get('query_token_count')}",
+                recommendation_text="Treat this row as needing extra domain context before blaming only the classifier.",
+                next_experiment="Add title, description, source/category metadata, or manual ambiguity label for this query and rerun.",
+                implementation_hint="Short titles often need object description, accepted alternatives, or source context to disambiguate related classes.",
+                success_signal="Manual audit confirms whether the expected answer is uniquely inferable from the provided query.",
+            )
+        )
+
+    if failure_mode:
+        return sorted(recs, key=lambda row: (priority_rank(row["priority"]), row["component"]))
 
     if expected_answerable is False and over_answered:
         recs.append(
@@ -199,7 +346,7 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                 recommendation_text="Some required evidence is found, but not enough for complete answers. Try larger top_k, section-level chunks, or multi-query retrieval.",
                 next_experiment="Compare --top-k 5 vs --top-k 10 and by_section vs fixed_words.",
                 implementation_hint="Prefer coverage-oriented changes first: top-k, chunk overlap, or chunk granularity. Only optimize prompting after coverage improves.",
-                success_signal="Higher context_claim_recall and lower missing_gold_claim_count.",
+                    success_signal="Higher context_claim_recall and lower missing_reference_claim_count.",
             )
         )
 
@@ -276,9 +423,9 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                 priority="P2",
                 issue="Reference entities are not well covered in context",
                 evidence=f"context_entities_recall={context_entities_recall:.2f}",
-                recommendation_text="Improve entity coverage with larger top-k, more examples, or hierarchy-aware retrieval so key terms and codes are not missed.",
+                recommendation_text="Improve entity coverage with larger top-k, more examples, or hierarchy-aware retrieval so key terms and expected answer cues are not missed.",
                 next_experiment="Compare current run against enriched examples and a reranked top-10 context.",
-                implementation_hint="Add synonyms, normalized code forms, or structured entity fields to retrieval text instead of relying only on raw prose.",
+                implementation_hint="Add synonyms, normalized answer forms, or structured entity fields to retrieval text instead of relying only on raw prose.",
                 success_signal="Higher context_entities_recall and better hit@k / target_doc_retrieved_at_k.",
             )
         )
@@ -297,7 +444,7 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                 evidence=f"factual_correctness_f1={factual_correctness_f1:.2f}, grounded_claim_ratio={grounded_claim_ratio:.2f}",
                 recommendation_text="Keep the retrieved evidence, but improve claim completeness or final label selection because the answer misses reference facts even when it stays grounded.",
                 next_experiment="Compare stricter answer synthesis against a reranked context on the same retrieval results.",
-                implementation_hint="Treat this as a completeness problem, not a hallucination problem: preserve grounding constraints but force better coverage of gold claims.",
+                implementation_hint="Treat this as a completeness problem, not a hallucination problem: preserve grounding constraints but force better coverage of reference claims.",
                 success_signal="Higher factual_correctness_f1 and answer_claim_f1 with grounded_claim_ratio remaining high.",
             )
         )
@@ -375,7 +522,7 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                 component="evaluation",
                 priority="P1",
                 issue="Possible judge/evaluator false negative",
-                evidence=f"primary_error_reason={primary_reason}, answer_gold_support={answer_gold_support:.2f}, proxy_faithfulness={proxy_faithfulness:.2f}",
+                evidence=f"primary_error_reason={primary_reason}, answer_reference_support={answer_gold_support:.2f}, proxy_faithfulness={proxy_faithfulness:.2f}",
                 recommendation_text="The automatic judge conflicts with heuristic support signals. Send this row to manual review before using it as a system failure.",
                 next_experiment="Add a human label for this question and calibrate judge thresholds.",
                 implementation_hint="Create a small adjudication set for rows where heuristic and judge-based signals strongly disagree.",
@@ -388,13 +535,13 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
             recommendation(
                 component="benchmark",
                 priority="P2",
-                issue="Gold answer may include extra details beyond the question",
+                issue="Reference answer may include extra details beyond the question",
                 evidence=(
                     f"auto_flag=correct, grounded_claim_ratio={grounded_claim_ratio:.2f}, "
                     f"context_claim_recall={context_claim_recall:.2f}"
                 ),
-                recommendation_text="The answer appears correct for the asked question, but the gold answer contains additional details that create missing-claim noise. Split optional explanatory details from required answer claims.",
-                next_experiment="Add required_claims/optional_claims or shorten gold_answer to the direct answer.",
+                recommendation_text="The answer appears correct for the asked question, but the reference answer contains additional details that create missing-claim noise. Split optional explanatory details from required answer claims.",
+                next_experiment="Add required_claims/optional_claims or shorten the reference answer to the direct answer.",
                 implementation_hint="Keep one concise canonical answer plus optional explanatory notes, and do not score optional notes as hard failures.",
                 success_signal="Lower benchmark-related false alarms without reducing real retrieval/generation error counts.",
             )
@@ -405,11 +552,11 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
             recommendation(
                 component="benchmark",
                 priority="P1",
-                issue="Answerable question lacks gold answer",
-                evidence="expected_answerable=true but gold_answer is empty.",
-                recommendation_text="Add a gold answer and expected evidence before trusting correctness or claim-level metrics for this row.",
-                next_experiment="Update benchmark annotations: gold_answer + expected_evidence.",
-                implementation_hint="At minimum, provide one concise gold answer and a few expected keywords or evidence cues.",
+                issue="Answerable question lacks a reference answer",
+                evidence="expected_answerable=true but reference_answer is empty.",
+                recommendation_text="Add a reference answer and expected evidence before trusting correctness or claim-level metrics for this row.",
+                next_experiment="Update benchmark annotations: reference answer + expected evidence.",
+                implementation_hint="At minimum, provide one concise reference answer and a few expected keywords or evidence cues.",
                 success_signal="This question stops generating benchmark warnings and gains stable correctness metrics.",
             )
         )
@@ -436,10 +583,19 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
     classifier = summary.get("classifier", {}) if isinstance(summary.get("classifier"), dict) else {}
     ranking = classifier.get("ranking_metrics", {}) if isinstance(classifier.get("ranking_metrics"), dict) else {}
     calibration = classifier.get("calibration", {}) if isinstance(classifier.get("calibration"), dict) else {}
+    cpv_diagnostics = (
+        classifier.get("cpv_diagnostics", {})
+        if isinstance(classifier.get("cpv_diagnostics"), dict)
+        else {}
+    )
 
     top1 = as_float(ranking.get("exact_top1_accuracy"))
     hit_at_k = as_float(ranking.get("hit_at_k"))
-    hierarchy_similarity = as_float(ranking.get("mean_cpv_hierarchy_similarity_top1"))
+    hierarchy_similarity = as_float(
+        ranking.get("mean_hierarchy_score_top1")
+        if ranking.get("mean_hierarchy_score_top1") is not None
+        else ranking.get("mean_cpv_hierarchy_similarity_top1")
+    )
     ece = as_float(calibration.get("expected_calibration_error"))
     brier = as_float(calibration.get("brier_score"))
     explanation_coverage = as_float(classifier.get("explanation_coverage"))
@@ -452,6 +608,119 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
     mean_mrr = as_float(retrieval_metrics.get("mean_mrr_at_k"))
     mean_recall = as_float(retrieval_metrics.get("mean_recall_at_k"))
     dominant_reason = str(diagnostics.get("most_common_reason") or "")
+    dominant_bottleneck = str(cpv_diagnostics.get("dominant_bottleneck") or "")
+    display_dominant_bottleneck = _display_bottleneck(dominant_bottleneck)
+    gold_present_rate = as_float(cpv_diagnostics.get("gold_present_at_k_rate"))
+    high_conf_wrong_rate = as_float(cpv_diagnostics.get("high_confidence_wrong_rate"))
+    low_margin_rate = as_float(cpv_diagnostics.get("low_margin_decision_rate"))
+    duplicate_pressure_rate = as_float(cpv_diagnostics.get("duplicate_candidate_pressure_rate"))
+    low_diversity_rate = as_float(cpv_diagnostics.get("low_diversity_at_k_rate"))
+    short_query_rate = as_float(cpv_diagnostics.get("short_or_ambiguous_query_rate"))
+    error_duplicate_pressure_rate = as_float(cpv_diagnostics.get("error_duplicate_candidate_pressure_rate"))
+    error_low_diversity_rate = as_float(cpv_diagnostics.get("error_low_diversity_at_k_rate"))
+    error_short_query_rate = as_float(cpv_diagnostics.get("error_short_or_ambiguous_query_rate"))
+
+    if dominant_bottleneck == "candidate_generation_or_retriever" or (
+        gold_present_rate is not None and gold_present_rate < 0.70
+    ):
+        recs.append(
+            recommendation(
+                component="retriever",
+                priority="P1",
+                issue="Candidate coverage limits the maximum score",
+                evidence=f"expected_answer_present_at_k={gold_present_rate}, dominant_bottleneck={display_dominant_bottleneck}",
+                recommendation_text="Improve candidate generation alongside selection work, because the final selector cannot recover labels that never appear in top-k.",
+                next_experiment="Run top-k 10/20 and compare dense, BM25, and hybrid retrieval on expected-answer coverage.",
+                implementation_hint="Enrich candidate text with labels, descriptions, parent labels, child labels, examples, and domain synonyms. If the expected answer still does not appear, the selector never had a fair chance.",
+                success_signal="Expected-answer coverage and hit@k rise; then top-1 can be improved with reranking.",
+            )
+        )
+
+    if dominant_bottleneck == "reranker_or_prompt_selection" or (
+        top1 is not None and hit_at_k is not None and hit_at_k - top1 >= 0.10
+    ):
+        recs.append(
+            recommendation(
+                component="selection",
+                priority="P1",
+                issue="Retrieved candidates are not being selected well",
+                evidence=f"top1={top1}, hit_at_k={hit_at_k}, low_margin_decision_rate={low_margin_rate}",
+                recommendation_text="Freeze retrieval and improve the final selection step with reranking or a contrastive prompt.",
+                next_experiment="Evaluate the same top-k candidates with a cross-encoder/reranker or a prompt that must compare the top candidates side by side.",
+                implementation_hint="This is the likely prompt/reranker failure pattern: the correct answer is available but not promoted to rank 1.",
+                success_signal="top-1 accuracy and MRR improve while expected-answer coverage remains stable.",
+            )
+        )
+
+    if dominant_bottleneck in {"sibling_disambiguation", "hierarchy_disambiguation"}:
+        recs.append(
+            recommendation(
+                component="hierarchy",
+                priority="P2",
+                issue="Errors are concentrated inside related hierarchy branches",
+                evidence=f"dominant_bottleneck={display_dominant_bottleneck}, mean_hierarchy_score_top1={hierarchy_similarity}",
+                recommendation_text="Add hierarchy-aware disambiguation for related but still incorrect answers.",
+                next_experiment="Build a branch-aware reranking evaluation for rows with close-branch misses.",
+                implementation_hint="The system is sometimes directionally close; add exclusions, examples, and contrastive definitions for related alternatives rather than only increasing broad recall.",
+                success_signal="Near misses inside the same branch turn into exact matches.",
+            )
+        )
+
+    if high_conf_wrong_rate is not None and high_conf_wrong_rate >= 0.10:
+        recs.append(
+            recommendation(
+                component="calibration",
+                priority="P1",
+                issue="Too many wrong predictions are high-confidence",
+                evidence=f"high_confidence_wrong_rate={high_conf_wrong_rate:.2f}, ece={ece}",
+                recommendation_text="Add confidence calibration and review thresholds before automatic acceptance.",
+                next_experiment="Create reliability bins and test auto-accept/manual-review thresholds using confidence, margin, and entropy.",
+                implementation_hint="Wrong high-confidence rows are often more dangerous than low-confidence misses; route them to review until calibration improves.",
+                success_signal="Lower high_confidence_wrong_rate, ECE, and Brier score.",
+            )
+        )
+
+    if error_duplicate_pressure_rate is not None and error_duplicate_pressure_rate >= 0.20:
+        recs.append(
+            recommendation(
+                component="retriever",
+                priority="P2",
+                issue="Top-k candidates contain too many duplicates",
+                evidence=f"error_duplicate_candidate_pressure_rate={error_duplicate_pressure_rate:.2f}",
+                recommendation_text="Deduplicate repeated candidates in error cases and measure whether unique candidate coverage improves.",
+                next_experiment="Compare raw top-k against unique-answer top-k on incorrect rows.",
+                implementation_hint="Duplicates matter most when they appear in errors; if duplicates are mostly correct rows, this should not drive the next iteration.",
+                success_signal="Higher unique answer count and better hit@k/selection accuracy.",
+            )
+        )
+
+    if error_low_diversity_rate is not None and error_low_diversity_rate >= 0.40:
+        recs.append(
+            recommendation(
+                component="retriever",
+                priority="P2",
+                issue="Candidate lists lack hierarchy diversity",
+                evidence=f"error_low_diversity_at_k_rate={error_low_diversity_rate:.2f}, overall_low_diversity_at_k_rate={low_diversity_rate}",
+                recommendation_text="Measure whether the retriever is over-committing to one hierarchy branch too early.",
+                next_experiment="Compare unrestricted retrieval with a diversity-aware candidate set, then rerank both.",
+                implementation_hint="Diversity is diagnostic, not always better; use it to discover whether the expected answer's branch is being excluded too early.",
+                success_signal="More relevant branches appear in top-k without reducing exact top-1.",
+            )
+        )
+
+    if error_short_query_rate is not None and error_short_query_rate >= 0.40:
+        recs.append(
+            recommendation(
+                component="benchmark",
+                priority="P3",
+                issue="Many queries may be under-specified",
+                evidence=f"error_short_or_ambiguous_query_rate={error_short_query_rate:.2f}, overall_short_or_ambiguous_query_rate={short_query_rate}",
+                recommendation_text="Add richer source context before treating every miss as a model failure.",
+                next_experiment="Rerun a subset with title + description + buyer/category metadata and compare failure modes.",
+                implementation_hint="Short titles often need domain context or accepted alternative answers to become fair classification examples.",
+                success_signal="Manual audit labels fewer rows as ambiguous and top-1 accuracy becomes more stable.",
+            )
+        )
 
     if top1 is not None and hit_at_k is not None and hit_at_k - top1 >= 0.15:
         recs.append(
@@ -473,11 +742,11 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 component="hierarchy",
                 priority="P2",
                 issue="Most errors are close rather than random",
-                evidence=f"mean_cpv_hierarchy_similarity_top1={hierarchy_similarity:.2f}",
-                recommendation_text="Exploit this by adding sibling disambiguation features instead of only broad retrieval changes.",
-                next_experiment="Compare plain ranking against sibling-only reranking inside the predicted branch.",
-                implementation_hint="Add label-detail fields, examples, or domain synonyms that distinguish neighboring classes within the same subtree.",
-                success_signal="Higher CPV hierarchy similarity and improved top-1 accuracy.",
+                evidence=f"mean_hierarchy_score_top1={hierarchy_similarity:.2f}",
+                recommendation_text="Exploit this by adding close-candidate disambiguation features instead of only broad retrieval changes.",
+                next_experiment="Compare plain ranking against branch-aware reranking inside the predicted branch.",
+                implementation_hint="Add label-detail fields, examples, or domain synonyms that distinguish neighboring answers within the same subtree.",
+                success_signal="Higher hierarchy similarity and improved top-1 accuracy.",
             )
         )
 
@@ -618,7 +887,7 @@ def benchmark_warnings(rows: Sequence[Dict[str, object]]) -> List[str]:
         warnings.append("No unanswerable questions are marked in this run; abstention quality cannot be evaluated.")
     no_gold = sum(1 for row in rows if as_bool(row.get("expected_answerable")) is not False and not str(row.get("gold_answer") or "").strip())
     if no_gold:
-        warnings.append(f"{no_gold} answerable questions have no gold_answer; correctness and claim metrics are less reliable.")
+        warnings.append(f"{no_gold} answerable questions have no reference answer; correctness and claim metrics are less reliable.")
     no_keywords = sum(1 for row in rows if not str(row.get("expected_keywords") or "").strip())
     if no_keywords / total > 0.5:
         warnings.append("More than half of questions have no expected_keywords; retrieval proxy metrics may be weak.")
@@ -675,6 +944,45 @@ def build_run_advisor(summary: Dict[str, object], rows: Sequence[Dict[str, objec
     answer_metrics = summary.get("answer_metrics", {}) if isinstance(summary.get("answer_metrics"), dict) else {}
     retrieval_metrics = summary.get("retrieval_metrics", {}) if isinstance(summary.get("retrieval_metrics"), dict) else {}
     prediction_calibration = _resolve_prediction_calibration(summary)
+    classifier = summary.get("classifier", {}) if isinstance(summary.get("classifier"), dict) else {}
+    is_cpv_classifier = classifier.get("type") in {"ted_cpv", "api_classifier", "prepared_rag_results"}
+    cpv_diagnostics = (
+        classifier.get("cpv_diagnostics", {})
+        if isinstance(classifier.get("cpv_diagnostics"), dict)
+        else {}
+    )
+    warnings = [] if is_cpv_classifier else benchmark_warnings(rows)
+    health = {
+        "correct": summary.get("n_correct"),
+        "incorrect": summary.get("n_incorrect"),
+        "mean_mrr_at_k": retrieval_metrics.get("mean_mrr_at_k"),
+        "mean_ndcg_at_k": retrieval_metrics.get("mean_ndcg_at_k"),
+        "prediction_brier_score": prediction_calibration.get("brier_score"),
+        "prediction_ece": prediction_calibration.get("expected_calibration_error"),
+    }
+    if not is_cpv_classifier:
+        health.update(
+            {
+                "mean_context_claim_recall": answer_metrics.get("mean_context_claim_recall"),
+                "mean_factual_correctness_f1": answer_metrics.get("mean_factual_correctness_f1"),
+                "mean_grounded_claim_ratio": answer_metrics.get("mean_grounded_claim_ratio"),
+                "mean_context_entities_recall": answer_metrics.get("mean_context_entities_recall"),
+                "mean_noise_sensitivity_relevant": answer_metrics.get("mean_noise_sensitivity_relevant"),
+                "mean_evidence_attribution_f1": answer_metrics.get("mean_evidence_attribution_f1"),
+                "over_answering_rate": answer_metrics.get("over_answering_rate"),
+                "false_refusal_rate": answer_metrics.get("false_refusal_rate"),
+            }
+        )
+    else:
+        health.update(
+            {
+                "expected_answer_present_at_k_rate": cpv_diagnostics.get("gold_present_at_k_rate"),
+                "high_confidence_wrong_rate": cpv_diagnostics.get("high_confidence_wrong_rate"),
+                "low_margin_decision_rate": cpv_diagnostics.get("low_margin_decision_rate"),
+                "mean_unique_answers_at_k": cpv_diagnostics.get("mean_unique_cpv_at_k"),
+                "dominant_bottleneck": cpv_diagnostics.get("dominant_bottleneck"),
+            }
+        )
     return {
         "n_questions": len(rows),
         "component_counts": dict(component_counts),
@@ -682,23 +990,8 @@ def build_run_advisor(summary: Dict[str, object], rows: Sequence[Dict[str, objec
         "priority_counts": dict(priority_counts),
         "top_recommendations": top_recommendations,
         "summary_recommendations": summary_recommendations,
-        "benchmark_warnings": benchmark_warnings(rows),
-        "health": {
-            "correct": summary.get("n_correct"),
-            "incorrect": summary.get("n_incorrect"),
-            "mean_context_claim_recall": answer_metrics.get("mean_context_claim_recall"),
-            "mean_factual_correctness_f1": answer_metrics.get("mean_factual_correctness_f1"),
-            "mean_grounded_claim_ratio": answer_metrics.get("mean_grounded_claim_ratio"),
-            "mean_context_entities_recall": answer_metrics.get("mean_context_entities_recall"),
-            "mean_noise_sensitivity_relevant": answer_metrics.get("mean_noise_sensitivity_relevant"),
-            "mean_evidence_attribution_f1": answer_metrics.get("mean_evidence_attribution_f1"),
-            "over_answering_rate": answer_metrics.get("over_answering_rate"),
-            "false_refusal_rate": answer_metrics.get("false_refusal_rate"),
-            "mean_mrr_at_k": retrieval_metrics.get("mean_mrr_at_k"),
-            "mean_ndcg_at_k": retrieval_metrics.get("mean_ndcg_at_k"),
-            "prediction_brier_score": prediction_calibration.get("brier_score"),
-            "prediction_ece": prediction_calibration.get("expected_calibration_error"),
-        },
+        "benchmark_warnings": warnings,
+        "health": health,
     }
 
 
@@ -709,16 +1002,27 @@ def write_quality_report(path: str, advisor: Dict[str, object], summary: Dict[st
     lines.append("## Executive Summary")
     health = advisor.get("health", {}) if isinstance(advisor.get("health"), dict) else {}
     lines.append(f"- Questions: {advisor.get('n_questions', 0)}")
-    lines.append(f"- Correct: {health.get('correct')}")
-    lines.append(f"- Incorrect: {health.get('incorrect')}")
-    lines.append(f"- Mean context claim recall: {health.get('mean_context_claim_recall')}")
-    lines.append(f"- Mean factual correctness F1: {health.get('mean_factual_correctness_f1')}")
-    lines.append(f"- Mean grounded claim ratio: {health.get('mean_grounded_claim_ratio')}")
-    lines.append(f"- Mean context entities recall: {health.get('mean_context_entities_recall')}")
-    lines.append(f"- Mean noise sensitivity (relevant): {health.get('mean_noise_sensitivity_relevant')}")
-    lines.append(f"- Mean evidence attribution F1: {health.get('mean_evidence_attribution_f1')}")
-    lines.append(f"- Prediction Brier score: {health.get('prediction_brier_score')}")
-    lines.append(f"- Prediction ECE: {health.get('prediction_ece')}")
+    for label, key in [
+        ("Correct", "correct"),
+        ("Incorrect", "incorrect"),
+        ("Mean context claim recall", "mean_context_claim_recall"),
+        ("Mean factual correctness F1", "mean_factual_correctness_f1"),
+        ("Mean grounded claim ratio", "mean_grounded_claim_ratio"),
+        ("Mean context entities recall", "mean_context_entities_recall"),
+        ("Mean noise sensitivity (relevant)", "mean_noise_sensitivity_relevant"),
+        ("Mean evidence attribution F1", "mean_evidence_attribution_f1"),
+        ("Mean MRR@K", "mean_mrr_at_k"),
+        ("Mean nDCG@K", "mean_ndcg_at_k"),
+        ("Expected answer present@K rate", "expected_answer_present_at_k_rate"),
+        ("High-confidence wrong rate", "high_confidence_wrong_rate"),
+        ("Low-margin decision rate", "low_margin_decision_rate"),
+        ("Mean unique answers@K", "mean_unique_answers_at_k"),
+        ("Dominant bottleneck", "dominant_bottleneck"),
+        ("Prediction Brier score", "prediction_brier_score"),
+        ("Prediction ECE", "prediction_ece"),
+    ]:
+        if health.get(key) is not None:
+            lines.append(f"- {label}: {health.get(key)}")
     lines.append("")
 
     warnings = advisor.get("benchmark_warnings", [])
@@ -726,6 +1030,20 @@ def write_quality_report(path: str, advisor: Dict[str, object], summary: Dict[st
         lines.append("## Benchmark Warnings")
         for warning in warnings:
             lines.append(f"- {warning}")
+        lines.append("")
+
+    classifier = summary.get("classifier", {}) if isinstance(summary.get("classifier"), dict) else {}
+    cpv_diagnostics = (
+        classifier.get("cpv_diagnostics", {})
+        if isinstance(classifier.get("cpv_diagnostics"), dict)
+        else {}
+    )
+    helpful_data = cpv_diagnostics.get("additional_data_that_would_help", [])
+    if isinstance(helpful_data, list) and helpful_data:
+        lines.append("## Additional Data That Would Help")
+        for item in helpful_data:
+            if isinstance(item, dict):
+                lines.append(f"- {item.get('data')}: {item.get('why')}")
         lines.append("")
 
     top = advisor.get("top_recommendations", [])

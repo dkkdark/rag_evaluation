@@ -819,10 +819,19 @@ def run_single_experiment(
             top_k=top_k,
             chart_label=experiment_slug,
         )
+        unique_chunk_alignment_svg = write_chunk_relevance_comparison_svg(
+            retrieved_rows,
+            os.path.join(experiment_dir, "strategy_unique_chunk_alignment.svg"),
+            top_k=top_k,
+            chart_label=experiment_slug,
+            unique_relevance=True,
+        )
         summary["visualization"]["strategy_score_profile_svg"] = score_profile_svg
         summary["visualization"]["strategy_chunk_alignment_svg"] = chunk_alignment_svg
+        summary["visualization"]["strategy_unique_chunk_alignment_svg"] = unique_chunk_alignment_svg
         summary["outputs"]["strategy_score_profile_svg"] = score_profile_svg
         summary["outputs"]["strategy_chunk_alignment_svg"] = chunk_alignment_svg
+        summary["outputs"]["strategy_unique_chunk_alignment_svg"] = unique_chunk_alignment_svg
 
     if create_strategy_showcase:
         showcase_bundle = write_strategy_showcase_bundle(
@@ -834,8 +843,10 @@ def run_single_experiment(
         summary["visualization"]["enabled"] = True
         summary["visualization"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
         summary["visualization"]["strategy_chunk_alignment_svg"] = showcase_bundle["chunk_alignment_svg"]
+        summary["visualization"]["strategy_unique_chunk_alignment_svg"] = showcase_bundle.get("unique_chunk_alignment_svg")
         summary["outputs"]["strategy_score_profile_svg"] = showcase_bundle["score_profile_svg"]
         summary["outputs"]["strategy_chunk_alignment_svg"] = showcase_bundle["chunk_alignment_svg"]
+        summary["outputs"]["strategy_unique_chunk_alignment_svg"] = showcase_bundle.get("unique_chunk_alignment_svg")
         summary["outputs"]["strategy_metric_overview_svg"] = showcase_bundle["metric_overview_svg"]
         summary["outputs"]["strategy_diagnostics_svg"] = showcase_bundle["diagnostics_svg"]
         summary["outputs"]["strategy_showcase_md"] = showcase_bundle["showcase_md"]

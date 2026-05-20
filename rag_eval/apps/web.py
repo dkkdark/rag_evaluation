@@ -559,6 +559,17 @@ INDEX_HTML = r"""<!doctype html>
       min-height: 74px;
     }
     .metric .value { font-size: 22px; font-weight: 720; margin-top: 4px; }
+    .metric .metric-key {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+    .metric .metric-source {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+    }
     .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
     .tab.active { border-color: var(--accent); color: var(--accent); font-weight: 650; }
     .table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 6px; max-height: 460px; }
@@ -879,6 +890,8 @@ INDEX_HTML = r"""<!doctype html>
     function renderOutcomeCounts(summary) {
       const classifier = summary.classifier_summary || {};
       const answerMetrics = classifier.answer_metrics || {};
+      const classifierType = classifier.classifier?.type || "";
+      const isCpv = ["ted_cpv", "api_classifier", "prepared_rag_results"].includes(classifierType);
       const correct = classifier.n_correct ?? answerMetrics.n_correct;
       const incorrect = classifier.n_incorrect ?? answerMetrics.n_incorrect;
       const partial = classifier.n_partial_correct ?? answerMetrics.n_partially_correct ?? 0;
@@ -886,9 +899,57 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metrics">
           <div class="metric"><div class="meta">Correct</div><div class="value">${fmt(correct)}</div></div>
           <div class="metric"><div class="meta">Incorrect</div><div class="value">${fmt(incorrect)}</div></div>
-          <div class="metric"><div class="meta">Partial correct</div><div class="value">${fmt(partial)}</div></div>
+          ${!isCpv && partial ? `<div class="metric"><div class="meta">Partial correct</div><div class="value">${fmt(partial)}</div></div>` : ""}
         </div>
       `;
+    }
+
+    function metricCard(key, value, help, formatter = fmt, source = "") {
+      return `
+        <div class="metric">
+          <div class="meta"><span class="metric-key">${htmlEscape(key)}</span> <span class="hint" title="${htmlEscape(help)}">i</span></div>
+          <div class="value">${formatter(value)}</div>
+          ${source ? `<div class="metric-source">${htmlEscape(source)}</div>` : ""}
+        </div>
+      `;
+    }
+
+    function pct(value) {
+      if (value === null || value === undefined || value === "") return "—";
+      const number = Number(value);
+      if (!Number.isFinite(number)) return fmt(value);
+      return `${(number * 100).toFixed(1)}%`;
+    }
+
+    function renderKeyMetrics(summary) {
+      const classifier = summary.classifier_summary || {};
+      const answerMetrics = classifier.answer_metrics || {};
+      const ranking = classifier.classifier?.ranking_metrics || {};
+      const cpvDiagnostics = classifier.classifier?.cpv_diagnostics || {};
+      const retrieval = classifier.retrieval_metrics || {};
+      const calibration = classifier.classifier?.calibration || {};
+      const classifierType = classifier.classifier?.type || "";
+      const isCpv = ["ted_cpv", "api_classifier", "prepared_rag_results"].includes(classifierType);
+      const cards = isCpv ? [
+        metricCard("accuracy", answerMetrics.accuracy, "Exact top-1 correctness rate: correct only when the predicted answer exactly equals the expected answer.", pct, "answer_metrics"),
+        metricCard("exact_top1_accuracy", ranking.exact_top1_accuracy, "Share of records where the first predicted answer exactly equals the expected answer.", pct, "classifier.ranking_metrics"),
+        metricCard("hit_at_k", ranking.hit_at_k, "Share of records where the expected answer appears anywhere in the returned top-k candidates.", pct, "classifier.ranking_metrics"),
+        metricCard("mean_mrr_at_k", retrieval.mean_mrr_at_k, "Mean reciprocal rank of the first relevant answer or candidate. Rank 1 gives 1.0, rank 2 gives 0.5, missing gives 0.", fmt, "retrieval_metrics"),
+        metricCard("mean_ndcg_at_k", retrieval.mean_ndcg_at_k, "Mean ranking quality for returned candidates. Higher means better candidates appear closer to the top.", fmt, "retrieval_metrics"),
+        metricCard("mean_recall_at_k", retrieval.mean_recall_at_k, "Average share of relevant candidates found in top-k.", pct, "retrieval_metrics"),
+        metricCard("mean_hierarchy_score_top1", ranking.mean_hierarchy_score_top1, "Diagnostic closeness of the top answer to the expected answer. Higher means the prediction is structurally closer, but exact correctness is still separate.", fmt, "classifier.ranking_metrics"),
+        metricCard("expected_answer_present_at_k_rate", cpvDiagnostics.gold_present_at_k_rate, "Share of records where the expected answer was available anywhere in top-k. Low value points to retriever/candidate-generation problems.", pct, "classifier.diagnostics"),
+        metricCard("low_margin_decision_rate", cpvDiagnostics.low_margin_decision_rate, "Share of records where rank 1 and rank 2 scores were close. These are good candidates for reranking or manual review.", pct, "classifier.diagnostics"),
+        metricCard("high_confidence_wrong_rate", cpvDiagnostics.high_confidence_wrong_rate, "Share of records where the classifier was wrong despite high confidence. Lower is safer.", pct, "classifier.diagnostics"),
+        metricCard("expected_calibration_error", calibration.expected_calibration_error, "Expected calibration error for prediction scores. Lower is better; high values mean confidence is not reliable.", fmt, "classifier.calibration"),
+      ] : [
+        metricCard("mean_mrr_at_k", retrieval.mean_mrr_at_k, "How early the first relevant retrieved chunk appears on average.", fmt, "retrieval_metrics"),
+        metricCard("mean_ndcg_at_k", retrieval.mean_ndcg_at_k, "Ranking quality for retrieved chunks, rewarding relevant chunks near the top.", fmt, "retrieval_metrics"),
+        metricCard("mean_recall_at_k", retrieval.mean_recall_at_k, "Share of relevant chunks found in top-k.", pct, "retrieval_metrics"),
+        metricCard("questions_with_relevant_chunk", retrieval.questions_with_relevant_chunk, "Number of questions with at least one relevant retrieved item.", fmt, "retrieval_metrics"),
+        metricCard("questions_with_target_doc_at_k", retrieval.questions_with_target_doc_at_k, "Number of questions where top-k includes the expected source or answer.", fmt, "retrieval_metrics"),
+      ];
+      return `<div class="metrics">${cards.join("")}</div>`;
     }
 
     async function loadRun(runName) {
@@ -932,6 +993,14 @@ INDEX_HTML = r"""<!doctype html>
           <div class="metric"><div class="meta">Experiments</div><div class="value">${fmt(run.n_experiments || 1)}</div></div>
         </div>
         <div class="band">
+          <h2>Outcome Counts</h2>
+          ${renderOutcomeCounts(summary)}
+        </div>
+        <div class="band">
+          <h2>Key Metrics</h2>
+          ${renderKeyMetrics(summary)}
+        </div>
+        <div class="band">
           <h2>CSV previews</h2>
           <div class="tabs">${tablePaths.map(([key]) => `<button class="tab ${key === state.activeTable ? "active" : ""}" onclick="selectTable('${key}')">${key.replace(/_csv$/, "")}</button>`).join("") || '<span class="empty">No CSV outputs.</span>'}</div>
           <div id="tableTarget" class="empty">Loading table...</div>
@@ -943,10 +1012,6 @@ INDEX_HTML = r"""<!doctype html>
         <div class="band">
           <h2>Log</h2>
           <pre>${htmlEscape(data.log || "No log yet.")}</pre>
-        </div>
-        <div class="band">
-          <h2>Outcome Counts</h2>
-          ${renderOutcomeCounts(summary)}
         </div>
         <div class="band">
           <h2>Recommendations</h2>

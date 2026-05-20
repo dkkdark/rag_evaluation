@@ -55,6 +55,7 @@ def _rank_profile(
     retrieved_rows: Sequence[Dict],
     *,
     top_k: int,
+    unique_relevance: bool = False,
 ) -> tuple[List[int], List[float], List[float], List[int], List[int]]:
     grouped: Dict[str, List[Dict]] = {}
     for row in retrieved_rows:
@@ -72,12 +73,19 @@ def _rank_profile(
     for rows in grouped.values():
         ordered = sorted(rows, key=lambda item: int(item["rank"]))
         normalized = _normalize_scores([float(item["score"]) for item in ordered])
+        seen_relevance_keys: set[str] = set()
         for item, normalized_score in zip(ordered, normalized):
             rank = int(item["rank"])
             if rank > top_k:
                 continue
             relevance_grade = _safe_float(item.get("relevance_grade"))
-            is_relevant = bool(item.get("is_relevant")) or is_relevant_grade(relevance_grade)
+            is_relevant = _truthy_flag(item.get("is_relevant")) or is_relevant_grade(relevance_grade)
+            if unique_relevance and is_relevant:
+                relevance_key = _relevance_identity(item)
+                if relevance_key in seen_relevance_keys:
+                    is_relevant = False
+                else:
+                    seen_relevance_keys.add(relevance_key)
             per_rank_scores.setdefault(rank, []).append(normalized_score)
             per_rank_relevance.setdefault(rank, []).append(1.0 if is_relevant else 0.0)
             per_rank_relevant_counts[rank] = per_rank_relevant_counts.get(rank, 0) + (1 if is_relevant else 0)
@@ -92,6 +100,20 @@ def _rank_profile(
     relevant_counts = [per_rank_relevant_counts.get(rank, 0) for rank in ranks]
     total_counts = [per_rank_total_counts.get(rank, 0) for rank in ranks]
     return ranks, avg_scores, relevant_rates, relevant_counts, total_counts
+
+
+def _relevance_identity(row: Dict) -> str:
+    for key in ["cpv_code", "doc_id", "chunk_id"]:
+        value = str(row.get(key, "") or "").strip()
+        if value:
+            return f"{key}:{value}"
+    return f"rank:{row.get('rank', '')}"
+
+
+def _truthy_flag(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "y"}
+    return bool(value)
 
 
 def write_strategy_score_profile_svg(
@@ -171,9 +193,10 @@ def write_chunk_relevance_comparison_svg(
     *,
     top_k: int,
     chart_label: str,
+    unique_relevance: bool = False,
 ) -> str | None:
     ranks, avg_scores, relevant_rates, relevant_counts, total_counts = _rank_profile(
-        retrieved_rows, top_k=top_k
+        retrieved_rows, top_k=top_k, unique_relevance=unique_relevance
     )
     if not ranks:
         return None
@@ -224,17 +247,19 @@ def write_chunk_relevance_comparison_svg(
 
     legend_x = width - 355
     legend_y = 42
+    title = "Unique Relevant Chunks" if unique_relevance else "Scored vs Correct Chunks"
+    caption = "green labels = unique relevant/total" if unique_relevance else "green labels = relevant/total"
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Chunk score vs relevant chunk profile for {html.escape(chart_label)}">
   <rect width="{width}" height="{height}" fill="#fffdf8" />
   <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{width - margin_right}" y2="{margin_top + plot_height}" stroke="#8d8d8d" stroke-width="3" />
   <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{margin_left}" y2="{margin_top}" stroke="#8d8d8d" stroke-width="3" />
-  <text x="28" y="42" font-size="28" fill="#444b57" font-family="Helvetica, Arial, sans-serif">Scored vs Correct Chunks</text>
+  <text x="28" y="42" font-size="28" fill="#444b57" font-family="Helvetica, Arial, sans-serif">{html.escape(title)}</text>
   <text x="28" y="74" font-size="18" fill="#7b808a" font-family="Helvetica, Arial, sans-serif">{html.escape(chart_label)}</text>
   <rect x="{legend_x}" y="{legend_y}" width="20" height="20" rx="5" fill="#68a8ff" />
   <text x="{legend_x + 30}" y="{legend_y + 16}" font-size="18" fill="#4f5665" font-family="Helvetica, Arial, sans-serif">avg normalized score</text>
   <rect x="{legend_x}" y="{legend_y + 30}" width="20" height="20" rx="5" fill="#58c28c" />
   <text x="{legend_x + 30}" y="{legend_y + 46}" font-size="18" fill="#4f5665" font-family="Helvetica, Arial, sans-serif">relevant chunk rate</text>
-  <text x="{width - margin_right - 35}" y="{margin_top + plot_height + 86}" font-size="18" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">green labels = relevant/total</text>
+  <text x="{width - margin_right - 35}" y="{margin_top + plot_height + 86}" font-size="18" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">{html.escape(caption)}</text>
   <text x="{width - margin_right - 20}" y="{margin_top + plot_height + 60}" font-size="24" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">Chunks</text>
   <text x="36" y="{margin_top + 52}" transform="rotate(-90 36 {margin_top + 52})" font-size="24" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">Rate / Score</text>
   {''.join(bars)}
@@ -513,6 +538,13 @@ def write_strategy_showcase_bundle(
         top_k=int(summary["top_k"]),
         chart_label=summary["experiment"],
     )
+    unique_chunk_alignment_svg = write_chunk_relevance_comparison_svg(
+        retrieved_rows,
+        os.path.join(experiment_dir, "strategy_unique_chunk_alignment.svg"),
+        top_k=int(summary["top_k"]),
+        chart_label=summary["experiment"],
+        unique_relevance=True,
+    )
     diagnostics_svg = write_strategy_diagnostics_svg(
         summary, os.path.join(experiment_dir, "strategy_diagnostics.svg")
     )
@@ -530,6 +562,7 @@ def write_strategy_showcase_bundle(
         "enabled": True,
         "score_profile_svg": score_profile_svg,
         "chunk_alignment_svg": chunk_alignment_svg,
+        "unique_chunk_alignment_svg": unique_chunk_alignment_svg,
         "metric_overview_svg": metric_overview_svg,
         "diagnostics_svg": diagnostics_svg,
         "showcase_md": showcase_md,
@@ -566,9 +599,12 @@ def write_classifier_metric_overview_svg(summary: Dict, output_path: str) -> str
     retrieval = summary.get("retrieval_metrics", {})
     answer = summary.get("answer_metrics", {})
     ranking = classifier.get("ranking_metrics", {})
+    hierarchy_score = ranking.get("mean_hierarchy_score_top1")
+    if hierarchy_score is None:
+        hierarchy_score = ranking.get("mean_cpv_hierarchy_similarity_top1")
     metrics = [
         ("Top-1 accuracy", float(ranking.get("exact_top1_accuracy") or 0.0), "#68a8ff"),
-        ("CPV hierarchy similarity", float(ranking.get("mean_cpv_hierarchy_similarity_top1") or 0.0), "#58c28c"),
+        ("Hierarchy score", float(hierarchy_score or 0.0), "#58c28c"),
         ("Factual correctness", float(answer.get("mean_factual_correctness_f1") or 0.0), "#f1b54c"),
         ("Calibration (1-ECE)", max(0.0, 1.0 - float(classifier.get("calibration", {}).get("expected_calibration_error") or 0.0)), "#ef7d8f"),
         ("Grounded claims", float(answer.get("mean_grounded_claim_ratio") or 0.0), "#8f9cff"),
@@ -617,7 +653,11 @@ def build_classifier_improvement_summary(summary: Dict) -> Dict[str, object]:
     margin = float(summary.get("classifier", {}).get("avg_top1_top2_margin") or 0.0)
     explanation_coverage = float(summary.get("classifier", {}).get("explanation_coverage") or 0.0)
     dominant_reason = summary.get("diagnostics", {}).get("most_common_reason")
-    hierarchy_similarity = float(ranking.get("mean_cpv_hierarchy_similarity_top1") or 0.0)
+    hierarchy_similarity = float(
+        ranking.get("mean_hierarchy_score_top1")
+        or ranking.get("mean_cpv_hierarchy_similarity_top1")
+        or 0.0
+    )
     ece = calibration.get("expected_calibration_error")
     noise = float(summary.get("answer_metrics", {}).get("mean_noise_sensitivity_relevant") or 0.0)
 
@@ -635,13 +675,13 @@ def build_classifier_improvement_summary(summary: Dict) -> Dict[str, object]:
             "Improve candidate coverage: enrich the label representations with more real examples, synonyms, or structured relations."
         )
     if hierarchy_similarity > top1 + 0.15:
-        blockers.append("many misses stay inside the correct CPV branch, but the classifier still fails at the final leaf selection")
+        blockers.append("many misses stay inside a related hierarchy branch, but the classifier still fails at the final selection")
         improvements.append(
-            "Add hierarchy-aware reranking so sibling CPV candidates inside the correct branch are separated more precisely."
+            "Add hierarchy-aware reranking so related candidates inside the same branch are separated more precisely."
         )
     if hierarchy_similarity >= 0.75 and top1 < 0.65:
         improvements.append(
-            "Use CPV hierarchy as a scoring feature or fallback because the classifier is often near the right branch already."
+            "Use hierarchy as a scoring feature or fallback because the classifier is often near the right branch already."
         )
     if margin < 0.05:
         blockers.append("the score separation between the first and second candidate is weak")
@@ -661,11 +701,11 @@ def build_classifier_improvement_summary(summary: Dict) -> Dict[str, object]:
         improvements.append(
             "Return explanations more consistently so error analysis can distinguish ranking errors from reasoning errors."
         )
-    if dominant_reason == "gold_missing_from_top_k":
+    if dominant_reason in {"gold_missing_from_top_k", "expected_answer_missing_from_top_k"}:
         improvements.append(
             "Focus first on retrieval and candidate generation, not only on explanation prompting."
         )
-    if dominant_reason == "gold_present_but_not_ranked_first":
+    if dominant_reason in {"gold_present_but_not_ranked_first", "expected_answer_present_but_not_ranked_first"}:
         improvements.append(
             "The most promising improvement is better top-1 selection from already relevant candidates."
         )
@@ -693,6 +733,7 @@ def build_classifier_improvement_summary(summary: Dict) -> Dict[str, object]:
             "top1_accuracy": top1,
             "hit_at_k": hit_at_k,
             "mrr_at_k": mrr,
+            "mean_hierarchy_score_top1": hierarchy_similarity,
             "mean_cpv_hierarchy_similarity_top1": hierarchy_similarity,
             "calibration_ece": ece,
             "most_common_reason": dominant_reason,
@@ -768,6 +809,13 @@ def write_classifier_showcase_bundle(
         top_k=int(summary["top_k"]),
         chart_label=summary.get("experiment", "classifier"),
     )
+    unique_chunk_alignment_svg = write_chunk_relevance_comparison_svg(
+        ranking_rows,
+        os.path.join(experiment_dir, "classifier_unique_chunk_alignment.svg"),
+        top_k=int(summary["top_k"]),
+        chart_label=summary.get("experiment", "classifier"),
+        unique_relevance=True,
+    )
     diagnostics_svg = write_strategy_diagnostics_svg(
         summary, os.path.join(experiment_dir, "classifier_diagnostics.svg")
     )
@@ -781,6 +829,7 @@ def write_classifier_showcase_bundle(
         "enabled": True,
         "score_profile_svg": score_profile_svg,
         "chunk_alignment_svg": chunk_alignment_svg,
+        "unique_chunk_alignment_svg": unique_chunk_alignment_svg,
         "metric_overview_svg": metric_overview_svg,
         "diagnostics_svg": diagnostics_svg,
         "showcase_md": showcase_md,

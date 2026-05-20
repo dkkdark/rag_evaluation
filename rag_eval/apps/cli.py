@@ -562,6 +562,7 @@ def run_classifier_mode(args) -> Dict:
         "claim_judge_results_jsonl",
         "strategy_score_profile_svg",
         "strategy_chunk_alignment_svg",
+        "strategy_unique_chunk_alignment_svg",
         "strategy_metric_overview_svg",
         "strategy_diagnostics_svg",
         "strategy_showcase_md",

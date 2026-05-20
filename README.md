@@ -181,31 +181,55 @@ Most metrics are between `0` and `1`, where higher is better, unless the descrip
 
 - `n_questions`: number of evaluated questions or queries.
 - `n_correct`: predictions/answers marked correct.
-- `n_partially_correct`: answers with some correct evidence but incomplete coverage.
+- `n_partially_correct`: answers with some correct evidence but incomplete coverage. This applies to answer-generation evaluations, not CPV classifier runs.
 - `n_incorrect`: answers that miss the expected answer.
 - `n_unsupported`: answers that appear unsupported by retrieved context.
 - `n_needs_manual_review`: cases where automatic scoring is not confident enough.
 
+For CPV classification, correctness is binary: the predicted CPV code is either an exact match or it is incorrect. CPV runs therefore report `n_correct`, `n_incorrect`, and `accuracy`, but do not report partial-correct outcomes.
+
 ### CPV Classification Metrics
+
+CPV hierarchy scoring uses the real CPV boundaries only: 2 digits for Division, 4 for Group, 6 for Class, and 8 for Category/exact code.
+The hierarchy score is a diagnostic similarity KPI, not a partial correctness label. A same-class or same-group prediction can show that the classifier is close in the CPV tree, but it is still counted as incorrect unless the full code matches.
+
+Top-1 metrics describe only the first predicted CPV code:
+
+- `exact_top1_accuracy`: share of queries where the first predicted CPV code equals the gold code.
+- `mean_hierarchy_score_top1`: average hierarchy similarity for the first prediction: exact/category = `1.0`, same class = `0.75`, same group = `0.5`, same division = `0.25`, no overlap = `0.0`.
+- `top1_metrics.match_breakdown`: count of top-1 predictions by deepest shared CPV level: `category`, `class`, `group`, `division`, or `no_overlap`.
+- `cpv_common_prefix_length_top1`: how many leading digits the top prediction shares with the gold CPV code.
+- `same_division_top1`, `same_group_top1`, `same_class_top1`, `same_category_top1`: whether top-1 reaches each real CPV hierarchy boundary.
+
+Ranked-list metrics evaluate the whole returned candidate list up to `top_k`:
 
 - `gold_hit_at_k`: whether the gold CPV code appears anywhere in the top-K predictions.
 - `gold_first_rank`: first rank where the gold CPV code appears. Lower is better.
 - `reciprocal_rank`: `1 / gold_first_rank`; top-1 hit is `1.0`, rank-2 hit is `0.5`.
-- `exact_top1_accuracy`: share of queries where the first predicted CPV code equals the gold code.
 - `hit_at_k`: share of queries where the gold code appears anywhere in top-K.
+- `precision_at_k`: share of the returned top-K predictions that exactly match an accepted gold code.
 - `mrr_at_k`: average reciprocal rank across queries.
-- `cpv_common_prefix_length_top1`: how many leading digits the top prediction shares with the gold CPV code.
-- `cpv_hierarchy_distance_top1`: hierarchy distance between top prediction and gold. Lower is better.
-- `mean_cpv_hierarchy_similarity_top1`: average closeness in the CPV hierarchy. Higher is better.
-- `same_division_top1`, `same_group_top1`, `same_class_top1`, `same_category_top1`, `same_branch_top1`: whether top-1 lands in the same CPV hierarchy level as the gold code.
+- `ndcg_at_k`: ranking quality using the hierarchy score as graded relevance, so near misses can still carry partial signal.
+- `mean_best_hierarchy_score_at_k`: best hierarchy similarity score found anywhere in top-K.
+- `ranked_list_metrics.best_match_breakdown`: count of the best top-K match by deepest shared CPV level.
 - `ancestor_hit_at_k`: whether a broader ancestor/related hierarchy match appears in top-K.
+
+CPV diagnostic metrics explain where the classifier likely failed:
+
+- `failure_mode`: row-level outcome such as `gold_missing_from_top_k`, `gold_present_but_not_ranked_first`, `same_branch_wrong_code`, or `ok`.
+- `likely_bottleneck`: inferred weak point, for example `candidate_generation_or_retriever`, `reranker_or_prompt_selection`, `hierarchy_disambiguation`, `confidence_calibration`, or `none`.
+- `gold_present_at_k_rate`: share of records where the expected CPV appears in the returned top-K list. Low values point to retriever/candidate-generation issues.
+- `score_margin_top1_top2`: score gap between the first and second candidates. Small margins are good candidates for reranking, contrastive prompting, or manual review.
+- `high_confidence_wrong_rate`: share of records where a wrong top-1 prediction had high confidence.
+- `unique_cpv_at_k`, `unique_division_at_k`, `duplicate_cpv_rate_at_k`: candidate diversity signals that reveal duplicate-heavy or overly narrow retrieval.
+- `top_division_confusions`: most common gold-division to predicted-division mistakes.
 
 ### Retrieval Metrics
 
 - `mrr_at_k`: how early the first relevant chunk/candidate appears. `1.0` means rank 1.
 - `ndcg_at_k`: ranking quality that rewards stronger relevant items near the top.
 - `recall_at_k`: share of all relevant chunks/candidates found in top-K.
-- `ragas_recall_at_k`: share of reference facts or keywords covered by retrieved context.
+- `ragas_recall_at_k`: share of reference facts or keywords covered by retrieved context. This is only emitted for answer/RAG evaluations where reference facts are available; CPV classifier runs omit it.
 - `first_relevant_rank`: first top-K position considered relevant.
 - `n_relevant_chunks`: how many relevant chunks/candidates exist in the available candidate pool.
 - `n_retrieved_relevant_chunks`: how many relevant chunks/candidates were retrieved in top-K.

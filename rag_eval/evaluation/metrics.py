@@ -1324,12 +1324,14 @@ def evaluate_retrieval_metrics(
     ideal_grades = sorted(all_candidate_grades, reverse=True)
     actual_dcg = dcg_at_k(retrieved_grades, k)
     ideal_dcg = dcg_at_k(ideal_grades, k)
-    ndcg_at_k = (actual_dcg / ideal_dcg) if ideal_dcg > 0 else None
+    ndcg_at_k = min(1.0, actual_dcg / ideal_dcg) if ideal_dcg > 0 else None
 
     relevant_chunk_count = sum(1 for grade in all_candidate_grades if is_relevant_grade(grade))
     retrieved_relevant_count = sum(1 for grade in retrieved_grades if is_relevant_grade(grade))
     recall_at_k = (
-        retrieved_relevant_count / relevant_chunk_count if relevant_chunk_count > 0 else None
+        min(1.0, retrieved_relevant_count / relevant_chunk_count)
+        if relevant_chunk_count > 0
+        else None
     )
 
     return {
@@ -1348,8 +1350,15 @@ def evaluate_retrieval_metrics(
 
 def retrieval_relevance_grade(item: Dict, row: Dict) -> int:
     target_doc_id = item.get("doc_id")
-    if target_doc_id and not metadata_value_matches(row.get("doc_id", ""), target_doc_id):
+    if not target_doc_id:
+        return weak_chunk_relevance_grade(item, str(row.get("text", "")))
+    row_matches_target = metadata_value_matches(row.get("doc_id", ""), target_doc_id) or metadata_value_matches(
+        row.get("cpv_code", ""), target_doc_id
+    )
+    if not row_matches_target:
         return 0
+    if row.get("program_id") == "cpv" or row.get("cpv_code"):
+        return 3
     return weak_chunk_relevance_grade(item, str(row.get("text", "")))
 
 
