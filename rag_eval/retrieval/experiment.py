@@ -8,14 +8,20 @@ from typing import Dict, List, Optional, Sequence
 from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
 from rag_eval.retrieval.chunking import build_chunks
 from rag_eval.retrieval.kg import (
+    build_kg_supervision_terms,
     build_knowledge_graph,
     evaluate_kg_for_question,
+    evaluate_kg_retrieval_diagnostics,
     graph_augmented_retrieval,
-    maybe_export_graph_to_neo4j,
     summarize_kg_metrics,
 )
 from rag_eval.evaluation.judge import judge_claims_with_llm
-from rag_eval.evaluation.llm import generate_answer_with_llm
+from rag_eval.evaluation.llm import (
+    augment_query_with_llm,
+    critique_and_revise_answer_with_llm,
+    generate_answer_with_llm,
+    rewrite_query_for_retry,
+)
 from rag_eval.evaluation.metrics import (
     diagnose_failure,
     evaluate_answer_metrics,
@@ -29,7 +35,7 @@ from rag_eval.evaluation.metrics import (
     summarize_diagnostics,
     summarize_retrieval_metrics,
 )
-from rag_eval.core.models import LLMConfig, Paragraph, Section
+from rag_eval.core.models import LLMCallResult, LLMConfig, Paragraph, Section
 from rag_eval.retrieval.engines import build_retriever, rerank_with_lexical_signal, retrieve_top_k
 from rag_eval.core.text_utils import metadata_value_matches
 from rag_eval.reporting.visualization import (
@@ -91,6 +97,136 @@ def filter_chunks_by_metadata(chunks: Sequence[Dict], metadata_filter: Dict[str,
     return filtered
 
 
+def assemble_context_rows(
+    rows: Sequence[Dict],
+    *,
+    mode: str,
+    max_chunks: int | None,
+    max_chars: int | None,
+    kg_retrieval: Dict[str, object] | None = None,
+) -> List[Dict]:
+    selected = list(rows)
+    if mode == "kg_first":
+        selected.sort(
+            key=lambda row: (
+                0 if row.get("retrieval_source") == "graph" else 1,
+                -float(row.get("kg_graph_score", 0.0)),
+                -float(row.get("score", 0.0)),
+            )
+        )
+    elif mode == "group_by_doc":
+        selected.sort(key=lambda row: (str(row.get("doc_id", "")), str(row.get("section_id", "")), -float(row.get("score", 0.0))))
+    elif mode == "dedupe_section":
+        seen = set()
+        deduped = []
+        for row in selected:
+            key = (row.get("doc_id"), row.get("section_id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+        selected = deduped
+    elif mode == "kg_organized":
+        selected = organize_context_with_kg_paths(selected, kg_retrieval or {})
+
+    if max_chunks is not None and max_chunks > 0:
+        selected = selected[:max_chunks]
+    if max_chars is not None and max_chars > 0:
+        out = []
+        total = 0
+        for row in selected:
+            row_chars = len(str(row.get("text", "")))
+            if out and total + row_chars > max_chars:
+                break
+            out.append(row)
+            total += row_chars
+        selected = out
+    return selected
+
+
+def organize_context_with_kg_paths(rows: Sequence[Dict], kg_retrieval: Dict[str, object]) -> List[Dict]:
+    supporting = [
+        relation
+        for relation in kg_retrieval.get("supporting_relations", [])
+        if isinstance(relation, dict)
+    ]
+    relation_by_chunk: Dict[str, Dict[str, object]] = {}
+    for relation in supporting:
+        chunk_id = str(relation.get("chunk_id", ""))
+        if not chunk_id:
+            continue
+        current = relation_by_chunk.get(chunk_id)
+        current_depth = float(current.get("activation_depth", 99)) if current else 99
+        relation_depth = float(relation.get("activation_depth", 1) or 1)
+        relation_intent = float(relation.get("intent_score", 0.0) or 0.0)
+        current_intent = float(current.get("intent_score", 0.0)) if current else -1.0
+        if current is None or (relation_depth, -relation_intent) < (current_depth, -current_intent):
+            relation_by_chunk[chunk_id] = relation
+
+    out: List[Dict] = []
+    for row in rows:
+        organized = dict(row)
+        relation = relation_by_chunk.get(str(row.get("chunk_id", "")))
+        if relation:
+            header = " | ".join(
+                part
+                for part in [
+                    f"KG path: {relation.get('seed', '')}",
+                    f"{relation.get('subject', '')} --{relation.get('predicate', '')}--> {relation.get('object', '')}",
+                    f"depth {relation.get('activation_depth', 1)}",
+                ]
+                if str(part).strip()
+            )
+            organized["kg_context_header"] = header
+            organized["kg_context_depth"] = int(relation.get("activation_depth", 1) or 1)
+            organized["kg_context_intent_score"] = float(relation.get("intent_score", 0.0) or 0.0)
+        else:
+            organized["kg_context_header"] = "Semantic seed context" if row.get("retrieval_source") != "graph" else "KG-related context"
+            organized["kg_context_depth"] = 0 if row.get("retrieval_source") != "graph" else 99
+            organized["kg_context_intent_score"] = float(row.get("kg_intent_score", 0.0) or 0.0)
+        out.append(organized)
+
+    out.sort(
+        key=lambda row: (
+            0 if row.get("retrieval_source") in {"vector", "vector+graph"} else 1,
+            int(row.get("kg_context_depth", 99) or 99),
+            -float(row.get("kg_context_intent_score", 0.0) or 0.0),
+            -float(row.get("kg_graph_score", 0.0) or 0.0),
+            str(row.get("doc_id", "")),
+            str(row.get("section_id", "")),
+        )
+    )
+    return out
+
+
+def decision_policy_result(
+    *,
+    prediction_confidence: float | None,
+    runtime_retrieval_status: str,
+    context_claim_recall: float | None,
+    grounded_claim_ratio: float | None,
+    min_confidence: float,
+    min_context_claim_recall: float,
+    min_grounded_claim_ratio: float,
+) -> Dict[str, object]:
+    reasons = []
+    if prediction_confidence is not None and prediction_confidence < min_confidence:
+        reasons.append("low_confidence")
+    if context_claim_recall is not None and context_claim_recall < min_context_claim_recall:
+        reasons.append("low_context_claim_recall")
+    if grounded_claim_ratio is not None and grounded_claim_ratio < min_grounded_claim_ratio:
+        reasons.append("low_grounded_claim_ratio")
+    if runtime_retrieval_status in {"missing_evidence", "weak_evidence"}:
+        reasons.append(runtime_retrieval_status)
+    if "missing_evidence" in reasons:
+        action = "abstain"
+    elif reasons:
+        action = "manual_review"
+    else:
+        action = "auto_accept"
+    return {"decision_action": action, "decision_reasons": ",".join(reasons)}
+
+
 def build_run_dir(base_output_dir: str, run_name: Optional[str]) -> str:
     run_id = run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(base_output_dir, run_id)
@@ -116,18 +252,40 @@ def run_single_experiment(
     create_strategy_visualization: bool,
     create_strategy_showcase: bool,
     kg_enabled: bool,
-    neo4j_enabled: bool,
-    neo4j_uri: str | None,
-    neo4j_user: str | None,
-    neo4j_password: str | None,
-    neo4j_database: str | None,
-    neo4j_clear: bool,
+    kg_graph_weight: float,
+    kg_profile: str = "balanced",
+    kg_algorithm: str | None = None,
+    kg_max_added_chunks: int | None = None,
+    kg_ppr_iterations: int | None = None,
+    kg_ppr_damping: float | None = None,
+    kg_quality_threshold: float | None = None,
+    kg_intent_weight: float | None = None,
+    answer_mode: str = "cite_first",
+    context_mode: str = "dedupe_section",
+    max_context_chunks: int | None = None,
+    max_context_chars: int | None = None,
+    query_augmentation: str = "none",
+    query_augmentation_max_terms: int = 8,
+    decision_min_confidence: float = 0.0,
+    decision_min_context_claim_recall: float = 0.0,
+    decision_min_grounded_claim_ratio: float = 1.0,
     runtime_retrieval_evaluator_enabled: bool = True,
     abstain_on_weak_evidence: bool = False,
+    self_rag_retry_on_weak_evidence: bool = False,
+    self_rag_retry_max_attempts: int = 1,
+    self_rag_critique: bool = False,
     rerank_top_n: int = 0,
     rerank_weight: float = 0.25,
 ) -> Dict:
     import pandas as pd
+
+    resolved_answer_mode = answer_mode or "cite_first"
+    resolved_context_mode = context_mode or "dedupe_section"
+    resolved_max_context_chunks = max_context_chunks
+    resolved_max_context_chars = max_context_chars
+    resolved_query_augmentation = query_augmentation or "none"
+    resolved_decision_min_confidence = float(decision_min_confidence or 0.0)
+    resolved_decision_min_context_claim_recall = float(decision_min_context_claim_recall or 0.0)
 
     experiment_slug = f"{strategy}_{retriever_type}_size{chunk_size}_overlap{chunk_overlap}"
     experiment_dir = os.path.join(run_dir, experiment_slug)
@@ -141,26 +299,21 @@ def run_single_experiment(
     chunks_csv = os.path.join(experiment_dir, "chunks.csv")
     chunks_df.to_csv(chunks_csv, index=False)
 
-    kg_graph = build_knowledge_graph(chunks) if kg_enabled else {"entities": [], "relations": []}
+    kg_supervision_terms = build_kg_supervision_terms(questions) if kg_enabled else {}
+    kg_graph = (
+        build_knowledge_graph(chunks, extra_entity_terms=kg_supervision_terms)
+        if kg_enabled
+        else {"entities": [], "relations": []}
+    )
     kg_entities_csv: Optional[str] = None
     kg_relations_csv: Optional[str] = None
     kg_metrics_csv: Optional[str] = None
     kg_summary_json: Optional[str] = None
-    kg_neo4j_status: Dict = {"status": "disabled"}
     if kg_enabled:
         kg_entities_csv = os.path.join(experiment_dir, "kg_entities.csv")
         kg_relations_csv = os.path.join(experiment_dir, "kg_relations.csv")
         pd.DataFrame(kg_graph["entities"]).to_csv(kg_entities_csv, index=False)
         pd.DataFrame(kg_graph["relations"]).to_csv(kg_relations_csv, index=False)
-        kg_neo4j_status = maybe_export_graph_to_neo4j(
-            kg_graph,
-            enabled=neo4j_enabled,
-            uri=neo4j_uri,
-            user=neo4j_user,
-            password=neo4j_password,
-            database=neo4j_database,
-            clear=neo4j_clear,
-        )
 
     retriever_state = build_retriever(chunks, retriever_type, embedding_model)
     faiss_path: Optional[str] = None
@@ -184,6 +337,18 @@ def run_single_experiment(
     judge_rows: List[Dict] = []
     claim_evidence_rows: List[Dict] = []
     for item in questions:
+        query_augmentation_config = (
+            LLMConfig(True, llm_config.model, llm_config.api_key_env, 0.0)
+            if resolved_query_augmentation in {"llm", "hyde"}
+            else llm_config
+        )
+        query_augmentation_result = augment_query_with_llm(
+            item["question"],
+            query_augmentation_config,
+            mode=resolved_query_augmentation,
+            max_terms=query_augmentation_max_terms,
+        )
+        retrieval_query = query_augmentation_result.answer or item["question"]
         answer_metadata_filter = question_metadata_filter(item, include_document=False)
         evaluation_metadata_filter = question_metadata_filter(item, include_document=True)
         candidate_chunks = filter_chunks_by_metadata(chunks, evaluation_metadata_filter)
@@ -194,7 +359,7 @@ def run_single_experiment(
             )
         answer_scope_chunks = filter_chunks_by_metadata(chunks, answer_metadata_filter)
         base_retrieved = retrieve_top_k(
-            query=item["question"],
+            query=retrieval_query,
             retriever_state=retriever_state,
             chunks=chunks,
             k=min(max(top_k, rerank_top_n or top_k), len(answer_scope_chunks or chunks)),
@@ -202,7 +367,7 @@ def run_single_experiment(
             metadata_filter=answer_metadata_filter,
         )
         base_retrieved = rerank_with_lexical_signal(
-            query=item["question"],
+            query=retrieval_query,
             rows=base_retrieved,
             top_k=min(top_k, len(base_retrieved)),
             rerank_top_n=rerank_top_n,
@@ -212,32 +377,122 @@ def run_single_experiment(
             "enabled": False,
             "seed_entities": [],
             "added_chunk_ids": [],
+            "replaced_chunk_ids": [],
             "supporting_relations": [],
             "base_chunk_ids": [row["chunk_id"] for row in base_retrieved],
             "fused_chunk_ids": [row["chunk_id"] for row in base_retrieved],
         }
         if kg_enabled:
             retrieved, kg_retrieval = graph_augmented_retrieval(
-                query=item["question"],
+                query=retrieval_query,
                 retrieved=base_retrieved,
                 graph=kg_graph,
                 chunks=answer_scope_chunks or chunks,
                 k=min(top_k, len(answer_scope_chunks or chunks)),
+                graph_weight=kg_graph_weight,
+                kg_profile=kg_profile,
+                graph_algorithm=kg_algorithm,
+                max_added_chunks=kg_max_added_chunks,
+                ppr_iterations=kg_ppr_iterations,
+                ppr_damping=kg_ppr_damping,
+                quality_threshold=kg_quality_threshold,
+                intent_weight=kg_intent_weight,
             )
         else:
             retrieved = base_retrieved
+        retrieved = assemble_context_rows(
+            retrieved,
+            mode=resolved_context_mode,
+            max_chunks=resolved_max_context_chunks,
+            max_chars=resolved_max_context_chars,
+            kg_retrieval=kg_retrieval,
+        )
         runtime_retrieval_result = runtime_retrieval_evaluation(
             question=item["question"],
             retrieved=retrieved,
         )
+        self_rag_retry_status = "disabled"
+        self_rag_retry_query = ""
+        self_rag_retry_attempts = 0
+        if (
+            runtime_retrieval_evaluator_enabled
+            and self_rag_retry_on_weak_evidence
+            and runtime_retrieval_result["status"] in {"missing_evidence", "weak_evidence"}
+            and self_rag_retry_max_attempts > 0
+        ):
+            retry_config = LLMConfig(True, llm_config.model, llm_config.api_key_env, 0.0)
+            for _attempt in range(max(1, self_rag_retry_max_attempts)):
+                self_rag_retry_attempts += 1
+                retry_result = rewrite_query_for_retry(
+                    item["question"],
+                    retrieved,
+                    retry_config,
+                    reason=str(runtime_retrieval_result.get("reason", "")),
+                )
+                self_rag_retry_status = retry_result.status
+                self_rag_retry_query = retry_result.answer or ""
+                if retry_result.status != "success" or not retry_result.answer:
+                    break
+                retry_base_retrieved = retrieve_top_k(
+                    query=retry_result.answer,
+                    retriever_state=retriever_state,
+                    chunks=chunks,
+                    k=min(max(top_k, rerank_top_n or top_k), len(answer_scope_chunks or chunks)),
+                    hybrid_alpha=hybrid_alpha,
+                    metadata_filter=answer_metadata_filter,
+                )
+                retry_base_retrieved = rerank_with_lexical_signal(
+                    query=retry_result.answer,
+                    rows=retry_base_retrieved,
+                    top_k=min(top_k, len(retry_base_retrieved)),
+                    rerank_top_n=rerank_top_n,
+                    rerank_weight=rerank_weight,
+                )
+                if kg_enabled:
+                    retry_retrieved, retry_kg_retrieval = graph_augmented_retrieval(
+                        query=retry_result.answer,
+                        retrieved=retry_base_retrieved,
+                        graph=kg_graph,
+                        chunks=answer_scope_chunks or chunks,
+                        k=min(top_k, len(answer_scope_chunks or chunks)),
+                        graph_weight=kg_graph_weight,
+                        kg_profile=kg_profile,
+                        graph_algorithm=kg_algorithm,
+                        max_added_chunks=kg_max_added_chunks,
+                        ppr_iterations=kg_ppr_iterations,
+                        ppr_damping=kg_ppr_damping,
+                        quality_threshold=kg_quality_threshold,
+                        intent_weight=kg_intent_weight,
+                    )
+                else:
+                    retry_retrieved = retry_base_retrieved
+                    retry_kg_retrieval = kg_retrieval
+                retry_retrieved = assemble_context_rows(
+                    retry_retrieved,
+                    mode=resolved_context_mode,
+                    max_chunks=resolved_max_context_chunks,
+                    max_chars=resolved_max_context_chars,
+                    kg_retrieval=retry_kg_retrieval,
+                )
+                retry_runtime = runtime_retrieval_evaluation(
+                    question=item["question"],
+                    retrieved=retry_retrieved,
+                )
+                if retry_runtime["score"] > runtime_retrieval_result["score"]:
+                    retrieval_query = retry_result.answer
+                    base_retrieved = retry_base_retrieved
+                    retrieved = retry_retrieved
+                    kg_retrieval = retry_kg_retrieval
+                    runtime_retrieval_result = retry_runtime
+                if retry_runtime["status"] == "good_evidence":
+                    self_rag_retry_status = "success_improved"
+                    break
         should_abstain = (
             runtime_retrieval_evaluator_enabled
             and abstain_on_weak_evidence
             and runtime_retrieval_result["status"] in {"missing_evidence", "weak_evidence"}
         )
         if should_abstain:
-            from rag_eval.core.models import LLMCallResult
-
             llm_result = LLMCallResult(
                 answer=None,
                 used=False,
@@ -247,12 +502,34 @@ def run_single_experiment(
             answer = "Not enough evidence in the retrieved context to answer reliably."
             answer_mode = "runtime_abstention"
         else:
-            llm_result = generate_answer_with_llm(item["question"], retrieved, llm_config)
-            answer = llm_result.answer
-            answer_mode = "llm_grounded"
-            if answer is None:
+            if resolved_answer_mode == "extractive":
                 answer = keyword_extractive_answer(item["question"], retrieved)
-                answer_mode = "extractive_fallback"
+                llm_result = LLMCallResult(answer=None, used=False, status="disabled", error=None)
+                answer_mode = "extractive"
+            else:
+                llm_result = generate_answer_with_llm(
+                    item["question"],
+                    retrieved,
+                    llm_config,
+                    answer_mode=resolved_answer_mode,
+                    context_style="cite_first" if resolved_answer_mode in {"cite_first", "claim_checklist"} else "standard",
+                )
+                answer = llm_result.answer
+                answer_mode = resolved_answer_mode
+                if answer is None:
+                    answer = keyword_extractive_answer(item["question"], retrieved)
+                    answer_mode = f"extractive_fallback_after_{resolved_answer_mode}"
+        self_rag_critique_result = LLMCallResult(answer=answer, used=False, status="disabled", error=None)
+        if self_rag_critique and not should_abstain and answer:
+            critique_config = LLMConfig(True, llm_config.model, llm_config.api_key_env, 0.0)
+            self_rag_critique_result = critique_and_revise_answer_with_llm(
+                question=item["question"],
+                answer=answer,
+                retrieved=retrieved,
+                llm_config=critique_config,
+            )
+            if self_rag_critique_result.answer:
+                answer = self_rag_critique_result.answer
         claim_judge_result = judge_claims_with_llm(
             item=item,
             answer=answer,
@@ -276,6 +553,13 @@ def run_single_experiment(
         if kg_enabled:
             base_kg_metrics = evaluate_kg_for_question(item, base_retrieved, kg_graph)
             kg_metrics = evaluate_kg_for_question(item, retrieved, kg_graph)
+            kg_retrieval_diagnostics = evaluate_kg_retrieval_diagnostics(
+                item=item,
+                base_retrieved=base_retrieved,
+                retrieved=retrieved,
+                kg_retrieval=kg_retrieval,
+                graph=kg_graph,
+            )
             # Compare relation-evidence coverage before and after graph expansion.
             # A positive delta means KG added context that contains more gold facts.
             base_relation_recall = base_kg_metrics["gold_kg_relation_evidence_recall"]
@@ -301,9 +585,18 @@ def run_single_experiment(
                     "kg_retrieval_added_chunk_ids": json.dumps(
                         kg_retrieval["added_chunk_ids"], ensure_ascii=False
                     ),  # chunk ids pulled in by KG expansion
+                    "kg_retrieval_replaced_chunk_ids": json.dumps(
+                        kg_retrieval.get("replaced_chunk_ids", []), ensure_ascii=False
+                    ),  # base top-k chunks displaced by graph-intent reranking
                     "kg_retrieval_supporting_relations": json.dumps(
                         kg_retrieval["supporting_relations"], ensure_ascii=False
                     ),  # graph edges that justified added chunks
+                    "kg_profile": kg_retrieval.get("kg_profile", kg_profile),
+                    "kg_graph_algorithm": kg_retrieval.get("graph_algorithm", kg_algorithm or ""),
+                    "kg_settings": json.dumps(
+                        kg_retrieval.get("kg_settings", {}), ensure_ascii=False
+                    ),
+                    **kg_retrieval_diagnostics,
                 }
             )
         auto_flag = answer_metrics.answer_accuracy_label
@@ -313,6 +606,15 @@ def run_single_experiment(
             llm_status=llm_result.status,
             answer_mode=answer_mode,
         )
+        decision_result = decision_policy_result(
+            prediction_confidence=float(retrieved[0]["score"]) if retrieved else None,
+            runtime_retrieval_status=answer_metrics.runtime_retrieval_status,
+            context_claim_recall=answer_metrics.context_claim_recall,
+            grounded_claim_ratio=answer_metrics.grounded_claim_ratio,
+            min_confidence=resolved_decision_min_confidence,
+            min_context_claim_recall=resolved_decision_min_context_claim_recall,
+            min_grounded_claim_ratio=decision_min_grounded_claim_ratio,
+        )
 
         for rank, row in enumerate(retrieved, start=1):
             relevance_grade = retrieval_relevance_grade(item, row)
@@ -320,6 +622,12 @@ def run_single_experiment(
                 {
                     "question_id": item["id"],
                     "question": item["question"],
+                    "retrieval_query": retrieval_query,
+                    "query_augmentation_mode": resolved_query_augmentation,
+                    "query_augmentation_status": query_augmentation_result.status,
+                    "self_rag_retry_status": self_rag_retry_status,
+                    "self_rag_retry_attempts": self_rag_retry_attempts,
+                    "self_rag_retry_query": self_rag_retry_query,
                     "question_program_id": item.get("program_id", ""),
                     "question_program_name": item.get("program_name", ""),
                     "question_doc_id": item.get("doc_id", ""),
@@ -332,6 +640,11 @@ def run_single_experiment(
                     "score": row["score"],
                     "base_retrieval_score": row.get("base_retrieval_score", row["score"]),  # original text-retriever score
                     "kg_graph_score": row.get("kg_graph_score", 0.0),  # graph relevance score used in fusion
+                    "kg_intent_score": row.get("kg_intent_score", 0.0),  # predicate/query intent match used in fusion
+                    "kg_chunk_quality_factor": row.get("kg_chunk_quality_factor", 1.0),  # version/noise filter multiplier
+                    "kg_context_header": row.get("kg_context_header", ""),
+                    "kg_context_depth": row.get("kg_context_depth", ""),
+                    "kg_context_intent_score": row.get("kg_context_intent_score", ""),
                     "retrieval_source": row.get("retrieval_source", "vector"),  # vector, graph, or vector+graph
                     "doc_id": row["doc_id"],
                     "doc_path": row.get("doc_path", row["doc_id"]),
@@ -351,6 +664,16 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "retrieval_query": retrieval_query,
+                "query_augmentation_status": query_augmentation_result.status,
+                "self_rag_retry_status": self_rag_retry_status,
+                "self_rag_retry_attempts": self_rag_retry_attempts,
+                "self_rag_retry_query": self_rag_retry_query,
+                "self_rag_critique_status": self_rag_critique_result.status,
+                "self_rag_critique_error": self_rag_critique_result.error,
+                "answer_mode": answer_mode,
+                "context_mode": resolved_context_mode,
+                **decision_result,
                 "program_id": item.get("program_id", ""),
                 "program_name": item.get("program_name", ""),
                 "doc_id": item.get("doc_id", ""),
@@ -412,6 +735,9 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "retrieval_query": retrieval_query,
+                "context_mode": resolved_context_mode,
+                **decision_result,
                 "program_id": item.get("program_id", ""),
                 "program_name": item.get("program_name", ""),
                 "doc_id": item.get("doc_id", ""),
@@ -442,6 +768,8 @@ def run_single_experiment(
                 "evaluation_scope": json.dumps(evaluation_metadata_filter, ensure_ascii=False),
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
+                "context_mode": resolved_context_mode,
+                **decision_result,
                 "expected_answerable": answer_metrics.expected_answerable,
                 "abstained": answer_metrics.abstained,
                 "over_answered": answer_metrics.over_answered,
@@ -449,6 +777,10 @@ def run_single_experiment(
                 "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
                 "runtime_retrieval_action": answer_metrics.runtime_retrieval_action,
                 "runtime_retrieval_score": answer_metrics.runtime_retrieval_score,
+                "self_rag_retry_status": self_rag_retry_status,
+                "self_rag_retry_attempts": self_rag_retry_attempts,
+                "self_rag_retry_query": self_rag_retry_query,
+                "self_rag_critique_status": self_rag_critique_result.status,
                 "claim_judge_used": answer_metrics.claim_judge_used,
                 "claim_judge_status": answer_metrics.claim_judge_status,
                 "claim_diagnostic": answer_metrics.claim_diagnostic,
@@ -474,6 +806,17 @@ def run_single_experiment(
         result_row = {
                 "question_id": item["id"],
                 "question": item["question"],
+                "retrieval_query": retrieval_query,
+                "query_augmentation_mode": resolved_query_augmentation,
+                "query_augmentation_status": query_augmentation_result.status,
+                "answer_mode": answer_mode,
+                "context_mode": resolved_context_mode,
+                "self_rag_retry_status": self_rag_retry_status,
+                "self_rag_retry_attempts": self_rag_retry_attempts,
+                "self_rag_retry_query": self_rag_retry_query,
+                "self_rag_critique_status": self_rag_critique_result.status,
+                "self_rag_critique_error": self_rag_critique_result.error,
+                **decision_result,
                 "program_id": item.get("program_id", ""),
                 "gold_answer": item.get("gold_answer", ""),
                 "expected_keywords": json.dumps(item.get("expected_keywords", []), ensure_ascii=False),
@@ -506,6 +849,11 @@ def run_single_experiment(
                     if kg_enabled
                     else None
                 ),  # query/context entities used as graph seeds
+                "kg_retrieval_replaced_chunk_ids": (
+                    json.dumps(kg_retrieval.get("replaced_chunk_ids", []), ensure_ascii=False)
+                    if kg_enabled
+                    else None
+                ),  # base top-k chunks displaced by graph-intent reranking
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
@@ -668,7 +1016,6 @@ def run_single_experiment(
                     "n_entities": len(kg_graph["entities"]),
                     "n_relations": len(kg_graph["relations"]),
                     "metrics": aggregate_kg_metrics,
-                    "neo4j": kg_neo4j_status,
                 },
                 f,
                 ensure_ascii=False,
@@ -684,6 +1031,10 @@ def run_single_experiment(
         confidence_key="prediction_confidence",
         correct_fn=lambda row: row.get("auto_flag") == "correct",
     )
+    decision_counts = {
+        action: sum(1 for row in results if row.get("decision_action") == action)
+        for action in sorted({str(row.get("decision_action", "")) for row in results if row.get("decision_action")})
+    }
     diagnostics_json = os.path.join(experiment_dir, "diagnostics_summary.json")
     with open(diagnostics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_diagnostics, f, ensure_ascii=False, indent=2)
@@ -719,6 +1070,21 @@ def run_single_experiment(
             "top_n": rerank_top_n,
             "weight": rerank_weight,
         },
+        "evaluation_settings": {
+            "answer_mode": resolved_answer_mode,
+            "context_mode": resolved_context_mode,
+            "max_context_chunks": resolved_max_context_chunks,
+            "max_context_chars": resolved_max_context_chars,
+            "query_augmentation": resolved_query_augmentation,
+            "query_augmentation_max_terms": query_augmentation_max_terms,
+            "self_rag_retry_on_weak_evidence": self_rag_retry_on_weak_evidence,
+            "self_rag_retry_max_attempts": self_rag_retry_max_attempts,
+            "self_rag_critique": self_rag_critique,
+            "decision_min_confidence": resolved_decision_min_confidence,
+            "decision_min_context_claim_recall": resolved_decision_min_context_claim_recall,
+            "decision_min_grounded_claim_ratio": decision_min_grounded_claim_ratio,
+            "decision_counts": decision_counts,
+        },
         "n_chunks": len(chunks),
         "n_questions": len(questions),
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
@@ -727,20 +1093,43 @@ def run_single_experiment(
         "retrieval_metrics": aggregate_retrieval_metrics,
         "kg": {
             "enabled": kg_enabled,
+            "graph_weight": kg_graph_weight if kg_enabled else None,
+            "profile": kg_profile if kg_enabled else None,
+            "algorithm": kg_algorithm if kg_enabled else None,
+            "weak_supervision_entity_terms": sum(len(rows) for rows in kg_supervision_terms.values()),
             "n_entities": len(kg_graph["entities"]),
             "n_relations": len(kg_graph["relations"]),
             "metrics": aggregate_kg_metrics,
-            "neo4j": kg_neo4j_status,
         },
         "diagnostics": aggregate_diagnostics,
         "llm": {
-            "enabled": llm_config.enabled,
-            "model": llm_config.model if llm_config.enabled else None,
+            "enabled": (
+                llm_config.enabled
+                or resolved_query_augmentation in {"llm", "hyde"}
+                or self_rag_retry_on_weak_evidence
+                or self_rag_critique
+            ),
+            "model": (
+                llm_config.model
+                if (
+                    llm_config.enabled
+                    or resolved_query_augmentation in {"llm", "hyde"}
+                    or self_rag_retry_on_weak_evidence
+                    or self_rag_critique
+                )
+                else None
+            ),
             "answer_generation": llm_config.enabled,
+            "query_augmentation": resolved_query_augmentation,
+            "self_rag_retry_on_weak_evidence": self_rag_retry_on_weak_evidence,
+            "self_rag_critique": self_rag_critique,
         },
         "runtime_retrieval_evaluator": {
             "enabled": runtime_retrieval_evaluator_enabled,
             "abstain_on_weak_evidence": abstain_on_weak_evidence,
+            "self_rag_retry_on_weak_evidence": self_rag_retry_on_weak_evidence,
+            "self_rag_retry_max_attempts": self_rag_retry_max_attempts,
+            "self_rag_critique": self_rag_critique,
         },
         "judge": {
             "enabled": bool(judge_config and judge_config.enabled),

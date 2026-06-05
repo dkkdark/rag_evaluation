@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import html
 import json
@@ -20,7 +22,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
+DATA_FILES_DIR = PROJECT_ROOT / "data" / "files"
+UPLOAD_DIR = DATA_FILES_DIR / "uploads"
 RUN_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9_. -]+")
 
 
 @dataclass
@@ -98,6 +103,17 @@ def safe_run_name(raw_name: str | None) -> str:
     return cleaned[:80]
 
 
+def safe_upload_name(raw_name: str) -> str:
+    name = Path(raw_name or "uploaded.pdf").name
+    cleaned = UPLOAD_NAME_RE.sub("_", name).strip(" ._-")
+    if not cleaned:
+        cleaned = "uploaded.pdf"
+    suffix = Path(cleaned).suffix.lower()
+    if suffix not in {".pdf", ".pdfa"}:
+        raise ValueError(f"Unsupported upload type for {raw_name!r}; only PDF files are accepted.")
+    return cleaned[:120]
+
+
 def default_run_name() -> str:
     return "web_eval_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -113,6 +129,78 @@ def bool_flag(payload: dict[str, Any], key: str) -> bool:
     return bool(payload.get(key))
 
 
+def _payload_int(payload: dict[str, Any], key: str, default: int = 0) -> int:
+    try:
+        return int(payload.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep only settings that are explicitly selected so CLI defaults apply."""
+    active = dict(payload)
+
+    if not bool_flag(active, "kg_enable"):
+        for key in (
+            "kg_graph_weight",
+            "kg_profile",
+            "kg_algorithm",
+            "kg_max_added_chunks",
+            "kg_ppr_iterations",
+            "kg_ppr_damping",
+            "kg_quality_threshold",
+            "kg_intent_weight",
+        ):
+            active.pop(key, None)
+
+    if not bool_flag(active, "cross_encoder_rerank"):
+        active.pop("cross_encoder_model", None)
+        active.pop("cross_encoder_top_n", None)
+
+    chunking = str(active.get("chunking") or "")
+    if chunking != "auto":
+        active.pop("auto_chunk_sizes", None)
+        active.pop("auto_overlaps", None)
+    if chunking not in {"fixed_words", "fixed_tokens"}:
+        active.pop("chunk_size", None)
+        active.pop("overlap", None)
+
+    retriever = str(active.get("retriever") or "")
+    if retriever not in {"hybrid", "auto"}:
+        active.pop("hybrid_alpha", None)
+    if retriever != "auto":
+        active.pop("auto_retrievers", None)
+
+    if _payload_int(active, "rerank_top_n") <= 0:
+        active.pop("rerank_weight", None)
+    if not bool_flag(active, "self_rag_retry_on_weak_evidence"):
+        active.pop("self_rag_retry_max_attempts", None)
+
+    query_augmentation = str(active.get("query_augmentation") or "").strip().lower()
+    if query_augmentation not in {"llm", "hyde"}:
+        active.pop("query_augmentation_max_terms", None)
+    if query_augmentation in {"", "none"}:
+        active.pop("query_augmentation", None)
+
+    llm_needed = (
+        bool_flag(active, "llm_enable")
+        or bool_flag(active, "judge_enable")
+        or query_augmentation in {"llm", "hyde"}
+        or bool_flag(active, "self_rag_retry_on_weak_evidence")
+        or bool_flag(active, "self_rag_critique")
+    )
+    if not (bool_flag(active, "llm_enable") or query_augmentation in {"llm", "hyde"} or bool_flag(active, "self_rag_retry_on_weak_evidence") or bool_flag(active, "self_rag_critique")):
+        active.pop("llm_model", None)
+        active.pop("llm_temperature", None)
+    if not bool_flag(active, "judge_enable"):
+        active.pop("judge_model", None)
+        active.pop("judge_temperature", None)
+    if not llm_needed:
+        active.pop("openai_api_key_env", None)
+
+    return active
+
+
 def add_value_arg(command: list[str], flag: str, value: Any) -> None:
     if value is None:
         return
@@ -122,13 +210,15 @@ def add_value_arg(command: list[str], flag: str, value: Any) -> None:
 
 
 def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> list[str]:
-    classifier_type = str(payload.get("classifier_type", "examination_regulations"))
+    payload = filter_active_payload(payload)
+    classifier_type = str(payload.get("classifier_type", "document_qa"))
+    is_document_classifier = classifier_type in {"document_qa", "examination_regulations"}
     selected_docs = payload.get("selected_docs") or []
     if isinstance(selected_docs, str):
         selected_docs = [selected_docs]
-    if classifier_type == "examination_regulations":
+    if is_document_classifier:
         if not selected_docs:
-            raise ValueError("Select at least one PDF file for examination_regulations.")
+            raise ValueError("Select at least one PDF file for document_qa.")
         docs_value = ",".join(str(path) for path in selected_docs)
     else:
         docs_value = payload.get("docs", "data/files/**/*.pdf*")
@@ -162,9 +252,30 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--auto-chunk-sizes": payload.get("auto_chunk_sizes"),
         "--auto-overlaps": payload.get("auto_overlaps"),
         "--auto-retrievers": payload.get("auto_retrievers"),
+        "--sweep-configs-json": payload.get("sweep_configs_json"),
         "--hybrid-alpha": payload.get("hybrid_alpha"),
+        "--answer-mode": payload.get("answer_mode") if is_document_classifier else None,
+        "--context-mode": payload.get("context_mode") if is_document_classifier else None,
+        "--max-context-chunks": payload.get("max_context_chunks"),
+        "--max-context-chars": payload.get("max_context_chars"),
+        "--query-augmentation": payload.get("query_augmentation"),
+        "--query-augmentation-max-terms": payload.get("query_augmentation_max_terms"),
+        "--decision-min-confidence": payload.get("decision_min_confidence"),
+        "--decision-min-context-claim-recall": payload.get("decision_min_context_claim_recall"),
+        "--decision-min-grounded-claim-ratio": payload.get("decision_min_grounded_claim_ratio"),
+        "--self-rag-retry-max-attempts": payload.get("self_rag_retry_max_attempts"),
+        "--kg-graph-weight": payload.get("kg_graph_weight"),
+        "--kg-profile": payload.get("kg_profile"),
+        "--kg-algorithm": payload.get("kg_algorithm"),
+        "--kg-max-added-chunks": payload.get("kg_max_added_chunks"),
+        "--kg-ppr-iterations": payload.get("kg_ppr_iterations"),
+        "--kg-ppr-damping": payload.get("kg_ppr_damping"),
+        "--kg-quality-threshold": payload.get("kg_quality_threshold"),
+        "--kg-intent-weight": payload.get("kg_intent_weight"),
         "--rerank-top-n": payload.get("rerank_top_n"),
         "--rerank-weight": payload.get("rerank_weight"),
+        "--cross-encoder-model": payload.get("cross_encoder_model"),
+        "--cross-encoder-top-n": payload.get("cross_encoder_top_n"),
         "--weight-answer": payload.get("weight_answer"),
         "--weight-correctness": payload.get("weight_correctness"),
         "--weight-retrieval": payload.get("weight_retrieval"),
@@ -174,7 +285,7 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--judge-model": payload.get("judge_model"),
         "--judge-temperature": payload.get("judge_temperature"),
     }
-    if classifier_type != "examination_regulations":
+    if not is_document_classifier:
         simple_args["--docs-root"] = payload.get("docs_root", "data/files")
     for flag, value in simple_args.items():
         add_value_arg(command, flag, value)
@@ -186,7 +297,10 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--judge-enable": "judge_enable",
         "--disable-runtime-retrieval-evaluator": "disable_runtime_retrieval_evaluator",
         "--abstain-on-weak-evidence": "abstain_on_weak_evidence",
+        "--self-rag-retry-on-weak-evidence": "self_rag_retry_on_weak_evidence",
+        "--self-rag-critique": "self_rag_critique",
         "--kg-enable": "kg_enable",
+        "--cross-encoder-rerank": "cross_encoder_rerank",
     }
     for flag, key in flags.items():
         if bool_flag(payload, key):
@@ -273,6 +387,33 @@ def list_data_files() -> dict[str, list[str]]:
             if path.is_file()
         ),
     }
+
+
+def save_uploaded_files(payload: dict[str, Any]) -> dict[str, Any]:
+    files = payload.get("files") or []
+    if not isinstance(files, list) or not files:
+        raise ValueError("Upload payload must contain a non-empty files list.")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("Each uploaded file must be an object with name and content_base64.")
+        filename = safe_upload_name(str(item.get("name") or "uploaded.pdf"))
+        raw_content = str(item.get("content_base64") or "")
+        try:
+            content = base64.b64decode(raw_content, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"Invalid base64 content for {filename}.") from exc
+        if not content.startswith(b"%PDF"):
+            raise ValueError(f"{filename} does not look like a PDF file.")
+        target = UPLOAD_DIR / filename
+        if target.exists():
+            stem = target.stem
+            suffix = target.suffix
+            target = UPLOAD_DIR / f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}{suffix}"
+        target.write_bytes(content)
+        saved.append(str(target.relative_to(PROJECT_ROOT)))
+    return {"saved": saved, "options": list_data_files()}
 
 
 def summarize_run(run_dir: Path) -> dict[str, Any]:
@@ -362,6 +503,460 @@ def read_tail(path: Path, max_chars: int = 24000) -> str:
     return data[-max_chars:]
 
 
+def _metric_payload(title: str, value: Any, help_text: str, kind: str = "number") -> dict[str, Any]:
+    return {"title": title, "value": value, "help": help_text, "kind": kind}
+
+
+def _chat_answer_grounding_score(answer: str, retrieved: list[dict[str, Any]]) -> float | None:
+    answer_tokens = {
+        token
+        for token in re.findall(r"\w+", answer.casefold(), flags=re.UNICODE)
+        if len(token) > 2
+    }
+    if not answer_tokens:
+        return None
+    context_text = "\n".join(str(row.get("text") or "") for row in retrieved)
+    context_tokens = {
+        token
+        for token in re.findall(r"\w+", context_text.casefold(), flags=re.UNICODE)
+        if len(token) > 2
+    }
+    if not context_tokens:
+        return 0.0
+    return len(answer_tokens.intersection(context_tokens)) / len(answer_tokens)
+
+
+def _chat_score_margin(retrieved: list[dict[str, Any]]) -> float | None:
+    scores = []
+    for row in retrieved:
+        try:
+            scores.append(float(row.get("score")))
+        except (TypeError, ValueError):
+            continue
+    if len(scores) < 2:
+        return None
+    scores = sorted(scores, reverse=True)
+    return scores[0] - scores[1]
+
+
+def _min_max(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if abs(high - low) < 1e-12:
+        return [1.0 if high > 0 else 0.0 for _ in values]
+    return [(value - low) / (high - low) for value in values]
+
+
+def _chat_rerank_by_question_evidence(
+    *,
+    question: str,
+    rows: list[dict[str, Any]],
+    top_k: int = 5,
+) -> list[dict[str, Any]]:
+    from rag_eval.evaluation.metrics import informative_tokens, numeric_tokens
+
+    if top_k <= 0 or not rows:
+        return []
+
+    question_terms = set(informative_tokens(question))
+    question_numbers = numeric_tokens(question)
+    base_scores: list[float] = []
+    for row in rows:
+        try:
+            base_scores.append(float(row.get("score") or 0.0))
+        except (TypeError, ValueError):
+            base_scores.append(0.0)
+    normalized_scores = _min_max(base_scores)
+
+    reranked: list[dict[str, Any]] = []
+    for row, base_score in zip(rows, normalized_scores):
+        search_text = "\n".join(
+            str(row.get(key) or "")
+            for key in ("section_id", "title", "text")
+            if str(row.get(key) or "").strip()
+        )
+        text_terms = set(informative_tokens(search_text))
+        lexical_coverage = (
+            len(question_terms.intersection(text_terms)) / len(question_terms)
+            if question_terms
+            else 0.0
+        )
+        text_numbers = numeric_tokens(search_text)
+        number_coverage = (
+            len(question_numbers.intersection(text_numbers)) / len(question_numbers)
+            if question_numbers
+            else lexical_coverage
+        )
+        title_terms = set(informative_tokens(str(row.get("title") or "")))
+        title_coverage = (
+            len(question_terms.intersection(title_terms)) / len(question_terms)
+            if question_terms and title_terms
+            else 0.0
+        )
+        evidence_score = (
+            0.50 * base_score
+            + 0.30 * lexical_coverage
+            + 0.15 * number_coverage
+            + 0.05 * title_coverage
+        )
+        updated = dict(row)
+        updated["base_score_before_evidence_rerank"] = row.get("score")
+        updated["question_evidence_score"] = float(evidence_score)
+        updated["question_lexical_coverage"] = float(lexical_coverage)
+        updated["question_number_coverage"] = float(number_coverage)
+        updated["score"] = float(evidence_score)
+        updated["reranked"] = True
+        updated["reranker"] = "question_evidence"
+        reranked.append(updated)
+
+    reranked.sort(key=lambda item: float(item.get("question_evidence_score") or 0.0), reverse=True)
+    return reranked[:top_k]
+
+
+def _chat_snippet_for_claim(claim: str, source_text: str, *, max_chars: int = 320) -> str:
+    from rag_eval.evaluation.metrics import informative_tokens, numeric_tokens
+
+    text = re.sub(r"\s+", " ", str(source_text or "")).strip()
+    if not text:
+        return ""
+
+    anchors = list(numeric_tokens(claim))
+    anchors.extend(sorted(set(informative_tokens(claim)), key=len, reverse=True))
+    match_start = 0
+    for anchor in anchors:
+        if not anchor:
+            continue
+        match = re.search(re.escape(anchor), text, flags=re.IGNORECASE)
+        if match:
+            match_start = match.start()
+            break
+
+    half = max_chars // 2
+    start = max(0, match_start - half)
+    end = min(len(text), start + max_chars)
+    if end - start < max_chars:
+        start = max(0, end - max_chars)
+    snippet = text[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(text):
+        snippet = snippet + "..."
+    return snippet
+
+
+def _chat_evidence_spans(
+    *,
+    answer: str,
+    retrieved: list[dict[str, Any]],
+    max_spans: int = 4,
+) -> list[dict[str, Any]]:
+    from rag_eval.evaluation.metrics import claim_support_score, split_claims
+
+    claims = split_claims(answer)
+    if not claims and answer.strip():
+        claims = [answer.strip()]
+
+    spans: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for claim in claims:
+        best_row: dict[str, Any] | None = None
+        best_score = 0.0
+        best_rank = None
+        for rank, row in enumerate(retrieved, start=1):
+            source_text = str(row.get("text") or "")
+            score = claim_support_score(claim, source_text)
+            if score > best_score:
+                best_score = score
+                best_row = row
+                best_rank = rank
+        if not best_row or best_score < 0.35:
+            continue
+
+        quote = _chat_snippet_for_claim(claim, str(best_row.get("text") or ""))
+        if not quote:
+            continue
+        key = (str(best_row.get("chunk_id") or best_rank or ""), quote)
+        if key in seen:
+            continue
+        seen.add(key)
+        spans.append(
+            {
+                "claim": claim,
+                "quote": quote,
+                "full_quote": re.sub(r"\s+", " ", str(best_row.get("text") or "")).strip(),
+                "rank": best_rank,
+                "chunk_id": best_row.get("chunk_id"),
+                "doc_id": best_row.get("doc_id"),
+                "title": best_row.get("title"),
+                "source_score": best_row.get("score"),
+                "support_score": best_score,
+            }
+        )
+        if len(spans) >= max_spans:
+            break
+    return spans
+
+
+def _chat_metric_cards(
+    *,
+    runtime_result: dict[str, Any],
+    retrieved: list[dict[str, Any]],
+    answer: str,
+) -> list[dict[str, Any]]:
+    top_score = runtime_result.get("top_score")
+    unique_sources = {
+        str(row.get("doc_id") or row.get("chunk_id") or "").strip()
+        for row in retrieved
+        if str(row.get("doc_id") or row.get("chunk_id") or "").strip()
+    }
+    return [
+        _metric_payload(
+            "Evidence confidence",
+            runtime_result.get("score"),
+            "A runtime estimate of whether retrieved context is strong enough to answer from.",
+            "percent",
+        ),
+        _metric_payload(
+            "Answer grounded in sources",
+            _chat_answer_grounding_score(answer, retrieved),
+            "Share of answer terms that also appear in retrieved source text. Higher usually means the answer is better grounded.",
+            "percent",
+        ),
+        _metric_payload(
+            "Query-context match",
+            runtime_result.get("context_relevance"),
+            "Lexical overlap between the user question and retrieved context.",
+            "percent",
+        ),
+        _metric_payload(
+            "Top source strength",
+            top_score,
+            "The strongest raw retrieval/candidate score among returned sources.",
+        ),
+        _metric_payload(
+            "Top-2 score gap",
+            _chat_score_margin(retrieved),
+            "Difference between the best and second-best source score. Small gaps usually mean the decision is ambiguous.",
+        ),
+        _metric_payload(
+            "Source diversity",
+            len(unique_sources),
+            "How many distinct documents or candidates contributed evidence.",
+        ),
+    ]
+
+
+def _chat_api_turn(payload: dict[str, Any], *, question: str, top_k: int) -> dict[str, Any]:
+    import time
+
+    from rag_eval.classifiers.evaluation import (
+        _normalize_prediction_label,
+        _normalize_prediction_score,
+        _post_classifier_request,
+    )
+    from rag_eval.evaluation.metrics import runtime_retrieval_evaluation
+
+    api_url = str(payload.get("api_classifier_url") or "").strip()
+    if not api_url:
+        raise ValueError("API classifier URL is required for api_classifier chat mode.")
+    started = time.perf_counter()
+    response_payload = _post_classifier_request(
+        api_url=api_url,
+        payload={"id": "chat_turn", "query": question, "top_k": top_k},
+        auth_token_env=str(payload.get("api_auth_token_env") or "API_CLASSIFIER_TOKEN"),
+        extra_headers={},
+        timeout_seconds=float(payload.get("api_timeout_seconds") or 30.0),
+    )
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    predictions_raw = response_payload.get("predictions", response_payload.get("top_k_answers", []))
+    if not isinstance(predictions_raw, list):
+        predictions_raw = []
+
+    retrieved: list[dict[str, Any]] = []
+    for rank, candidate in enumerate(predictions_raw[:top_k], start=1):
+        if not isinstance(candidate, dict):
+            continue
+        label = _normalize_prediction_label(candidate)
+        if not label:
+            continue
+        score = _normalize_prediction_score(candidate, fallback=max(0.0, 1.0 - 0.05 * (rank - 1)))
+        retrieved.append(
+            {
+                "chunk_id": str(candidate.get("id") or candidate.get("code") or label),
+                "doc_id": str(candidate.get("source") or ""),
+                "section_id": "api_candidate",
+                "title": label,
+                "text": str(candidate.get("description") or candidate.get("text") or candidate.get("explanation") or label),
+                "score": score,
+                "retriever": "api_classifier",
+            }
+        )
+
+    answer = str(response_payload.get("answer") or response_payload.get("final_answer") or "").strip()
+    if not answer and retrieved:
+        answer = retrieved[0]["title"]
+    if not answer:
+        answer = "No answer returned."
+    runtime_result = runtime_retrieval_evaluation(question=question, retrieved=retrieved)
+    metrics = _chat_metric_cards(
+        runtime_result=runtime_result,
+        retrieved=retrieved,
+        answer=answer,
+    )
+    metrics.append(
+        _metric_payload(
+            "API latency",
+            latency_ms,
+            "Time spent waiting for the external classifier API.",
+        )
+    )
+    return {
+        "mode": "api_classifier",
+        "question": question,
+        "answer": answer,
+        "metrics": metrics,
+        "evidence_spans": _chat_evidence_spans(answer=answer, retrieved=retrieved),
+        "retrieved": _chat_retrieved_payload(retrieved),
+        "diagnostic": {
+            "primary_error_reason": runtime_result.get("status"),
+            "secondary_error_reason": runtime_result.get("action"),
+            "explanation": runtime_result.get("reason"),
+        },
+    }
+
+
+def _chat_retrieved_payload(retrieved: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "rank": index,
+            "chunk_id": row.get("chunk_id"),
+            "doc_id": row.get("doc_id"),
+            "title": row.get("title"),
+            "score": row.get("score"),
+            "base_score_before_evidence_rerank": row.get("base_score_before_evidence_rerank"),
+            "question_evidence_score": row.get("question_evidence_score"),
+            "reranker": row.get("reranker"),
+            "text": row.get("text"),
+        }
+        for index, row in enumerate(retrieved, start=1)
+    ]
+
+
+def evaluate_chat_turn(payload: dict[str, Any]) -> dict[str, Any]:
+    question = str(payload.get("question") or "").strip()
+    if not question:
+        raise ValueError("Chat question is required.")
+
+    mode = str(payload.get("chat_mode") or "document_qa")
+    top_k = max(1, int(payload.get("top_k") or 5))
+    if mode == "api_classifier":
+        return _chat_api_turn(payload, question=question, top_k=top_k)
+
+    if mode != "document_qa":
+        raise ValueError(f"Unsupported chat mode: {mode}")
+
+    if mode == "document_qa":
+        from rag_eval.core.models import LLMConfig
+        from rag_eval.data.io import extract_paragraphs, parse_pdf_sections, resolve_doc_paths
+        from rag_eval.evaluation.llm import generate_answer_with_llm
+        from rag_eval.evaluation.metrics import (
+            keyword_extractive_answer,
+            runtime_retrieval_evaluation,
+        )
+        from rag_eval.retrieval.chunking import build_chunks
+        from rag_eval.retrieval.engines import (
+            DEFAULT_EMBEDDING_MODEL,
+            build_retriever,
+            retrieve_top_k,
+        )
+
+        selected_docs = payload.get("selected_docs") or []
+        if isinstance(selected_docs, str):
+            selected_docs = [selected_docs]
+        if not selected_docs:
+            raise ValueError("Select at least one PDF file for chat evaluation.")
+        doc_patterns = ",".join(str(path) for path in selected_docs)
+        doc_paths = resolve_doc_paths(doc_patterns)
+        sections = []
+        for doc_path in doc_paths:
+            _, parsed_sections = parse_pdf_sections(doc_path, "data/files")
+            sections.extend(parsed_sections)
+        paragraphs = extract_paragraphs(sections)
+        chunks = build_chunks(
+            sections,
+            paragraphs,
+            str(payload.get("chunking") or "fixed_words"),
+            int(payload.get("chunk_size") or 450),
+            int(payload.get("overlap") or 60),
+        )
+        if not chunks:
+            raise ValueError("No chunks were produced from the selected files.")
+        retriever_type = str(payload.get("retriever") or "tfidf")
+        embedding_model = str(payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL)
+        retriever_state = build_retriever(chunks, retriever_type, embedding_model)
+        retrieval_depth = max(1, top_k)
+        rerank_top_n = max(0, int(payload.get("rerank_top_n") or 0))
+        generation_top_k = min(retrieval_depth, rerank_top_n) if rerank_top_n > 0 else retrieval_depth
+        retrieved_raw = retrieve_top_k(
+            question,
+            retriever_state,
+            chunks,
+            k=retrieval_depth,
+            hybrid_alpha=float(payload.get("hybrid_alpha") or 0.5),
+        )
+        retrieved = _chat_rerank_by_question_evidence(
+            question=question,
+            rows=retrieved_raw,
+            top_k=generation_top_k,
+        )
+        runtime_result = runtime_retrieval_evaluation(question=question, retrieved=retrieved)
+        answer_mode = "extractive_answer"
+        answer = ""
+        llm_result = None
+        if bool(payload.get("llm_enable")):
+            llm_result = generate_answer_with_llm(
+                question,
+                retrieved,
+                LLMConfig(
+                    enabled=True,
+                    model=str(payload.get("llm_model") or "gpt-4.1-mini"),
+                    api_key_env=str(payload.get("openai_api_key_env") or "OPENAI_API_KEY"),
+                    temperature=float(payload.get("llm_temperature") or 0.0),
+                ),
+            )
+            if llm_result.answer:
+                answer = llm_result.answer
+                answer_mode = "llm_grounded_answer"
+            else:
+                answer_mode = f"extractive_fallback_after_{llm_result.status}"
+        if not answer:
+            if bool(payload.get("abstain_on_weak_evidence")) and runtime_result.get("action") == "abstain":
+                answer = "I do not have enough reliable context to answer this from the selected sources."
+                answer_mode = "abstained_on_weak_evidence"
+            else:
+                answer = keyword_extractive_answer(question, retrieved)
+
+    return {
+        "mode": mode,
+        "question": question,
+        "answer": answer,
+        "metrics": _chat_metric_cards(
+            runtime_result=runtime_result,
+            retrieved=retrieved,
+            answer=answer,
+        ),
+        "evidence_spans": _chat_evidence_spans(answer=answer, retrieved=retrieved),
+        "retrieved": _chat_retrieved_payload(retrieved),
+        "diagnostic": {
+            "primary_error_reason": runtime_result.get("status"),
+            "secondary_error_reason": runtime_result.get("action"),
+            "explanation": runtime_result.get("reason"),
+        },
+    }
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -399,6 +994,32 @@ INDEX_HTML = r"""<!doctype html>
       position: sticky;
       top: 0;
       z-index: 2;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      min-width: 0;
+    }
+    .app-nav {
+      display: inline-flex;
+      gap: 4px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .app-tab {
+      min-height: 30px;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      padding: 5px 10px;
+    }
+    .app-tab.active {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 650;
     }
     h1, h2, h3 { margin: 0; letter-spacing: 0; }
     h1 { font-size: 20px; }
@@ -518,6 +1139,78 @@ INDEX_HTML = r"""<!doctype html>
     }
     .check input { width: auto; min-height: auto; }
     .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .segmented {
+      display: inline-flex;
+      gap: 4px;
+      padding: 3px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .segmented label {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 5px 9px;
+      border-radius: 6px;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .segmented input { display: none; }
+    .segmented label:has(input:checked) {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 650;
+    }
+    .sweep-builder {
+      display: grid;
+      gap: 12px;
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+    }
+    .sweep-options {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .option-panel {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--panel);
+    }
+    .chip-grid { display: flex; flex-wrap: wrap; gap: 7px; }
+    .chip-check {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 30px;
+      padding: 5px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font-size: 12px;
+    }
+    .chip-check input { width: auto; min-height: auto; }
+    .combo-list { display: grid; gap: 7px; }
+    .combo-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: var(--panel);
+    }
+    .combo-actions { display: flex; gap: 5px; }
+    .combo-actions button { min-height: 28px; padding: 4px 8px; }
     .runs {
       display: grid;
       gap: 8px;
@@ -560,7 +1253,6 @@ INDEX_HTML = r"""<!doctype html>
     }
     .metric .value { font-size: 22px; font-weight: 720; margin-top: 4px; }
     .metric .metric-key {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
       color: var(--ink);
       overflow-wrap: anywhere;
@@ -637,24 +1329,158 @@ INDEX_HTML = r"""<!doctype html>
       padding: 10px 12px;
     }
     .recommendation strong { color: var(--ink); }
+    .chat-shell {
+      min-height: calc(100vh - 70px);
+      background: #f2f6f6;
+      padding: 14px;
+      overflow: visible;
+    }
+    .chat-page {
+      display: grid;
+      grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+      gap: 18px;
+      max-width: 1500px;
+      margin: 0 auto;
+      align-items: start;
+    }
+    .chat-config,
+    .chat-main {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .chat-config {
+      position: sticky;
+      top: 84px;
+      padding: 14px;
+      align-self: start;
+      display: grid;
+      gap: 12px;
+      max-height: calc(100vh - 104px);
+      overflow: auto;
+    }
+    .chat-main {
+      display: grid;
+      grid-template-rows: auto auto auto;
+      min-height: 620px;
+      overflow: visible;
+    }
+    .chat-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+    .chat-thread {
+      grid-row: 3;
+      overflow: visible;
+      padding: 18px;
+      display: grid;
+      align-content: start;
+      gap: 14px;
+    }
+    .chat-turn {
+      display: grid;
+      gap: 10px;
+    }
+    .bubble {
+      max-width: min(820px, 100%);
+      border-radius: 8px;
+      padding: 11px 13px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .bubble.user {
+      justify-self: end;
+      background: var(--accent);
+      color: #fff;
+    }
+    .bubble.assistant {
+      justify-self: start;
+      background: #eef4f1;
+      border: 1px solid #cddbd6;
+    }
+    .chat-metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+      gap: 8px;
+      max-width: 980px;
+    }
+    .chat-metrics .metric {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-top: 3px solid var(--accent-2);
+      min-height: 70px;
+    }
+    .chat-sources {
+      max-width: 980px;
+      display: grid;
+      gap: 7px;
+    }
+    .chat-doc-config,
+    .chat-api-config {
+      display: grid;
+      gap: 10px;
+    }
+    .source-toggle {
+      width: fit-content;
+      min-height: 30px;
+      font-size: 12px;
+      color: var(--accent);
+    }
+    .retrieved-list { display: grid; gap: 8px; }
+    .retrieved-item { border: 1px solid var(--line); border-radius: 6px; padding: 9px; background: #fff; }
+    .chat-composer {
+      grid-row: 2;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 14px;
+      background: #fbfcfd;
+    }
+    .composer-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: end;
+    }
+    .composer-row textarea {
+      min-height: 52px;
+      max-height: 170px;
+      border-radius: 8px;
+    }
     .hidden { display: none !important; }
+    .inactive-field { display: none !important; }
     .empty { color: var(--muted); padding: 16px 0; }
     @media (max-width: 980px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
       .metrics { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+      .sweep-options { grid-template-columns: 1fr; }
+      .brand { align-items: flex-start; flex-direction: column; gap: 8px; }
+      .chat-shell { min-height: calc(100vh - 92px); overflow: visible; }
+      .chat-page { grid-template-columns: 1fr; min-height: 680px; }
+      .chat-main { min-height: 620px; }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>RAG Evaluation Admin</h1>
+    <div class="brand">
+      <h1>RAG Evaluation</h1>
+      <nav class="app-nav" aria-label="Application mode">
+        <button class="app-tab active" id="adminTabBtn" type="button">Admin</button>
+        <button class="app-tab" id="chatTabBtn" type="button">Chat</button>
+      </nav>
+    </div>
     <div class="toolbar">
       <button id="refreshBtn" title="Refresh runs">Refresh</button>
       <button id="loadDefaultsBtn" title="Reload detected files">Detect files</button>
     </div>
   </header>
-  <main>
+  <main id="adminApp">
     <aside>
       <div class="band">
         <h2>Run settings</h2>
@@ -662,28 +1488,100 @@ INDEX_HTML = r"""<!doctype html>
           <div class="grid">
             <label><span class="label-row">Run name <span class="hint" title="Default format is web_eval_YYYYMMDD_HHMMSS. Leave as is or rename before launch.">i</span></span><input name="run_name" /></label>
             <label><span class="label-row">Mode <span class="hint" title="classifier runs one selected classifier; sweep compares several RAG retrieval/chunking settings.">i</span></span><select name="mode"><option value="classifier">classifier</option><option value="sweep">sweep</option></select></label>
-            <label><span class="label-row">Classifier <span class="hint" title="Choose the evaluation target. Only settings relevant to this classifier are shown below.">i</span></span><select name="classifier_type"><option value="examination_regulations">examination_regulations</option><option value="ted_cpv">ted_cpv</option><option value="api_classifier">api_classifier</option><option value="prepared_rag_results">prepared_rag_results</option></select></label>
+            <label><span class="label-row">Classifier <span class="hint" title="Choose the evaluation target. Only settings relevant to this classifier are shown below.">i</span></span><select name="classifier_type"><option value="document_qa">document_qa_files</option><option value="ted_cpv">ted_cpv</option><option value="api_classifier">api_classifier</option><option value="prepared_rag_results">prepared_rag_results</option></select></label>
             <label><span class="label-row">Top K <span class="hint" title="How many candidates/chunks to retrieve for each question. Higher values improve recall but add noise.">i</span></span><input name="top_k" type="number" min="1" value="5" /></label>
           </div>
 
-          <div class="setting-group" data-show-for="examination_regulations sweep" style="margin-top:10px">
+          <div class="setting-group" data-show-for="document_qa examination_regulations sweep" style="margin-top:10px">
             <label><span class="label-row">PDF files <span class="hint" title="Select the exact regulation PDFs for this run. The server passes these files directly to --docs.">i</span></span><div class="file-picker" id="pdfPicker"></div></label>
             <div class="toolbar" style="margin-top:8px">
+              <input type="file" id="fileUploadInput" multiple accept=".pdf,.pdfa,application/pdf" />
+              <button type="button" id="uploadDocsBtn">Upload PDFs</button>
               <button type="button" id="selectAllDocsBtn">Select all files</button>
               <button type="button" id="clearDocsBtn">Clear</button>
             </div>
           </div>
 
-          <div class="grid setting-group" data-show-for="examination_regulations sweep" style="margin-top:10px">
+          <div class="grid setting-group" data-show-for="document_qa examination_regulations" style="margin-top:10px">
             <label><span class="label-row">Questions <span class="hint" title="JSON file with evaluation questions and gold answers/keywords.">i</span></span><input name="questions" value="data/questions_by_file.json" /></label>
             <label><span class="label-row">Retriever <span class="hint" title="Retrieval backend. auto compares several retrievers during sweep.">i</span></span><select name="retriever"><option>tfidf</option><option>bm25</option><option>dense</option><option>hybrid</option><option>auto</option></select></label>
             <label><span class="label-row">Chunking <span class="hint" title="How documents are split before retrieval. auto compares several strategies during sweep.">i</span></span><select name="chunking"><option>fixed_words</option><option>fixed_tokens</option><option>by_section</option><option>by_paragraph</option><option>auto</option></select></label>
-            <label><span class="label-row">Chunk size <span class="hint" title="Size of fixed chunks. Ignored for section/paragraph chunking.">i</span></span><input name="chunk_size" type="number" min="0" value="450" /></label>
-            <label><span class="label-row">Overlap <span class="hint" title="Token/word overlap between adjacent fixed chunks.">i</span></span><input name="overlap" type="number" min="0" value="60" /></label>
-            <label><span class="label-row">Hybrid alpha <span class="hint" title="Dense score weight for hybrid retrieval; BM25 gets the remaining weight.">i</span></span><input name="hybrid_alpha" type="number" step="0.05" value="0.5" /></label>
-            <label><span class="label-row">Auto sizes <span class="hint" title="Comma-separated chunk sizes used when chunking=auto.">i</span></span><input name="auto_chunk_sizes" value="256,450" /></label>
-            <label><span class="label-row">Auto overlaps <span class="hint" title="Comma-separated overlaps used when chunking=auto.">i</span></span><input name="auto_overlaps" value="0,60" /></label>
-            <label><span class="label-row">Auto retrievers <span class="hint" title="Comma-separated retrievers used when retriever=auto.">i</span></span><input name="auto_retrievers" value="tfidf,bm25,dense,hybrid" /></label>
+            <label data-show-if="chunking:fixed_words|fixed_tokens"><span class="label-row">Chunk size <span class="hint" title="Size of fixed chunks. Ignored for section/paragraph chunking.">i</span></span><input name="chunk_size" type="number" min="0" value="450" /></label>
+            <label data-show-if="chunking:fixed_words|fixed_tokens"><span class="label-row">Overlap <span class="hint" title="Token/word overlap between adjacent fixed chunks.">i</span></span><input name="overlap" type="number" min="0" value="60" /></label>
+            <label data-show-if="retriever:hybrid|auto" class="inactive-field"><span class="label-row">Hybrid alpha <span class="hint" title="Dense score weight for hybrid retrieval; BM25 gets the remaining weight.">i</span></span><input name="hybrid_alpha" type="number" step="0.05" value="0.5" /></label>
+            <label data-show-if="chunking:auto" class="inactive-field"><span class="label-row">Auto sizes <span class="hint" title="Comma-separated chunk sizes used when chunking=auto.">i</span></span><input name="auto_chunk_sizes" value="256,450" /></label>
+            <label data-show-if="chunking:auto" class="inactive-field"><span class="label-row">Auto overlaps <span class="hint" title="Comma-separated overlaps used when chunking=auto.">i</span></span><input name="auto_overlaps" value="0,60" /></label>
+            <label data-show-if="retriever:auto" class="inactive-field"><span class="label-row">Auto retrievers <span class="hint" title="Comma-separated retrievers used when retriever=auto.">i</span></span><input name="auto_retrievers" value="tfidf,bm25,dense,hybrid" /></label>
+          </div>
+
+          <div class="setting-group" data-show-for="sweep">
+            <div class="grid" style="margin-top:10px">
+              <label><span class="label-row">Questions <span class="hint" title="JSON file with evaluation questions and gold answers/keywords.">i</span></span><input name="sweep_questions" value="data/questions_by_file.json" /></label>
+              <label><span class="label-row">Hybrid alpha <span class="hint" title="Dense score weight for hybrid retrieval; BM25 gets the remaining weight.">i</span></span><input name="sweep_hybrid_alpha" type="number" step="0.05" value="0.5" /></label>
+            </div>
+            <div class="sweep-builder">
+              <div class="toolbar" style="justify-content:space-between">
+                <div>
+                  <h3>Sweep Configurations</h3>
+                  <div class="meta">Run all selected combinations, or build an ordered list manually.</div>
+                </div>
+                <div class="segmented">
+                  <label><input type="radio" name="sweep_builder_mode" value="all" checked /> All selected</label>
+                  <label><input type="radio" name="sweep_builder_mode" value="ordered" /> Ordered list</label>
+                </div>
+              </div>
+              <div class="sweep-options">
+                <div class="option-panel">
+                  <div class="toolbar" style="justify-content:space-between"><strong>Chunking</strong><button type="button" data-select-sweep="chunking">All</button></div>
+                  <div class="chip-grid">
+                    <label class="chip-check"><input type="checkbox" data-sweep-chunking value="fixed_words" checked /> fixed_words</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-chunking value="fixed_tokens" checked /> fixed_tokens</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-chunking value="by_section" checked /> by_section</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-chunking value="by_paragraph" checked /> by_paragraph</label>
+                  </div>
+                </div>
+                <div class="option-panel">
+                  <div class="toolbar" style="justify-content:space-between"><strong>Retriever</strong><button type="button" data-select-sweep="retriever">All</button></div>
+                  <div class="chip-grid">
+                    <label class="chip-check"><input type="checkbox" data-sweep-retriever value="tfidf" checked /> tfidf</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-retriever value="bm25" checked /> bm25</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-retriever value="dense" checked /> dense</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-retriever value="hybrid" checked /> hybrid</label>
+                  </div>
+                </div>
+                <div class="option-panel">
+                  <div class="toolbar" style="justify-content:space-between"><strong>Chunk sizes</strong><span class="meta">fixed only</span></div>
+                  <div class="chip-grid">
+                    <label class="chip-check"><input type="checkbox" data-sweep-size value="256" checked /> 256</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-size value="450" checked /> 450</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-size value="700" /> 700</label>
+                  </div>
+                </div>
+                <div class="option-panel">
+                  <div class="toolbar" style="justify-content:space-between"><strong>Overlaps</strong><span class="meta">fixed only</span></div>
+                  <div class="chip-grid">
+                    <label class="chip-check"><input type="checkbox" data-sweep-overlap value="0" checked /> 0</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-overlap value="60" checked /> 60</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-overlap value="120" /> 120</label>
+                  </div>
+                </div>
+              </div>
+              <div class="ordered-sweep-controls hidden">
+                <div class="grid">
+                  <label>Chunking<select id="customSweepChunking"><option>fixed_words</option><option>fixed_tokens</option><option>by_section</option><option>by_paragraph</option></select></label>
+                  <label>Retriever<select id="customSweepRetriever"><option>tfidf</option><option>bm25</option><option>dense</option><option>hybrid</option></select></label>
+                  <label>Chunk size<input id="customSweepSize" type="number" value="450" min="0" /></label>
+                  <label>Overlap<input id="customSweepOverlap" type="number" value="60" min="0" /></label>
+                </div>
+                <div class="toolbar" style="margin-top:8px">
+                  <button type="button" id="addSweepComboBtn">Add combination</button>
+                  <button type="button" id="addSelectedSweepCombosBtn">Add selected grid</button>
+                  <button type="button" id="clearSweepCombosBtn">Clear list</button>
+                </div>
+                <div class="combo-list" id="customSweepList"></div>
+              </div>
+              <div class="meta" id="sweepPreview"></div>
+            </div>
           </div>
 
           <div class="grid setting-group" data-show-for="ted_cpv api_classifier" style="margin-top:10px">
@@ -697,27 +1595,66 @@ INDEX_HTML = r"""<!doctype html>
             <label><span class="label-row">API classifier URL <span class="hint" title="HTTP endpoint for external classifier predictions.">i</span></span><input name="api_classifier_url" placeholder="https://..." /></label>
             <label><span class="label-row">API token env <span class="hint" title="Environment variable containing a Bearer token for the classifier API.">i</span></span><input name="api_auth_token_env" value="API_CLASSIFIER_TOKEN" /></label>
           </div>
+          <div class="setting-group" data-show-for="api_classifier prepared_rag_results" style="margin-top:10px">
+            <div class="meta">Field aliases accepted: id/query/question, expected/expected_answer/gold/reference, prediction/predicted_answer/answer/candidate/label/code, score/confidence/probability/retrieval_score/reranker_score. Ranked files may use suffixes like #1, _1, or rank1.</div>
+          </div>
 
           <div class="grid setting-group" data-show-for="prepared_rag_results" style="margin-top:10px">
             <label><span class="label-row">Prepared results <span class="hint" title="Excel file with existing RAG/classifier outputs. Multiple rows with one ID are treated as top-k candidates.">i</span></span><input name="prepared_results" value="data/eval_dataset.xlsx" /></label>
             <label><span class="label-row">CPV catalog <span class="hint" title="CPV catalog is used to attach labels and compute hierarchy-aware metrics.">i</span></span><input name="prepared_cpv_catalog" value="data/cpv_ted_train_catalog.csv" /></label>
           </div>
 
-          <div class="grid setting-group" data-show-for="examination_regulations ted_cpv sweep" style="margin-top:10px">
+          <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
             <label><span class="label-row">Rerank top N <span class="hint" title="Optional lexical reranking window. 0 disables reranking.">i</span></span><input name="rerank_top_n" type="number" min="0" value="0" /></label>
-            <label><span class="label-row">Rerank weight <span class="hint" title="How strongly lexical reranking influences scores.">i</span></span><input name="rerank_weight" type="number" step="0.05" value="0.25" /></label>
+            <label data-show-if="rerank_top_n>0" class="inactive-field"><span class="label-row">Rerank weight <span class="hint" title="How strongly lexical reranking influences scores.">i</span></span><input name="rerank_weight" type="number" step="0.05" value="0.25" /></label>
           </div>
 
-          <div class="grid setting-group" data-show-for="examination_regulations sweep" style="margin-top:10px">
-            <label><span class="label-row">LLM model <span class="hint" title="OpenAI model used when LLM answer generation or judging is enabled.">i</span></span><input name="llm_model" value="gpt-4.1-mini" /></label>
-            <label><span class="label-row">API key env <span class="hint" title="Environment variable containing the OpenAI API key.">i</span></span><input name="openai_api_key_env" value="OPENAI_API_KEY" /></label>
-            <label><span class="label-row">Judge model <span class="hint" title="Optional separate OpenAI model for claim-level judging.">i</span></span><input name="judge_model" placeholder="defaults to LLM model" /></label>
+          <div class="grid setting-group" data-show-for="ted_cpv" style="margin-top:10px">
+            <label class="check" style="grid-column:1/-1"><input type="checkbox" name="cross_encoder_rerank" /> Cross-encoder rerank <span class="hint" title="Rerank the top-N CPV candidates with a cross-encoder after retrieval and KG.">i</span></label>
+            <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder top N <span class="hint" title="How many top candidates to rerank with the cross-encoder (typically 10).">i</span></span><input name="cross_encoder_top_n" type="number" min="1" value="10" /></label>
+            <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder model <span class="hint" title="HuggingFace cross-encoder model. Leave empty for the default multilingual model.">i</span></span><input name="cross_encoder_model" placeholder="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1" /></label>
           </div>
-          <div class="checks setting-group" data-show-for="examination_regulations sweep">
+
+          <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
+            <label data-show-if="llm_enable|judge_enable|query_augmentation:llm|query_augmentation:hyde|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">LLM model <span class="hint" title="OpenAI model used for LLM answer generation, judging, query augmentation, HyDE, or Self-RAG steps.">i</span></span><input name="llm_model" value="gpt-4.1-mini" /></label>
+            <label data-show-if="llm_enable|judge_enable|query_augmentation:llm|query_augmentation:hyde|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">API key env <span class="hint" title="Environment variable containing the OpenAI API key. Required for LLM, HyDE, or Self-RAG steps.">i</span></span><input name="openai_api_key_env" value="OPENAI_API_KEY" /></label>
+            <label data-show-if="judge_enable" class="inactive-field"><span class="label-row">Judge model <span class="hint" title="Optional separate OpenAI model for claim-level judging.">i</span></span><input name="judge_model" placeholder="defaults to LLM model" /></label>
+          </div>
+          <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
+            <label><span class="label-row">Query augmentation <span class="hint" title="Use LLM expansion or HyDE before CPV or document search.">i</span></span><select name="query_augmentation"><option value="">profile/default none</option><option>none</option><option>llm</option><option>hyde</option></select></label>
+            <label data-show-if="query_augmentation:llm|query_augmentation:hyde" class="inactive-field"><span class="label-row">Augment terms <span class="hint" title="Maximum terms for LLM expansion. HyDE ignores this and generates one hypothetical passage.">i</span></span><input name="query_augmentation_max_terms" type="number" min="1" value="8" /></label>
+          </div>
+          <div class="grid setting-group" data-show-for="document_qa examination_regulations sweep" style="margin-top:10px">
+            <label><span class="label-row">Answer mode <span class="hint" title="Optional answer synthesis override.">i</span></span><select name="answer_mode"><option value="">profile default</option><option>extractive</option><option>grounded_llm</option><option selected>cite_first</option><option>claim_checklist</option></select></label>
+            <label><span class="label-row">Context mode <span class="hint" title="Optional context assembly override. kg_organized orders context by KG evidence paths.">i</span></span><select name="context_mode"><option value="">profile default</option><option>ranked</option><option>kg_first</option><option>kg_organized</option><option>group_by_doc</option><option selected>dedupe_section</option></select></label>
+            <label><span class="label-row">Max context chunks <span class="hint" title="Optional limit on chunks passed to answer and metrics.">i</span></span><input name="max_context_chunks" type="number" min="1" placeholder="profile default" /></label>
+            <label><span class="label-row">Max context chars <span class="hint" title="Optional total character budget for assembled context.">i</span></span><input name="max_context_chars" type="number" min="1" placeholder="profile default" /></label>
+            <label><span class="label-row">Min confidence <span class="hint" title="Decision policy threshold for auto-accept.">i</span></span><input name="decision_min_confidence" type="number" step="0.05" min="0" max="1" placeholder="profile default" /></label>
+            <label><span class="label-row">Min claim recall <span class="hint" title="Decision policy threshold for context claim coverage.">i</span></span><input name="decision_min_context_claim_recall" type="number" step="0.05" min="0" max="1" placeholder="profile default" /></label>
+            <label><span class="label-row">Min grounded <span class="hint" title="Decision policy threshold for grounded claim ratio.">i</span></span><input name="decision_min_grounded_claim_ratio" type="number" step="0.05" min="0" max="1" value="1.0" /></label>
+          </div>
+          <div class="checks setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep">
+            <label class="check"><input type="checkbox" name="kg_enable" /> KG retrieval <span class="hint" title="Build and use a lightweight knowledge graph for graph-augmented retrieval.">i</span></label>
+          </div>
+          <div class="grid setting-group inactive-field" data-show-for="document_qa examination_regulations ted_cpv sweep" data-show-if="kg_enable" style="margin-top:10px">
+            <label><span class="label-row">KG weight <span class="hint" title="Weight of graph signals when KG retrieval is enabled.">i</span></span><input type="number" step="0.05" min="0" max="1" name="kg_graph_weight" value="0.35" /></label>
+            <label><span class="label-row">KG profile <span class="hint" title="Preset for KG pool expansion. selection currently uses the balanced graph-expansion preset.">i</span></span><select name="kg_profile"><option>selection</option><option>balanced</option><option>conservative</option><option>exploratory</option><option>ppr_only</option><option>direct_only</option></select></label>
+            <label><span class="label-row">KG algorithm <span class="hint" title="Optional override for the graph traversal algorithm.">i</span></span><select name="kg_algorithm"><option value="">profile default</option><option>direct</option><option>ppr</option><option>ppr_direct</option></select></label>
+            <label><span class="label-row">KG max added <span class="hint" title="Optional max graph-only chunks or candidates added by KG.">i</span></span><input name="kg_max_added_chunks" type="number" min="0" placeholder="profile default" /></label>
+            <label><span class="label-row">PPR iterations <span class="hint" title="Optional Personalized PageRank-style propagation iterations for PDF KG.">i</span></span><input name="kg_ppr_iterations" type="number" min="0" placeholder="profile default" /></label>
+            <label><span class="label-row">PPR damping <span class="hint" title="Optional propagation damping factor for PDF KG.">i</span></span><input name="kg_ppr_damping" type="number" step="0.01" min="0" max="1" placeholder="profile default" /></label>
+            <label><span class="label-row">KG quality min <span class="hint" title="Optional minimum quality factor for graph-only chunks.">i</span></span><input name="kg_quality_threshold" type="number" step="0.05" min="0" max="1" placeholder="profile default" /></label>
+            <label><span class="label-row">Intent weight <span class="hint" title="Optional contribution of relation intent matching to KG ranking.">i</span></span><input name="kg_intent_weight" type="number" step="0.05" min="0" max="1" placeholder="profile default" /></label>
+          </div>
+          <div class="checks setting-group" data-show-for="document_qa examination_regulations sweep">
             <label class="check"><input type="checkbox" name="llm_enable" /> LLM answers <span class="hint" title="Generate grounded answers from retrieved chunks instead of extractive fallback only.">i</span></label>
             <label class="check"><input type="checkbox" name="judge_enable" /> LLM judge <span class="hint" title="Use an LLM judge for claim-level support and contradiction metrics.">i</span></label>
             <label class="check"><input type="checkbox" name="abstain_on_weak_evidence" /> Abstain weak <span class="hint" title="Abstain when runtime retrieval signals say evidence is weak or missing.">i</span></label>
-            <label class="check"><input type="checkbox" name="kg_enable" /> KG retrieval <span class="hint" title="Build and use a lightweight knowledge graph for graph-augmented retrieval.">i</span></label>
+            <label class="check"><input type="checkbox" name="self_rag_retry_on_weak_evidence" /> Self-RAG retry <span class="hint" title="Rewrite the query and retrieve again when runtime evidence is weak before answering.">i</span></label>
+            <label class="check"><input type="checkbox" name="self_rag_critique" /> Self-RAG critique <span class="hint" title="Critique and revise generated answers against retrieved context before scoring.">i</span></label>
+          </div>
+          <div class="grid setting-group" data-show-for="document_qa examination_regulations sweep" style="margin-top:10px">
+            <label data-show-if="self_rag_retry_on_weak_evidence" class="inactive-field"><span class="label-row">Retry attempts <span class="hint" title="Maximum query rewrite/retrieval retries for weak runtime evidence.">i</span></span><input name="self_rag_retry_max_attempts" type="number" min="1" value="1" /></label>
           </div>
           <div class="toolbar" style="margin-top:14px">
             <button class="primary" type="submit" id="startBtn">Start evaluation</button>
@@ -734,8 +1671,11 @@ INDEX_HTML = r"""<!doctype html>
       <div id="details" class="empty">Select a run to view metrics, outputs, logs, and CSV previews.</div>
     </section>
   </main>
+  <section id="chatApp" class="chat-shell hidden">
+    <div id="chatView"></div>
+  </section>
   <script>
-    const state = { runs: [], selected: null, details: null, activeTable: null, options: null };
+    const state = { runs: [], selected: null, details: null, activeTable: null, options: null, workspace: "admin", chatTurns: [], customSweepConfigs: [] };
     const csvCandidates = [
       "experiment_ranking_csv",
       "rag_results_csv",
@@ -771,11 +1711,104 @@ INDEX_HTML = r"""<!doctype html>
       return data;
     }
 
+    function evalShowIf(form, spec) {
+      if (!spec) return true;
+      if (spec.includes("|")) {
+        return spec.split("|").some(part => evalShowIf(form, part.trim()));
+      }
+      const gt = spec.match(/^([a-z0-9_]+)>(-?\\d+(?:\\.\\d+)?)$/i);
+      if (gt) {
+        const el = form.elements[gt[1]];
+        return Number(el?.value || 0) > Number(gt[2]);
+      }
+      const colon = spec.indexOf(":");
+      if (colon >= 0) {
+        const name = spec.slice(0, colon);
+        const values = spec.slice(colon + 1).split(",").filter(Boolean);
+        const el = form.elements[name];
+        if (!el) return false;
+        if (el.type === "checkbox") {
+          return values.some(value => (value === "true" || value === "1") && el.checked);
+        }
+        return values.includes(el.value);
+      }
+      const el = form.elements[spec];
+      if (!el) return false;
+      return el.type === "checkbox" ? el.checked : Boolean(String(el.value || "").trim());
+    }
+
+    function applyConditionalVisibility() {
+      const form = document.getElementById("runForm");
+      document.querySelectorAll("[data-show-if]").forEach(node => {
+        const visible = evalShowIf(form, node.dataset.showIf);
+        node.classList.toggle("inactive-field", !visible);
+        node.querySelectorAll("input, select, textarea").forEach(control => {
+          control.disabled = !visible;
+        });
+      });
+    }
+
+    function pruneInactivePayload(payload, form) {
+      const inactive = new Set();
+      form.querySelectorAll(".setting-group.hidden [name], .inactive-field [name]").forEach(el => {
+        if (el.name) inactive.add(el.name);
+      });
+      for (const name of inactive) {
+        if (name === "selected_docs") continue;
+        delete payload[name];
+      }
+      for (const box of form.querySelectorAll('input[type="checkbox"]')) {
+        if (inactive.has(box.name)) payload[box.name] = false;
+      }
+      if (!payload.kg_enable) {
+        ["kg_graph_weight","kg_profile","kg_algorithm","kg_max_added_chunks","kg_ppr_iterations","kg_ppr_damping","kg_quality_threshold","kg_intent_weight"].forEach(key => delete payload[key]);
+      }
+      if (!payload.cross_encoder_rerank) {
+        delete payload.cross_encoder_model;
+        delete payload.cross_encoder_top_n;
+      }
+      const chunking = String(payload.chunking || "");
+      if (chunking !== "auto") {
+        delete payload.auto_chunk_sizes;
+        delete payload.auto_overlaps;
+      }
+      if (!["fixed_words", "fixed_tokens"].includes(chunking)) {
+        delete payload.chunk_size;
+        delete payload.overlap;
+      }
+      const retriever = String(payload.retriever || "");
+      if (!["hybrid", "auto"].includes(retriever)) delete payload.hybrid_alpha;
+      if (retriever !== "auto") delete payload.auto_retrievers;
+      if (Number(payload.rerank_top_n || 0) <= 0) delete payload.rerank_weight;
+      if (!payload.self_rag_retry_on_weak_evidence) delete payload.self_rag_retry_max_attempts;
+      const queryAug = String(payload.query_augmentation || "").trim().toLowerCase();
+      if (!["llm", "hyde"].includes(queryAug)) delete payload.query_augmentation_max_terms;
+      if (!queryAug || queryAug === "none") delete payload.query_augmentation;
+      const llmNeeded = payload.llm_enable || payload.judge_enable || ["llm", "hyde"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique;
+      if (!(payload.llm_enable || ["llm", "hyde"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique)) {
+        delete payload.llm_model;
+        delete payload.llm_temperature;
+      }
+      if (!payload.judge_enable) {
+        delete payload.judge_model;
+        delete payload.judge_temperature;
+      }
+      if (!llmNeeded) delete payload.openai_api_key_env;
+    }
+
     function formPayload(form) {
+      applyVisibility();
+      applyConditionalVisibility();
       const data = new FormData(form);
       const payload = {};
       for (const [key, value] of data.entries()) payload[key] = value;
-      for (const box of form.querySelectorAll('input[type="checkbox"]')) payload[box.name] = box.checked;
+      for (const box of form.querySelectorAll('input[type="checkbox"]')) {
+        if (box.disabled) {
+          payload[box.name] = false;
+          continue;
+        }
+        payload[box.name] = box.checked;
+      }
       payload.selected_docs = Array.from(form.querySelectorAll('input[name="selected_docs"]:checked')).map(input => input.value);
       if (!payload.run_name) payload.run_name = defaultRunName();
       if (payload.classifier_type === "ted_cpv" || payload.classifier_type === "api_classifier") {
@@ -784,8 +1817,28 @@ INDEX_HTML = r"""<!doctype html>
       if (payload.classifier_type === "prepared_rag_results") {
         payload.cpv_catalog = payload.prepared_cpv_catalog || payload.cpv_catalog;
       }
-      for (const key of ["top_k","chunk_size","overlap","rerank_top_n"]) payload[key] = Number(payload[key] || 0);
-      for (const key of ["rerank_weight","hybrid_alpha"]) payload[key] = Number(payload[key] || 0);
+      if (payload.mode === "sweep") {
+        payload.questions = payload.sweep_questions || payload.questions;
+        payload.hybrid_alpha = payload.sweep_hybrid_alpha || payload.hybrid_alpha;
+        const builderMode = data.get("sweep_builder_mode") || "all";
+        if (builderMode === "ordered") {
+          if (!state.customSweepConfigs.length) throw new Error("Add at least one ordered sweep combination.");
+          payload.sweep_configs_json = JSON.stringify(state.customSweepConfigs);
+          payload.chunking = "fixed_words";
+          payload.retriever = "tfidf";
+        } else {
+          const configs = generatedSweepConfigs();
+          if (!configs.length) throw new Error("Select at least one sweep combination.");
+          payload.sweep_configs_json = JSON.stringify(configs);
+          payload.chunking = "fixed_words";
+          payload.retriever = "tfidf";
+        }
+      }
+      for (const key of ["top_k","chunk_size","overlap","rerank_top_n","cross_encoder_top_n","self_rag_retry_max_attempts"]) payload[key] = Number(payload[key] || 0);
+      for (const key of ["rerank_weight","hybrid_alpha"]) {
+        if (key in payload) payload[key] = Number(payload[key] || 0);
+      }
+      pruneInactivePayload(payload, form);
       return payload;
     }
 
@@ -801,13 +1854,87 @@ INDEX_HTML = r"""<!doctype html>
         const allowed = (group.dataset.showFor || "").split(/\s+/);
         group.classList.toggle("hidden", !allowed.includes(context));
       });
+      applyConditionalVisibility();
+      updateSweepBuilder();
     }
 
-    function renderPdfPicker(pdfs) {
-      const picker = document.getElementById("pdfPicker");
+    function selectedSweepValues(kind) {
+      return Array.from(document.querySelectorAll(`input[data-sweep-${kind}]:checked`)).map(input => input.value);
+    }
+
+    function generatedSweepConfigs() {
+      const chunking = selectedSweepValues("chunking");
+      const retrievers = selectedSweepValues("retriever");
+      const sizes = selectedSweepValues("size").map(Number);
+      const overlaps = selectedSweepValues("overlap").map(Number);
+      const configs = [];
+      for (const strategy of chunking) {
+        for (const retriever of retrievers) {
+          if (["fixed_words", "fixed_tokens"].includes(strategy)) {
+            for (const chunkSize of (sizes.length ? sizes : [450])) {
+              for (const overlap of (overlaps.length ? overlaps : [60])) {
+                configs.push({ chunking: strategy, retriever, chunk_size: chunkSize, overlap });
+              }
+            }
+          } else {
+            configs.push({ chunking: strategy, retriever, chunk_size: 0, overlap: 0 });
+          }
+        }
+      }
+      return configs;
+    }
+
+    function comboLabel(config, index) {
+      const fixed = ["fixed_words", "fixed_tokens"].includes(config.chunking);
+      const size = fixed ? ` · size ${config.chunk_size} · overlap ${config.overlap}` : "";
+      return `${index + 1}. ${config.chunking}${size} · ${config.retriever}`;
+    }
+
+    function renderCustomSweepList() {
+      const list = document.getElementById("customSweepList");
+      if (!list) return;
+      list.innerHTML = state.customSweepConfigs.map((config, index) => `
+        <div class="combo-row">
+          <strong>#${index + 1}</strong>
+          <div>${htmlEscape(comboLabel(config, index).replace(/^\d+\.\s*/, ""))}</div>
+          <div class="combo-actions">
+            <button type="button" onclick="moveSweepCombo(${index}, -1)" ${index === 0 ? "disabled" : ""}>Up</button>
+            <button type="button" onclick="moveSweepCombo(${index}, 1)" ${index === state.customSweepConfigs.length - 1 ? "disabled" : ""}>Down</button>
+            <button type="button" onclick="removeSweepCombo(${index})">Remove</button>
+          </div>
+        </div>
+      `).join("") || '<div class="empty">No ordered combinations yet.</div>';
+    }
+
+    function updateSweepBuilder() {
+      const selectedMode = document.querySelector('input[name="sweep_builder_mode"]:checked')?.value || "all";
+      document.querySelectorAll(".ordered-sweep-controls").forEach(node => node.classList.toggle("hidden", selectedMode !== "ordered"));
+      const preview = document.getElementById("sweepPreview");
+      if (!preview) return;
+      if (selectedMode === "ordered") {
+        renderCustomSweepList();
+        preview.textContent = `${state.customSweepConfigs.length} ordered combination${state.customSweepConfigs.length === 1 ? "" : "s"} will run exactly in this order.`;
+      } else {
+        const configs = generatedSweepConfigs();
+        preview.textContent = `${configs.length} combination${configs.length === 1 ? "" : "s"} selected. Fixed strategies combine selected sizes and overlaps; section/paragraph run once per retriever.`;
+      }
+    }
+
+    function renderPdfPicker(pdfs, targetId="pdfPicker", inputName="selected_docs") {
+      const picker = document.getElementById(targetId);
+      if (!picker) return;
       picker.innerHTML = (pdfs || []).map(path => `
-        <label><input type="checkbox" name="selected_docs" value="${htmlEscape(path)}" checked /> <span>${htmlEscape(path.replace(/^data\/files\//, ""))}</span></label>
+        <label><input type="checkbox" name="${inputName}" value="${htmlEscape(path)}" checked /> <span>${htmlEscape(path.replace(/^data\/files\//, ""))}</span></label>
       `).join("") || '<div class="empty">No PDFs found in data/files/.</div>';
+    }
+
+    function setWorkspace(view) {
+      state.workspace = view;
+      document.getElementById("adminTabBtn").classList.toggle("active", view === "admin");
+      document.getElementById("chatTabBtn").classList.toggle("active", view === "chat");
+      document.getElementById("adminApp").classList.toggle("hidden", view !== "admin");
+      document.getElementById("chatApp").classList.toggle("hidden", view !== "chat");
+      if (view === "chat") renderChat();
     }
 
     async function refreshRuns(selectLatest=false) {
@@ -839,13 +1966,20 @@ INDEX_HTML = r"""<!doctype html>
     function collectRecommendations(summary) {
       const advisor = (summary.classifier_summary && summary.classifier_summary.advisor) || {};
       const experiments = summary.experiments || [];
-      const items = []
-        .concat(advisor.summary_recommendations || [])
-        .concat(advisor.top_recommendations || []);
-      for (const experiment of experiments) {
-        const expAdvisor = experiment.advisor || {};
-        items.push(...(expAdvisor.summary_recommendations || []));
-        items.push(...(expAdvisor.top_recommendations || []));
+      let items = [];
+      const bestName = summary.best_experiment && summary.best_experiment.experiment;
+      if (bestName && experiments.length) {
+        const bestExperiment = experiments.find(experiment => experiment.experiment === bestName);
+        const bestAdvisor = (bestExperiment && bestExperiment.advisor) || {};
+        items = []
+          .concat(bestAdvisor.summary_recommendations || [])
+          .concat(bestAdvisor.top_recommendations || [])
+          .map(item => Object.assign({ experiment: bestName }, item));
+      }
+      if (!items.length) {
+        items = []
+          .concat(advisor.summary_recommendations || [])
+          .concat(advisor.top_recommendations || []);
       }
       const seen = new Set();
       return items.filter(item => {
@@ -880,6 +2014,7 @@ INDEX_HTML = r"""<!doctype html>
       return `<div class="recommendations">${recommendations.map(item => `
         <div class="recommendation">
           <strong>${htmlEscape(item.priority || "P?")} · ${htmlEscape(item.component || "general")} · ${htmlEscape(item.issue || "Recommendation")}</strong>
+          ${item.experiment ? `<div class="meta">Best config: ${htmlEscape(item.experiment)}</div>` : ""}
           <div>${htmlEscape(item.recommendation || "")}</div>
           ${item.evidence ? `<div class="meta">Evidence: ${htmlEscape(item.evidence)}</div>` : ""}
           ${item.next_experiment ? `<div class="meta">Next: ${htmlEscape(item.next_experiment)}</div>` : ""}
@@ -931,23 +2066,23 @@ INDEX_HTML = r"""<!doctype html>
       const classifierType = classifier.classifier?.type || "";
       const isCpv = ["ted_cpv", "api_classifier", "prepared_rag_results"].includes(classifierType);
       const cards = isCpv ? [
-        metricCard("accuracy", answerMetrics.accuracy, "Exact top-1 correctness rate: correct only when the predicted answer exactly equals the expected answer.", pct, "answer_metrics"),
-        metricCard("exact_top1_accuracy", ranking.exact_top1_accuracy, "Share of records where the first predicted answer exactly equals the expected answer.", pct, "classifier.ranking_metrics"),
-        metricCard("hit_at_k", ranking.hit_at_k, "Share of records where the expected answer appears anywhere in the returned top-k candidates.", pct, "classifier.ranking_metrics"),
-        metricCard("mean_mrr_at_k", retrieval.mean_mrr_at_k, "Mean reciprocal rank of the first relevant answer or candidate. Rank 1 gives 1.0, rank 2 gives 0.5, missing gives 0.", fmt, "retrieval_metrics"),
-        metricCard("mean_ndcg_at_k", retrieval.mean_ndcg_at_k, "Mean ranking quality for returned candidates. Higher means better candidates appear closer to the top.", fmt, "retrieval_metrics"),
-        metricCard("mean_recall_at_k", retrieval.mean_recall_at_k, "Average share of relevant candidates found in top-k.", pct, "retrieval_metrics"),
-        metricCard("mean_hierarchy_score_top1", ranking.mean_hierarchy_score_top1, "Diagnostic closeness of the top answer to the expected answer. Higher means the prediction is structurally closer, but exact correctness is still separate.", fmt, "classifier.ranking_metrics"),
-        metricCard("expected_answer_present_at_k_rate", cpvDiagnostics.gold_present_at_k_rate, "Share of records where the expected answer was available anywhere in top-k. Low value points to retriever/candidate-generation problems.", pct, "classifier.diagnostics"),
-        metricCard("low_margin_decision_rate", cpvDiagnostics.low_margin_decision_rate, "Share of records where rank 1 and rank 2 scores were close. These are good candidates for reranking or manual review.", pct, "classifier.diagnostics"),
-        metricCard("high_confidence_wrong_rate", cpvDiagnostics.high_confidence_wrong_rate, "Share of records where the classifier was wrong despite high confidence. Lower is safer.", pct, "classifier.diagnostics"),
-        metricCard("expected_calibration_error", calibration.expected_calibration_error, "Expected calibration error for prediction scores. Lower is better; high values mean confidence is not reliable.", fmt, "classifier.calibration"),
+        metricCard("Top answer exactly correct", answerMetrics.accuracy, "Correct only when the first predicted answer exactly equals the expected answer.", pct, "answer_metrics"),
+        metricCard("First ranked candidate correct", ranking.exact_top1_accuracy, "Share of records where the first returned candidate exactly equals the expected answer.", pct, "classifier.ranking_metrics"),
+        metricCard("Expected answer appears in candidates", ranking.hit_at_k, "Share of records where the expected answer appears anywhere in the returned top-k candidates.", pct, "classifier.ranking_metrics"),
+        metricCard("Expected answer appears early", retrieval.mean_mrr_at_k, "Mean reciprocal rank of the first relevant answer or candidate. Rank 1 gives 1.0, rank 2 gives 0.5, missing gives 0.", fmt, "retrieval_metrics"),
+        metricCard("Candidate ranking quality", retrieval.mean_ndcg_at_k, "Ranking quality for returned candidates. Higher means useful candidates appear closer to the top.", fmt, "retrieval_metrics"),
+        metricCard("Relevant candidate coverage", retrieval.mean_recall_at_k, "Average share of relevant candidates found in top-k.", pct, "retrieval_metrics"),
+        metricCard("Top answer structural closeness", ranking.mean_hierarchy_score_top1, "Diagnostic closeness of the top answer to the expected answer. Exact correctness is still evaluated separately.", fmt, "classifier.ranking_metrics"),
+        metricCard("Candidate generation ceiling", cpvDiagnostics.gold_present_at_k_rate, "Share of records where the expected answer was available anywhere in top-k. Low value points to candidate-generation problems.", pct, "classifier.diagnostics"),
+        metricCard("Ambiguous top decision rate", cpvDiagnostics.low_margin_decision_rate, "Share of records where rank 1 and rank 2 scores were close. These are good candidates for reranking or manual review.", pct, "classifier.diagnostics"),
+        metricCard("High-confidence wrong rate", cpvDiagnostics.high_confidence_wrong_rate, "Share of records where the classifier was wrong despite high confidence. Lower is safer.", pct, "classifier.diagnostics"),
+        metricCard("Confidence reliability error", calibration.expected_calibration_error, "Calibration error for prediction scores. Lower is better; high values mean confidence is not reliable.", fmt, "classifier.calibration"),
       ] : [
-        metricCard("mean_mrr_at_k", retrieval.mean_mrr_at_k, "How early the first relevant retrieved chunk appears on average.", fmt, "retrieval_metrics"),
-        metricCard("mean_ndcg_at_k", retrieval.mean_ndcg_at_k, "Ranking quality for retrieved chunks, rewarding relevant chunks near the top.", fmt, "retrieval_metrics"),
-        metricCard("mean_recall_at_k", retrieval.mean_recall_at_k, "Share of relevant chunks found in top-k.", pct, "retrieval_metrics"),
-        metricCard("questions_with_relevant_chunk", retrieval.questions_with_relevant_chunk, "Number of questions with at least one relevant retrieved item.", fmt, "retrieval_metrics"),
-        metricCard("questions_with_target_doc_at_k", retrieval.questions_with_target_doc_at_k, "Number of questions where top-k includes the expected source or answer.", fmt, "retrieval_metrics"),
+        metricCard("First useful source appears early", retrieval.mean_mrr_at_k, "How early the first relevant retrieved source appears on average.", fmt, "retrieval_metrics"),
+        metricCard("Source ranking quality", retrieval.mean_ndcg_at_k, "Ranking quality for retrieved sources, rewarding useful sources near the top.", fmt, "retrieval_metrics"),
+        metricCard("Useful source coverage", retrieval.mean_recall_at_k, "Share of relevant sources found in top-k.", pct, "retrieval_metrics"),
+        metricCard("Questions with useful source", retrieval.questions_with_relevant_chunk, "Number of questions with at least one relevant retrieved item.", fmt, "retrieval_metrics"),
+        metricCard("Questions with expected source", retrieval.questions_with_target_doc_at_k, "Number of questions where top-k includes the expected source or answer.", fmt, "retrieval_metrics"),
       ];
       return `<div class="metrics">${cards.join("")}</div>`;
     }
@@ -1043,8 +2178,199 @@ INDEX_HTML = r"""<!doctype html>
       await loadRun(runName);
     }
 
+    window.moveSweepCombo = function(index, direction) {
+      const nextIndex = index + direction;
+      if (nextIndex < 0 || nextIndex >= state.customSweepConfigs.length) return;
+      const copy = state.customSweepConfigs.slice();
+      [copy[index], copy[nextIndex]] = [copy[nextIndex], copy[index]];
+      state.customSweepConfigs = copy;
+      updateSweepBuilder();
+    }
+
+    window.removeSweepCombo = function(index) {
+      state.customSweepConfigs = state.customSweepConfigs.filter((_, rowIndex) => rowIndex !== index);
+      updateSweepBuilder();
+    }
+
     function htmlEscape(value) {
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]));
+    }
+
+    function valueFmtMetric(metric) {
+      const value = metric.value;
+      if (metric.kind === "boolean") return value ? "yes" : "no";
+      if (metric.kind === "percent") return pct(value);
+      return fmt(value);
+    }
+
+    function renderChat() {
+      const root = document.getElementById("chatView");
+      root.innerHTML = `
+        <div class="chat-page">
+          <aside class="chat-config">
+            <div>
+              <h2>Chat Mode</h2>
+              <div class="meta">Ask one question, get a grounded answer, then inspect live metrics for the same turn.</div>
+            </div>
+            <label><span class="label-row">Mode <span class="hint" title="document_qa_files answers from selected PDFs; api_classifier sends the question to an external classifier endpoint.">i</span></span><select id="chatMode"><option value="document_qa">document_qa_files</option><option value="api_classifier">api_classifier</option></select></label>
+            <div class="grid">
+              <label><span class="label-row">Top K <span class="hint" title="Initial number of chunks/candidates retrieved before reranking.">i</span></span><input id="chatTopK" type="number" min="1" value="5" /></label>
+              <label><span class="label-row">Retriever <span class="hint" title="Retrieval backend for document mode.">i</span></span><select id="chatRetriever"><option>tfidf</option><option>bm25</option><option>dense</option><option>hybrid</option></select></label>
+              <label><span class="label-row">Chunking <span class="hint" title="Chunking strategy for document mode.">i</span></span><select id="chatChunking"><option>fixed_words</option><option>fixed_tokens</option><option>by_section</option><option>by_paragraph</option></select></label>
+              <label><span class="label-row">Chunk size <span class="hint" title="Size for fixed chunking strategies.">i</span></span><input id="chatChunkSize" type="number" min="0" value="450" /></label>
+              <label><span class="label-row">Overlap <span class="hint" title="Overlap for fixed chunking strategies.">i</span></span><input id="chatOverlap" type="number" min="0" value="60" /></label>
+              <label><span class="label-row">Rerank top N <span class="hint" title="How many best chunks to keep after reranking the initial Top K. Use 0 to keep all retrieved Top K.">i</span></span><input id="chatRerankTopN" type="number" min="0" value="0" /></label>
+            </div>
+            <label class="check"><input type="checkbox" id="chatLlmEnable" /> LLM answer <span class="hint" title="Use the configured OpenAI model when the API key env var is available; otherwise fallback to extractive answer.">i</span></label>
+            <div class="grid">
+              <label><span class="label-row">LLM model <span class="hint" title="Used only when LLM answer is enabled.">i</span></span><input id="chatLlmModel" value="gpt-4.1-mini" /></label>
+              <label><span class="label-row">API key env <span class="hint" title="Environment variable containing the OpenAI API key.">i</span></span><input id="chatOpenaiEnv" value="OPENAI_API_KEY" /></label>
+            </div>
+            <div class="chat-doc-config">
+              <label><span class="label-row">Files <span class="hint" title="PDFs used by document_qa_files for this chat turn.">i</span></span><div class="file-picker" id="chatPdfPicker"></div></label>
+              <div class="toolbar" style="margin-top:8px">
+                <input type="file" id="chatFileUploadInput" multiple accept=".pdf,.pdfa,application/pdf" />
+                <button type="button" id="chatUploadDocsBtn">Upload PDFs</button>
+              </div>
+            </div>
+            <div class="chat-api-config hidden">
+              <label><span class="label-row">API classifier URL <span class="hint" title="HTTP endpoint that returns answer or ranked predictions for one query.">i</span></span><input id="chatApiUrl" placeholder="https://..." /></label>
+              <label><span class="label-row">API token env <span class="hint" title="Environment variable containing a Bearer token for this API.">i</span></span><input id="chatApiTokenEnv" value="API_CLASSIFIER_TOKEN" /></label>
+            </div>
+          </aside>
+          <section class="chat-main">
+            <div class="chat-head">
+              <div>
+                <h2>Ask the classifier</h2>
+                <div class="meta" id="chatModeSummary">document_qa_files · metrics after every answer</div>
+              </div>
+              <button type="button" id="clearChatBtn">Clear chat</button>
+            </div>
+            <div id="chatTurns" class="chat-thread"></div>
+            <div class="chat-composer">
+              <div class="composer-row">
+                <textarea id="chatQuestion" placeholder="Ask a question about the selected sources..."></textarea>
+                <button class="primary" type="button" id="chatSendBtn">Send</button>
+              </div>
+              <div class="meta" id="chatStatus"></div>
+            </div>
+          </section>
+        </div>
+      `;
+      renderPdfPicker((state.options && state.options.pdfs) || [], "chatPdfPicker", "chat_selected_docs");
+      document.getElementById("chatSendBtn").addEventListener("click", submitChatTurn);
+      document.getElementById("clearChatBtn").addEventListener("click", () => {
+        state.chatTurns = [];
+        renderChatTurns();
+      });
+      document.getElementById("chatUploadDocsBtn").addEventListener("click", () => uploadDocs("chatFileUploadInput"));
+      document.getElementById("chatMode").addEventListener("change", applyChatModeVisibility);
+      document.getElementById("chatQuestion").addEventListener("keydown", event => {
+        if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submitChatTurn();
+      });
+      applyChatModeVisibility();
+      renderChatTurns();
+    }
+
+    function renderChatTurns() {
+      const root = document.getElementById("chatTurns");
+      if (!root) return;
+      root.innerHTML = state.chatTurns.map(turn => `
+        <div class="chat-turn">
+          <div class="bubble user">${htmlEscape(turn.question)}</div>
+          <div class="bubble assistant">${htmlEscape(turn.answer || "")}</div>
+          <div class="chat-metrics">${(turn.metrics || []).map(metric => metricCard(metric.title, metric.value, metric.help, () => valueFmtMetric(metric))).join("")}</div>
+          <div class="chat-sources">
+            <div class="meta">Sources</div>
+            <div class="retrieved-list">
+            ${(turn.retrieved || []).map(row => `
+              <div class="retrieved-item">
+                <strong>#${fmt(row.rank)} ${htmlEscape(row.title || row.chunk_id || "source")}</strong>
+                <div class="meta">${htmlEscape(row.doc_id || "")} · score ${fmt(row.score)}</div>
+                <div>${htmlEscape(String(row.text || "").slice(0, 700))}</div>
+              </div>
+            `).join("")}
+            </div>
+          </div>
+        </div>
+      `).join("") || '<div class="empty">Ask a question to see the answer, metrics, and sources here.</div>';
+      root.scrollTop = root.scrollHeight;
+    }
+
+    function applyChatModeVisibility() {
+      const mode = document.getElementById("chatMode").value;
+      document.querySelectorAll(".chat-doc-config").forEach(node => node.classList.toggle("hidden", mode !== "document_qa"));
+      document.querySelectorAll(".chat-api-config").forEach(node => node.classList.toggle("hidden", mode !== "api_classifier"));
+      document.getElementById("chatModeSummary").textContent = `${mode === "document_qa" ? "document_qa_files" : "api_classifier"} · metrics after every answer`;
+    }
+
+    async function submitChatTurn() {
+      const button = document.getElementById("chatSendBtn");
+      const status = document.getElementById("chatStatus");
+      button.disabled = true;
+      status.textContent = "Evaluating...";
+      try {
+        const payload = {
+          chat_mode: document.getElementById("chatMode").value,
+          question: document.getElementById("chatQuestion").value,
+          top_k: Number(document.getElementById("chatTopK").value || 5),
+          retriever: document.getElementById("chatRetriever").value,
+          chunking: document.getElementById("chatChunking").value,
+          chunk_size: Number(document.getElementById("chatChunkSize").value || 450),
+          overlap: Number(document.getElementById("chatOverlap").value || 60),
+          rerank_top_n: Number(document.getElementById("chatRerankTopN").value || 0),
+          llm_enable: document.getElementById("chatLlmEnable").checked,
+          llm_model: document.getElementById("chatLlmModel").value,
+          openai_api_key_env: document.getElementById("chatOpenaiEnv").value,
+          api_classifier_url: document.getElementById("chatApiUrl").value,
+          api_auth_token_env: document.getElementById("chatApiTokenEnv").value,
+          selected_docs: Array.from(document.querySelectorAll('input[name="chat_selected_docs"]:checked')).map(input => input.value)
+        };
+        const result = await api("/api/chat/evaluate", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        state.chatTurns.push(result);
+        status.textContent = "Done";
+        document.getElementById("chatQuestion").value = "";
+        renderChatTurns();
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
+        reader.onerror = () => reject(reader.error || new Error("Could not read file."));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function uploadDocs(inputId="fileUploadInput") {
+      const input = document.getElementById(inputId);
+      const files = Array.from(input.files || []);
+      if (!files.length) return;
+      const button = inputId === "chatFileUploadInput" ? document.getElementById("chatUploadDocsBtn") : document.getElementById("uploadDocsBtn");
+      button.disabled = true;
+      try {
+        const payload = { files: await Promise.all(files.map(async file => ({ name: file.name, content_base64: await fileToBase64(file) }))) };
+        const result = await api("/api/uploads", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        state.options = result.options;
+        renderPdfPicker(state.options.pdfs || []);
+        if (state.workspace === "chat") renderChat();
+        input.value = "";
+      } finally {
+        button.disabled = false;
+      }
     }
 
     document.getElementById("runForm").addEventListener("submit", async event => {
@@ -1070,20 +2396,62 @@ INDEX_HTML = r"""<!doctype html>
     });
 
     document.getElementById("refreshBtn").addEventListener("click", () => refreshRuns(false));
+    document.getElementById("adminTabBtn").addEventListener("click", () => setWorkspace("admin"));
+    document.getElementById("chatTabBtn").addEventListener("click", () => setWorkspace("chat"));
+    document.getElementById("runForm").addEventListener("change", applyConditionalVisibility);
     document.getElementById("runForm").elements.mode.addEventListener("change", applyVisibility);
     document.getElementById("runForm").elements.classifier_type.addEventListener("change", applyVisibility);
+    document.getElementById("runForm").elements.chunking.addEventListener("change", applyConditionalVisibility);
+    document.getElementById("runForm").elements.retriever.addEventListener("change", applyConditionalVisibility);
+    document.getElementById("uploadDocsBtn").addEventListener("click", uploadDocs);
     document.getElementById("selectAllDocsBtn").addEventListener("click", () => {
       document.querySelectorAll('input[name="selected_docs"]').forEach(input => input.checked = true);
     });
     document.getElementById("clearDocsBtn").addEventListener("click", () => {
       document.querySelectorAll('input[name="selected_docs"]').forEach(input => input.checked = false);
     });
+    document.querySelectorAll('input[name="sweep_builder_mode"]').forEach(input => {
+      input.addEventListener("change", updateSweepBuilder);
+    });
+    document.querySelectorAll("[data-sweep-chunking], [data-sweep-retriever], [data-sweep-size], [data-sweep-overlap]").forEach(input => {
+      input.addEventListener("change", updateSweepBuilder);
+    });
+    document.querySelectorAll("[data-select-sweep]").forEach(button => {
+      button.addEventListener("click", () => {
+        const kind = button.dataset.selectSweep;
+        const inputs = Array.from(document.querySelectorAll(`input[data-sweep-${kind}]`));
+        const shouldCheck = inputs.some(input => !input.checked);
+        inputs.forEach(input => input.checked = shouldCheck);
+        updateSweepBuilder();
+      });
+    });
+    document.getElementById("addSweepComboBtn").addEventListener("click", () => {
+      const chunking = document.getElementById("customSweepChunking").value;
+      const fixed = ["fixed_words", "fixed_tokens"].includes(chunking);
+      state.customSweepConfigs.push({
+        chunking,
+        retriever: document.getElementById("customSweepRetriever").value,
+        chunk_size: fixed ? Number(document.getElementById("customSweepSize").value || 450) : 0,
+        overlap: fixed ? Number(document.getElementById("customSweepOverlap").value || 60) : 0,
+      });
+      updateSweepBuilder();
+    });
+    document.getElementById("addSelectedSweepCombosBtn").addEventListener("click", () => {
+      state.customSweepConfigs.push(...generatedSweepConfigs());
+      updateSweepBuilder();
+    });
+    document.getElementById("clearSweepCombosBtn").addEventListener("click", () => {
+      state.customSweepConfigs = [];
+      updateSweepBuilder();
+    });
     document.getElementById("loadDefaultsBtn").addEventListener("click", async () => {
       const options = await api("/api/options");
       state.options = options;
       renderPdfPicker(options.pdfs || []);
+      if (state.workspace === "chat") renderChat();
       const form = document.getElementById("runForm");
       if (options.questions[0]) form.elements.questions.value = options.questions[0];
+      if (options.questions[0]) form.elements.sweep_questions.value = options.questions[0];
       if (options.csv.includes("data/cpv_ted_train_catalog.csv")) form.elements.cpv_catalog.value = "data/cpv_ted_train_catalog.csv";
       if (options.csv.includes("data/cpv_ted_train_catalog.csv")) form.elements.prepared_cpv_catalog.value = "data/cpv_ted_train_catalog.csv";
       if (options.json.includes("data/cpv_ted_test_queries.json")) form.elements.cpv_queries.value = "data/cpv_ted_test_queries.json";
@@ -1095,6 +2463,7 @@ INDEX_HTML = r"""<!doctype html>
       state.options = await api("/api/options");
       renderPdfPicker(state.options.pdfs || []);
       applyVisibility();
+      updateSweepBuilder();
       await refreshRuns(true);
     }
 
@@ -1146,13 +2515,24 @@ class EvaluationAdminHandler(BaseHTTPRequestHandler):
                 return json_response(self, stop_job(unquote(parts[2])))
             except ValueError as exc:
                 return json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        if parsed.path == "/api/uploads":
+            try:
+                payload = self.read_json_body()
+                return json_response(self, save_uploaded_files(payload), HTTPStatus.CREATED)
+            except (json.JSONDecodeError, ValueError) as exc:
+                return json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        if parsed.path == "/api/chat/evaluate":
+            try:
+                payload = self.read_json_body()
+                return json_response(self, evaluate_chat_turn(payload), HTTPStatus.OK)
+            except (json.JSONDecodeError, ValueError) as exc:
+                return json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except Exception as exc:  # pragma: no cover - chat endpoint should report runtime failures cleanly
+                return json_response(self, {"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         if parsed.path != "/api/evaluations":
             return json_response(self, {"error": "Not found"}, HTTPStatus.NOT_FOUND)
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-            if not isinstance(payload, dict):
-                raise ValueError("JSON body must be an object.")
+            payload = self.read_json_body()
             run_name = safe_run_name(payload.get("run_name") or default_run_name())
             run_dir = DEFAULT_OUTPUT_DIR / run_name
             if run_dir.exists() and (run_dir / "run_summary.json").exists():
@@ -1172,6 +2552,13 @@ class EvaluationAdminHandler(BaseHTTPRequestHandler):
             return json_response(self, job.to_dict(), HTTPStatus.ACCEPTED)
         except (json.JSONDecodeError, ValueError) as exc:
             return json_response(self, {"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object.")
+        return payload
 
     def handle_run_get(self, path: str, query: dict[str, list[str]]) -> None:
         parts = path.split("/")

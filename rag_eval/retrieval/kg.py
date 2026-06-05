@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Sequence
@@ -40,6 +39,11 @@ ENTITY_PATTERNS = {
     ),
     "Language": re.compile(r"\b(?:Englisch|englischer Sprache|Deutsch|deutscher Sprache)\b", re.IGNORECASE),
     "Date": re.compile(r"\b\d{1,2}\.\s*[A-Za-zÄÖÜäöüß]+\s*\d{4}\b"),
+    "RepeatLimit": re.compile(
+        r"\b(?:(?:jeweils\s+)?(?:einmal|zweimal|zwei\s+Mal|dreimal|drei\s+Mal|\d+\s*mal|\d+\s*Mal)"
+        r"\s+wiederholt\s+werden|Wiederholungsversuch(?:e|s)?|Prüfungsanspruch)\b",
+        re.IGNORECASE,
+    ),
 }
 
 KEY_ENTITY_TERMS = {
@@ -55,6 +59,8 @@ KEY_ENTITY_TERMS = {
         "Abschlussarbeit",
         "Masterprüfung",
         "Zulassung zur Masterarbeit",
+        "Zulassung",
+        "Zulassungsvoraussetzungen",
         "Zugangsvoraussetzungen",
         "Sprachnachweis",
         "Auflagen",
@@ -109,6 +115,9 @@ KEY_ENTITY_TERMS = {
         "Prüfungsanspruch",
         "Änderungssatzung",
         "Gesamtnote",
+        "Abschlussgrad",
+        "akademische Grad",
+        "Hochschulgrad",
         "Aufnahme des Studiums",
         "Zugang zum Masterstudium",
         "Bachelorabschluss",
@@ -148,6 +157,12 @@ RELATION_KEYWORDS = {
     "has_goal": ["Ziel", "befähigen", "Erwerb"],
     "has_abbreviation": ["abgekürzt", "Abkürzung"],
     "has_property": ["berufsqualifizierend", "erfolgreich"],
+    "has_legal_status": ["Prüfungsanspruch", "erlischt", "verliert", "besteht"],
+    "contains": ["§", "Abschnitt", "Anlage", "Teil"],
+    "part_of": ["§", "Abschnitt", "Anlage", "Teil"],
+    "applies_to": ["Studiengang", "Prüfungsordnung", "Ordnung"],
+    "amends": ["Änderung", "Änderungssatzung", "geändert"],
+    "replaces": ["Auslauf", "außer Kraft", "ersetzt", "alte Prüfungsordnung"],
 }
 
 PREDICATE_CUES = {
@@ -169,6 +184,12 @@ PREDICATE_CUES = {
     "stands_in": ["§"],
     "has_abbreviation": ["abgekürzt"],
     "has_property": ["berufsqualifizierend", "erfolgreich"],
+    "has_legal_status": ["prüfungsanspruch", "erlischt", "verliert", "besteht"],
+    "contains": ["§", "abschnitt", "anlage", "teil"],
+    "part_of": ["§", "abschnitt", "anlage", "teil"],
+    "applies_to": ["studiengang", "ordnung", "prüfungsordnung"],
+    "amends": ["änderung", "änderungssatzung", "geändert"],
+    "replaces": ["auslauf", "außer kraft", "ersetzt", "alte prüfungsordnung"],
 }
 
 
@@ -222,6 +243,10 @@ def normalize_name(value: str) -> str:
 def stable_id(*parts: object) -> str:
     raw = "|".join(str(part) for part in parts)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def relation_predicate(relation: Dict) -> str:
+    return normalize_name(str(relation.get("predicate", ""))).replace(" ", "_")
 
 
 def split_sentences_with_offsets(text: str) -> List[Dict[str, object]]:
@@ -285,11 +310,184 @@ def add_entity(
     )
 
 
+def structural_entity(chunk: Dict, *, name: str, entity_type: str, sentence_id: str) -> KGEntity:
+    clean_name = re.sub(r"\s+", " ", str(name)).strip(" ,.;:()[]")
+    normalized = normalize_name(clean_name)
+    return KGEntity(
+        entity_id=stable_id("structural", entity_type, normalized, chunk.get("doc_id", ""), chunk.get("section_id", "")),
+        name=clean_name,
+        entity_type=entity_type,
+        normalized_name=normalized,
+        doc_id=chunk["doc_id"],
+        doc_path=chunk.get("doc_path", chunk["doc_id"]),
+        program_id=chunk.get("program_id", ""),
+        program_name=chunk.get("program_name", ""),
+        section_id=chunk["section_id"],
+        chunk_id=chunk["chunk_id"],
+        sentence_id=sentence_id,
+        start_char=0,
+        end_char=0,
+        start_word=int(chunk.get("start_word", 0)),
+        end_word=int(chunk.get("start_word", 0)),
+        source_text=str(chunk.get("title") or chunk.get("text") or ""),
+    )
+
+
+def structural_relation(
+    chunk: Dict,
+    *,
+    subject: KGEntity,
+    predicate: str,
+    obj: KGEntity,
+    sentence_id: str,
+) -> KGRelation:
+    evidence = "\n".join(
+        part
+        for part in [
+            str(chunk.get("program_name", "")),
+            str(chunk.get("doc_id", "")),
+            str(chunk.get("section_id", "")),
+            str(chunk.get("title", "")),
+        ]
+        if part.strip()
+    )
+    return KGRelation(
+        relation_id=stable_id(
+            chunk["chunk_id"],
+            sentence_id,
+            normalize_name(subject.name),
+            predicate,
+            normalize_name(obj.name),
+        ),
+        subject_id=subject.entity_id,
+        object_id=obj.entity_id,
+        subject=subject.name,
+        predicate=predicate,
+        object=obj.name,
+        subject_type=subject.entity_type,
+        object_type=obj.entity_type,
+        doc_id=chunk["doc_id"],
+        doc_path=chunk.get("doc_path", chunk["doc_id"]),
+        program_id=chunk.get("program_id", ""),
+        program_name=chunk.get("program_name", ""),
+        section_id=chunk["section_id"],
+        chunk_id=chunk["chunk_id"],
+        sentence_id=sentence_id,
+        evidence=evidence,
+    )
+
+
+def extract_structural_graph_for_chunk(chunk: Dict) -> tuple[List[KGEntity], List[KGRelation]]:
+    sentence_id = f"{chunk['chunk_id']}|struct"
+    entities: List[KGEntity] = []
+    relations: List[KGRelation] = []
+
+    program_name = str(chunk.get("program_name") or chunk.get("program_id") or "").strip()
+    doc_name = str(chunk.get("doc_id") or chunk.get("doc_path") or "").strip()
+    section_name = str(chunk.get("section_id") or "").strip()
+    title = str(chunk.get("title") or "").strip()
+
+    program_entity = structural_entity(
+        chunk,
+        name=program_name,
+        entity_type="Program",
+        sentence_id=sentence_id,
+    ) if program_name else None
+    document_entity = structural_entity(
+        chunk,
+        name=doc_name,
+        entity_type="Document",
+        sentence_id=sentence_id,
+    ) if doc_name else None
+    section_entity = structural_entity(
+        chunk,
+        name=section_name,
+        entity_type="Section",
+        sentence_id=sentence_id,
+    ) if section_name else None
+    title_entity = structural_entity(
+        chunk,
+        name=title,
+        entity_type="SectionTitle",
+        sentence_id=sentence_id,
+    ) if title and title != section_name else None
+
+    for entity in [program_entity, document_entity, section_entity, title_entity]:
+        if entity is not None:
+            entities.append(entity)
+
+    if document_entity is not None and program_entity is not None:
+        relations.append(
+            structural_relation(
+                chunk,
+                subject=document_entity,
+                predicate="applies_to",
+                obj=program_entity,
+                sentence_id=sentence_id,
+            )
+        )
+    if document_entity is not None and section_entity is not None:
+        relations.append(
+            structural_relation(
+                chunk,
+                subject=document_entity,
+                predicate="contains",
+                obj=section_entity,
+                sentence_id=sentence_id,
+            )
+        )
+        relations.append(
+            structural_relation(
+                chunk,
+                subject=section_entity,
+                predicate="part_of",
+                obj=document_entity,
+                sentence_id=sentence_id,
+            )
+        )
+    if section_entity is not None and title_entity is not None:
+        relations.append(
+            structural_relation(
+                chunk,
+                subject=section_entity,
+                predicate="contains",
+                obj=title_entity,
+                sentence_id=sentence_id,
+            )
+        )
+
+    doc_norm = normalize_name(doc_name)
+    if document_entity is not None and program_entity is not None:
+        if "aenderung" in doc_norm or "änderung" in doc_norm:
+            relations.append(
+                structural_relation(
+                    chunk,
+                    subject=document_entity,
+                    predicate="amends",
+                    obj=program_entity,
+                    sentence_id=sentence_id,
+                )
+            )
+        if "auslauf" in doc_norm:
+            relations.append(
+                structural_relation(
+                    chunk,
+                    subject=document_entity,
+                    predicate="replaces",
+                    obj=program_entity,
+                    sentence_id=sentence_id,
+                )
+            )
+
+    return entities, relations
+
+
 def extract_entities_for_sentence(
     chunk: Dict,
     sentence_id: str,
     sentence_text: str,
     sentence_start: int,
+    extra_entity_terms: Dict[str, Sequence[str]] | None = None,
 ) -> List[KGEntity]:
     entities: Dict[tuple, KGEntity] = {}
 
@@ -322,6 +520,23 @@ def extract_entities_for_sentence(
     for entity_type, terms in KEY_ENTITY_TERMS.items():
         for term in terms:
             for match in re.finditer(re.escape(term), sentence_text, flags=re.IGNORECASE):
+                add_entity(
+                    entities,
+                    chunk=chunk,
+                    sentence_id=sentence_id,
+                    sentence_text=sentence_text,
+                    name=match.group(0),
+                    entity_type=entity_type,
+                    start_char=sentence_start + match.start(),
+                    end_char=sentence_start + match.end(),
+                )
+
+    for entity_type, terms in (extra_entity_terms or {}).items():
+        for term in terms:
+            clean_term = str(term).strip()
+            if len(clean_term) < 3:
+                continue
+            for match in re.finditer(re.escape(clean_term), sentence_text, flags=re.IGNORECASE):
                 add_entity(
                     entities,
                     chunk=chunk,
@@ -382,6 +597,18 @@ def infer_predicates(sentence_text: str, subject: KGEntity, obj: KGEntity) -> Li
         predicates.append("has_language")
     if obj.entity_type == "Degree" and "awards" not in predicates:
         predicates.append("awards")
+    if obj.entity_type == "RepeatLimit" and "allows" not in predicates:
+        predicates.append("allows")
+    if subject.entity_type == "RepeatLimit" and "has_legal_status" not in predicates:
+        predicates.append("has_legal_status")
+    if "prüfungsanspruch" in lowered and "has_legal_status" not in predicates:
+        predicates.append("has_legal_status")
+    if any(phrase in lowered for phrase in ["wird verliehen", "werden verliehen", "verliehen"]) and (
+        subject.entity_type == "Degree" or obj.entity_type == "Degree"
+    ) and "awards" not in predicates:
+        predicates.append("awards")
+    if any(phrase in lowered for phrase in ["wiederholt werden", "wiederholungsversuch"]) and "allows" not in predicates:
+        predicates.append("allows")
     if obj.entity_type == "Requirement" and subject.entity_type in {
         "Module",
         "ExamType",
@@ -447,10 +674,17 @@ def extract_relations_for_sentence(chunk: Dict, sentence_id: str, sentence_text:
     return relations
 
 
-def build_knowledge_graph(chunks: Sequence[Dict]) -> Dict[str, List[Dict]]:
+def build_knowledge_graph(
+    chunks: Sequence[Dict],
+    *,
+    extra_entity_terms: Dict[str, Sequence[str]] | None = None,
+) -> Dict[str, List[Dict]]:
     entities: List[KGEntity] = []
     relations: List[KGRelation] = []
     for chunk in chunks:
+        structural_entities, structural_relations = extract_structural_graph_for_chunk(chunk)
+        entities.extend(structural_entities)
+        relations.extend(structural_relations)
         for sentence_index, sentence in enumerate(split_sentences_with_offsets(chunk["text"])):
             sentence_id = f"{chunk['chunk_id']}|s{sentence_index}"
             sentence_text = str(sentence["text"])
@@ -459,6 +693,7 @@ def build_knowledge_graph(chunks: Sequence[Dict]) -> Dict[str, List[Dict]]:
                 sentence_id=sentence_id,
                 sentence_text=sentence_text,
                 sentence_start=int(sentence["start"]),
+                extra_entity_terms=extra_entity_terms,
             )
             entities.extend(sentence_entities)
             relations.extend(
@@ -506,6 +741,45 @@ def dedupe_relations(relations: Sequence[KGRelation]) -> List[KGRelation]:
     return out
 
 
+def infer_weak_supervision_entity_type(value: str, *, role: str) -> str:
+    normalized = normalize_name(value)
+    if re.search(r"\b(?:master|bachelor)\s+of\s+(?:arts|science)\b|\b(?:m\.a\.|b\.a\.|m\.sc\.)\b", normalized):
+        return "Degree"
+    if "englisch" in normalized or "deutsch" in normalized:
+        return "Language" if role == "object" and "b2" not in normalized else "Requirement"
+    if re.search(r"\b(?:ects|lp|leistungspunkt|b2|dsh|note|\d+\s*monate?)\b", normalized):
+        return "Requirement"
+    if re.search(r"\b(?:semester|monat|jahr)\b", normalized):
+        return "Semester"
+    if re.search(r"\b(?:einmal|zweimal|wiederholt|wiederholungsversuch|prüfungsanspruch)\b", normalized):
+        return "RepeatLimit"
+    if role == "object":
+        return "Requirement"
+    return "Concept"
+
+
+def build_kg_supervision_terms(questions: Sequence[Dict]) -> Dict[str, List[str]]:
+    terms_by_type: Dict[str, List[str]] = {}
+    seen: set[tuple[str, str]] = set()
+    for item in questions:
+        triples = list(item.get("must_have_triples", [])) + list(item.get("nice_to_have_triples", []))
+        for raw_triple in triples:
+            if not isinstance(raw_triple, dict):
+                continue
+            for role, key in [("subject", "subject"), ("object", "object")]:
+                value = str(raw_triple.get(key, "")).strip()
+                if len(value) < 3:
+                    continue
+                entity_type = infer_weak_supervision_entity_type(value, role=role)
+                normalized = normalize_name(value)
+                dedupe_key = (entity_type, normalized)
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                terms_by_type.setdefault(entity_type, []).append(value)
+    return terms_by_type
+
+
 def graph_for_chunks(graph: Dict[str, List[Dict]], chunk_ids: Iterable[str]) -> Dict[str, List[Dict]]:
     chunk_id_set = set(chunk_ids)
     return {
@@ -527,6 +801,306 @@ def fast_normalized_contains(text: str, phrase: str) -> bool:
     return phrase_tokens.issubset(set(normalized_text.split()))
 
 
+def query_year_hints(query: str) -> set[str]:
+    return set(re.findall(r"\b20\d{2}\b", str(query or "")))
+
+
+def chunk_year_text(chunk: Dict) -> str:
+    return " ".join(
+        str(chunk.get(key, ""))
+        for key in ["doc_id", "doc_path", "title", "section_id"]
+    )
+
+
+def kg_chunk_quality_factor(query: str, chunk: Dict) -> float:
+    factor = 1.0
+    years = query_year_hints(query)
+    if years:
+        chunk_text = chunk_year_text(chunk)
+        if not any(year in chunk_text for year in years):
+            factor *= 0.25
+
+    section_id = normalize_name(str(chunk.get("section_id", "")))
+    query_norm = normalize_name(query)
+    preamble_allowed = any(
+        cue in query_norm
+        for cue in [
+            "preamble",
+            "präambel",
+            "inkraft",
+            "in kraft",
+            "änderung",
+            "aenderung",
+            "auslauf",
+            "veröffentlicht",
+            "verkuendet",
+            "verkündet",
+            "datum",
+        ]
+    )
+    if section_id == "preamble" and not preamble_allowed:
+        factor *= 0.20
+    return factor
+
+
+def kg_profile_settings(profile: str) -> Dict[str, object]:
+    profiles = {
+        "conservative": {
+            "algorithm": "direct",
+            "max_added_chunks": 1,
+            "quality_threshold": 0.75,
+            "ppr_iterations": 2,
+            "ppr_damping": 0.62,
+            "intent_weight": 0.0,
+        },
+        "balanced": {
+            "algorithm": "ppr_direct",
+            "max_added_chunks": 2,
+            "quality_threshold": 0.50,
+            "ppr_iterations": 4,
+            "ppr_damping": 0.72,
+            "intent_weight": 0.0,
+        },
+        "selection": {
+            "algorithm": "ppr_direct",
+            "max_added_chunks": 2,
+            "quality_threshold": 0.50,
+            "ppr_iterations": 4,
+            "ppr_damping": 0.72,
+            "intent_weight": 0.0,
+        },
+        "exploratory": {
+            "algorithm": "ppr_direct",
+            "max_added_chunks": 4,
+            "quality_threshold": 0.25,
+            "ppr_iterations": 6,
+            "ppr_damping": 0.82,
+            "intent_weight": 0.20,
+        },
+        "ppr_only": {
+            "algorithm": "ppr",
+            "max_added_chunks": 2,
+            "quality_threshold": 0.50,
+            "ppr_iterations": 5,
+            "ppr_damping": 0.78,
+            "intent_weight": 0.0,
+        },
+        "direct_only": {
+            "algorithm": "direct",
+            "max_added_chunks": 2,
+            "quality_threshold": 0.50,
+            "ppr_iterations": 0,
+            "ppr_damping": 0.0,
+            "intent_weight": 0.0,
+        },
+    }
+    return dict(profiles.get(profile, profiles["balanced"]))
+
+
+def relation_intent_score(query_norm: str, relation: Dict) -> float:
+    predicate_norm = relation_predicate(relation)
+    cues = PREDICATE_CUES.get(predicate_norm, [str(relation.get("predicate", ""))])
+    cue_hits = sum(1 for cue in cues if fast_normalized_contains(query_norm, cue))
+    score = min(0.55, cue_hits * 0.18)
+
+    subject_norm = normalize_name(str(relation.get("subject", "")))
+    object_norm = normalize_name(str(relation.get("object", "")))
+    relation_text = normalize_name(
+        " ".join(
+            [
+                str(relation.get("subject", "")),
+                str(relation.get("predicate", "")),
+                str(relation.get("object", "")),
+                str(relation.get("evidence", "")),
+            ]
+        )
+    )
+
+    if subject_norm and fast_normalized_contains(query_norm, subject_norm):
+        score += 0.16
+    if object_norm and fast_normalized_contains(query_norm, object_norm):
+        score += 0.16
+
+    intent_groups = {
+        "allows": ["wiederhol", "einmal", "zweimal", "prüfungsanspruch", "versuch"],
+        "has_legal_status": ["prüfungsanspruch", "erlischt", "verliert", "besteht"],
+        "requires": ["zulassung", "voraussetzung", "nachweis", "bewerb", "zugang"],
+        "has_requirement": ["zulassung", "voraussetzung", "nachweis", "bewerb", "zugang"],
+        "awards": ["abschlussgrad", "grad", "verliehen", "master of", "bachelor of"],
+        "has_deadline": ["frist", "spätestens", "binnen", "innerhalb", "bis wann"],
+        "has_duration": ["regelstudienzeit", "dauer", "semester"],
+        "has_ects": ["ects", "leistungspunkt", "lp", "umfang"],
+        "has_language": ["sprache", "englisch", "deutsch", "b2"],
+        "offered_in": ["angebot", "semester", "wann"],
+        "amends": ["änderung", "geändert", "fassung"],
+        "replaces": ["auslauf", "alte prüfungsordnung", "außer kraft"],
+    }
+    for predicate, group_cues in intent_groups.items():
+        if predicate_norm != predicate:
+            continue
+        if any(cue in query_norm or cue in relation_text for cue in group_cues):
+            score += 0.28
+        break
+
+    return min(score, 1.0)
+
+
+def graph_chunk_candidate_is_useful(row: Dict, *, base_threshold: float) -> bool:
+    if row["chunk_id"] in row.get("_base_chunk_ids", set()):
+        return True
+    if float(row.get("kg_chunk_quality_factor", 1.0)) < 0.5:
+        return False
+    graph_score = float(row.get("kg_graph_score", 0.0))
+    if graph_score < base_threshold:
+        return False
+    return True
+
+
+def relation_faithfulness_score(relation: Dict) -> float:
+    evidence = str(relation.get("evidence", ""))
+    if not evidence:
+        return 0.0
+    checks = [
+        fast_normalized_contains(evidence, str(relation.get("subject", ""))),
+        fast_normalized_contains(evidence, str(relation.get("object", ""))),
+    ]
+    predicate_norm = relation_predicate(relation)
+    cues = PREDICATE_CUES.get(predicate_norm, [str(relation.get("predicate", ""))])
+    checks.append(any(fast_normalized_contains(evidence, cue) for cue in cues))
+    return sum(1 for check in checks if check) / len(checks)
+
+
+def predicate_propagation_weight(predicate_norm: str) -> float:
+    return {
+        "requires": 1.0,
+        "has_requirement": 1.0,
+        "has_deadline": 0.95,
+        "has_duration": 0.95,
+        "has_ects": 0.95,
+        "has_language": 0.90,
+        "awards": 0.90,
+        "allows": 0.88,
+        "has_legal_status": 0.88,
+        "offered_in": 0.86,
+        "contains": 0.82,
+        "part_of": 0.82,
+        "applies_to": 0.80,
+        "amends": 0.78,
+        "replaces": 0.78,
+        "stands_in": 0.70,
+    }.get(predicate_norm, 0.68)
+
+
+def ppr_graph_propagation(
+    *,
+    query: str,
+    graph: Dict[str, List[Dict]],
+    chunks_by_id: Dict[str, Dict],
+    allowed_chunk_ids: set[str],
+    seed_norms: Dict[str, Dict[str, object]],
+    max_iterations: int = 4,
+    damping: float = 0.72,
+) -> tuple[Dict[str, Dict[str, object]], Dict[str, float], Dict[str, float], List[Dict[str, object]]]:
+    query_norm = normalize_name(query)
+    seed_total = sum(float(seed.get("seed_score", 0.0)) for seed in seed_norms.values()) or 1.0
+    restart_scores = {
+        seed_norm: float(seed.get("seed_score", 0.0)) / seed_total
+        for seed_norm, seed in seed_norms.items()
+    }
+    entity_info: Dict[str, Dict[str, object]] = {
+        seed_norm: {
+            "name": seed["name"],
+            "entity_type": seed["entity_type"],
+            "source": seed["source"],
+            "score": restart_scores[seed_norm],
+            "depth": 0,
+        }
+        for seed_norm, seed in seed_norms.items()
+    }
+    adjacency: Dict[str, List[Dict[str, object]]] = {}
+    for relation in graph["relations"]:
+        chunk_id = relation["chunk_id"]
+        if chunk_id not in allowed_chunk_ids:
+            continue
+        chunk = chunks_by_id.get(chunk_id, {})
+        quality_factor = kg_chunk_quality_factor(query, chunk)
+        if quality_factor < 0.5:
+            continue
+        subject_norm = normalize_name(str(relation["subject"]))
+        object_norm = normalize_name(str(relation["object"]))
+        if not subject_norm or not object_norm:
+            continue
+        predicate_norm = relation_predicate(relation)
+        intent_score = relation_intent_score(query_norm, relation)
+        edge_weight = predicate_propagation_weight(predicate_norm) * quality_factor * (1.0 + 0.12 * intent_score)
+        for source_norm, target_norm, target_name, target_type in [
+            (subject_norm, object_norm, relation["object"], relation["object_type"]),
+            (object_norm, subject_norm, relation["subject"], relation["subject_type"]),
+        ]:
+            adjacency.setdefault(source_norm, []).append(
+                {
+                    "target_norm": target_norm,
+                    "target_name": target_name,
+                    "target_type": target_type,
+                    "weight": edge_weight,
+                    "relation": relation,
+                    "intent_score": intent_score,
+                    "chunk_id": chunk_id,
+                }
+            )
+
+    scores = dict(restart_scores)
+    chunk_scores: Dict[str, float] = {}
+    chunk_intents: Dict[str, float] = {}
+    supporting: List[Dict[str, object]] = []
+    for iteration in range(max_iterations):
+        next_scores = {
+            seed_norm: (1.0 - damping) * score
+            for seed_norm, score in restart_scores.items()
+        }
+        for source_norm, source_score in scores.items():
+            edges = adjacency.get(source_norm, [])
+            if not edges or source_score <= 0:
+                continue
+            total_weight = sum(float(edge["weight"]) for edge in edges) or 1.0
+            source_name = str(entity_info.get(source_norm, {}).get("name", source_norm))
+            for edge in edges:
+                edge_weight = float(edge["weight"])
+                contribution = damping * source_score * (edge_weight / total_weight)
+                target_norm = str(edge["target_norm"])
+                next_scores[target_norm] = next_scores.get(target_norm, 0.0) + contribution
+                current = entity_info.get(target_norm)
+                if current is None or contribution > float(current["score"]):
+                    entity_info[target_norm] = {
+                        "name": edge["target_name"],
+                        "entity_type": edge["target_type"],
+                        "source": "graph_ppr",
+                        "score": contribution,
+                        "depth": iteration + 1,
+                    }
+                chunk_id = str(edge["chunk_id"])
+                chunk_scores[chunk_id] = max(chunk_scores.get(chunk_id, 0.0), contribution)
+                chunk_intents[chunk_id] = max(chunk_intents.get(chunk_id, 0.0), float(edge["intent_score"]))
+                if len(supporting) < 50:
+                    relation = edge["relation"]
+                    supporting.append(
+                        {
+                            "chunk_id": chunk_id,
+                            "seed": source_name,
+                            "subject": relation["subject"],
+                            "predicate": relation["predicate"],
+                            "object": relation["object"],
+                            "section_id": relation["section_id"],
+                            "activation_depth": iteration + 1,
+                            "intent_score": edge["intent_score"],
+                            "faithfulness_score": relation_faithfulness_score(relation),
+                            "propagation": "ppr",
+                        }
+                    )
+        scores = next_scores
+    return entity_info, chunk_scores, chunk_intents, supporting
+
+
 def graph_augmented_retrieval(
     *,
     query: str,
@@ -535,15 +1109,33 @@ def graph_augmented_retrieval(
     chunks: Sequence[Dict],
     k: int,
     graph_weight: float = 0.35,
+    kg_profile: str = "balanced",
+    graph_algorithm: str | None = None,
     max_seed_entities: int = 20,
-    max_added_chunks: int = 2,
+    max_added_chunks: int | None = None,
+    ppr_iterations: int | None = None,
+    ppr_damping: float | None = None,
+    quality_threshold: float | None = None,
+    intent_weight: float | None = None,
 ) -> tuple[List[Dict], Dict[str, object]]:
+    settings = kg_profile_settings(kg_profile)
+    resolved_algorithm = graph_algorithm or str(settings["algorithm"])
+    resolved_max_added_chunks = int(max_added_chunks if max_added_chunks is not None else settings["max_added_chunks"])
+    resolved_ppr_iterations = int(ppr_iterations if ppr_iterations is not None else settings["ppr_iterations"])
+    resolved_ppr_damping = float(ppr_damping if ppr_damping is not None else settings["ppr_damping"])
+    resolved_quality_threshold = float(
+        quality_threshold if quality_threshold is not None else settings["quality_threshold"]
+    )
+    resolved_intent_weight = float(intent_weight if intent_weight is not None else settings["intent_weight"])
     if not retrieved or k <= 0:
         return list(retrieved), {
             "enabled": True,
             "seed_entities": [],
             "added_chunk_ids": [],
+            "replaced_chunk_ids": [],
             "supporting_relations": [],
+            "graph_algorithm": resolved_algorithm,
+            "kg_profile": kg_profile,
         }
 
     chunks_by_id = {chunk["chunk_id"]: chunk for chunk in chunks}
@@ -600,12 +1192,118 @@ def graph_augmented_retrieval(
             "enabled": True,
             "seed_entities": [],
             "added_chunk_ids": [],
+            "replaced_chunk_ids": [],
             "supporting_relations": [],
+            "graph_algorithm": resolved_algorithm,
+            "kg_profile": kg_profile,
         }
 
     graph_scores: Dict[str, float] = {}
+    graph_intent_scores: Dict[str, float] = {}
     supporting_relations: List[Dict[str, object]] = []
     query_norm = normalize_name(query)
+    activated_entities: Dict[str, Dict[str, object]] = {
+        seed_norm: {
+            "name": seed["name"],
+            "entity_type": seed["entity_type"],
+            "source": seed["source"],
+            "score": float(seed["seed_score"]),
+            "depth": 0,
+        }
+        for seed_norm, seed in seed_norms.items()
+    }
+    if resolved_algorithm in {"ppr", "ppr_direct"} and resolved_ppr_iterations > 0:
+        ppr_entities, ppr_chunk_scores, ppr_chunk_intents, ppr_supporting = ppr_graph_propagation(
+            query=query,
+            graph=graph,
+            chunks_by_id=chunks_by_id,
+            allowed_chunk_ids=allowed_chunk_ids,
+            seed_norms=seed_norms,
+            max_iterations=resolved_ppr_iterations,
+            damping=resolved_ppr_damping,
+        )
+        activated_entities.update(ppr_entities)
+        for chunk_id, score in ppr_chunk_scores.items():
+            graph_scores[chunk_id] = max(graph_scores.get(chunk_id, 0.0), score)
+        for chunk_id, score in ppr_chunk_intents.items():
+            graph_intent_scores[chunk_id] = max(graph_intent_scores.get(chunk_id, 0.0), score)
+        supporting_relations.extend(ppr_supporting[:50])
+    frontier = {
+        seed_norm: activated_entities[seed_norm]
+        for seed_norm in seed_norms
+        if seed_norm in activated_entities
+    }
+    for depth in range(2 if resolved_algorithm in {"direct", "ppr_direct"} else 0):
+        next_frontier: Dict[str, Dict[str, object]] = {}
+        for relation in graph["relations"]:
+            chunk_id = relation["chunk_id"]
+            if chunk_id not in allowed_chunk_ids:
+                continue
+            subject_norm = normalize_name(str(relation["subject"]))
+            object_norm = normalize_name(str(relation["object"]))
+            predicate_norm = normalize_name(str(relation["predicate"])).replace(" ", "_")
+            predicate_cues = PREDICATE_CUES.get(predicate_norm, [str(relation["predicate"])])
+            relation_intent_bonus = (
+                0.12 if any(fast_normalized_contains(query_norm, cue) for cue in predicate_cues) else 0.0
+            )
+            intent_score = relation_intent_score(query_norm, relation)
+            predicate_weight = {
+                "requires": 1.0,
+                "has_requirement": 1.0,
+                "has_deadline": 0.95,
+                "has_duration": 0.95,
+                "has_ects": 0.95,
+                "has_language": 0.90,
+                "awards": 0.90,
+                "contains": 0.85,
+                "part_of": 0.85,
+                "applies_to": 0.80,
+                "amends": 0.80,
+                "replaces": 0.80,
+                "stands_in": 0.70,
+            }.get(predicate_norm, 0.72)
+            for active_norm, target_norm, target_name, target_type in [
+                (subject_norm, object_norm, relation["object"], relation["object_type"]),
+                (object_norm, subject_norm, relation["subject"], relation["subject_type"]),
+            ]:
+                active = frontier.get(active_norm)
+                if active is None or not target_norm:
+                    continue
+                chunk_factor = kg_chunk_quality_factor(query, chunks_by_id.get(chunk_id, {}))
+                score = (
+                    float(active["score"]) * (0.55 ** (depth + 1)) * predicate_weight + relation_intent_bonus
+                ) * chunk_factor
+                current = activated_entities.get(target_norm)
+                if current is None or score > float(current["score"]):
+                    activated_entities[target_norm] = {
+                        "name": target_name,
+                        "entity_type": target_type,
+                        "source": f"graph_hop_{depth + 1}",
+                        "score": score,
+                        "depth": depth + 1,
+                    }
+                    next_frontier[target_norm] = activated_entities[target_norm]
+                graph_scores[chunk_id] = max(graph_scores.get(chunk_id, 0.0), score)
+                graph_intent_scores[chunk_id] = max(graph_intent_scores.get(chunk_id, 0.0), intent_score)
+                if len(supporting_relations) < 50:
+                    supporting_relations.append(
+                        {
+                            "chunk_id": chunk_id,
+                            "seed": active["name"],
+                            "subject": relation["subject"],
+                            "predicate": relation["predicate"],
+                            "object": relation["object"],
+                            "section_id": relation["section_id"],
+                            "activation_depth": depth + 1,
+                            "intent_score": intent_score,
+                            "faithfulness_score": relation_faithfulness_score(relation),
+                            "propagation": "direct",
+                        }
+                    )
+        frontier = next_frontier
+        if not frontier:
+            break
+
     for relation in graph["relations"]:
         chunk_id = relation["chunk_id"]
         if chunk_id not in allowed_chunk_ids:
@@ -613,7 +1311,7 @@ def graph_augmented_retrieval(
         subject_norm = normalize_name(str(relation["subject"]))
         object_norm = normalize_name(str(relation["object"]))
         matched_seed = None
-        for seed_norm, seed in seed_norms.items():
+        for seed_norm, seed in activated_entities.items():
             if (
                 seed_norm == subject_norm
                 or seed_norm == object_norm
@@ -630,8 +1328,12 @@ def graph_augmented_retrieval(
         relation_intent_bonus = (
             0.15 if any(fast_normalized_contains(query_norm, cue) for cue in predicate_cues) else 0.0
         )
-        score = float(matched_seed["seed_score"]) + relation_intent_bonus
+        intent_score = relation_intent_score(query_norm, relation)
+        score = (
+            float(matched_seed.get("score", 0.0)) + relation_intent_bonus
+        ) * kg_chunk_quality_factor(query, chunks_by_id.get(chunk_id, {}))
         graph_scores[chunk_id] = max(graph_scores.get(chunk_id, 0.0), score)
+        graph_intent_scores[chunk_id] = max(graph_intent_scores.get(chunk_id, 0.0), intent_score)
         if len(supporting_relations) < 50:
             supporting_relations.append(
                 {
@@ -641,6 +1343,9 @@ def graph_augmented_retrieval(
                     "predicate": relation["predicate"],
                     "object": relation["object"],
                     "section_id": relation["section_id"],
+                    "intent_score": intent_score,
+                    "faithfulness_score": relation_faithfulness_score(relation),
+                    "propagation": "direct_match",
                 }
             )
 
@@ -649,28 +1354,40 @@ def graph_augmented_retrieval(
         if chunk_id not in allowed_chunk_ids:
             continue
         entity_norm = normalize_name(str(entity["name"]))
-        if entity_norm in seed_norms:
-            seed = seed_norms[entity_norm]
-            graph_scores[chunk_id] = max(graph_scores.get(chunk_id, 0.0), float(seed["seed_score"]) * 0.7)
+        if entity_norm in activated_entities:
+            seed = activated_entities[entity_norm]
+            score = float(seed["score"]) * 0.7 * kg_chunk_quality_factor(query, chunks_by_id.get(chunk_id, {}))
+            graph_scores[chunk_id] = max(graph_scores.get(chunk_id, 0.0), score)
 
     graph_max = max(graph_scores.values()) if graph_scores else 0.0
     graph_norm = {
         chunk_id: (score / graph_max if graph_max > 0 else 0.0)
         for chunk_id, score in graph_scores.items()
     }
+    intent_max = max(graph_intent_scores.values()) if graph_intent_scores else 0.0
+    intent_norm = {
+        chunk_id: (score / intent_max if intent_max > 0 else 0.0)
+        for chunk_id, score in graph_intent_scores.items()
+    }
     candidate_ids = list(dict.fromkeys(base_chunk_ids + list(graph_scores.keys())))
     fused: List[Dict] = []
+    base_chunk_id_set = set(base_chunk_ids)
     for chunk_id in candidate_ids:
         chunk = chunks_by_id.get(chunk_id)
         if chunk is None:
             continue
         base_score = base_norm.get(chunk_id, 0.0)
         graph_score = graph_norm.get(chunk_id, 0.0)
-        score = (1.0 - graph_weight) * base_score + graph_weight * graph_score
+        intent_score = intent_norm.get(chunk_id, 0.0)
+        quality_factor = kg_chunk_quality_factor(query, chunk)
+        kg_score = (1.0 - resolved_intent_weight) * graph_score + resolved_intent_weight * intent_score
+        score = (1.0 - graph_weight) * base_score + graph_weight * kg_score
         row = dict(chunk)
         row["score"] = float(score)
         row["base_retrieval_score"] = float(base_scores.get(chunk_id, 0.0))
         row["kg_graph_score"] = float(graph_score)
+        row["kg_intent_score"] = float(intent_score)
+        row["kg_chunk_quality_factor"] = float(quality_factor)
         row["retriever"] = "kg_augmented" if chunk_id not in base_scores else str(
             next((base_row.get("retriever", "") for base_row in retrieved if base_row["chunk_id"] == chunk_id), "")
         )
@@ -681,33 +1398,47 @@ def graph_augmented_retrieval(
             if chunk_id in graph_scores
             else "vector"
         )
+        row["_base_chunk_ids"] = base_chunk_id_set
         fused.append(row)
 
     fused.sort(key=lambda row: row["score"], reverse=True)
     fused_by_id = {row["chunk_id"]: row for row in fused}
-    final_ids = [row["chunk_id"] for row in retrieved[:k]]
-    graph_only_ids = [
-        row["chunk_id"]
+    base_floor = max(resolved_quality_threshold * 0.10, 0.08 if graph_weight <= 0.4 else 0.05)
+    final_ids = [row["chunk_id"] for row in retrieved[:k] if row["chunk_id"] in fused_by_id]
+    graph_only_rows = [
+        row
         for row in fused
-        if row["chunk_id"] not in base_chunk_ids and row["kg_graph_score"] > 0
+        if row["chunk_id"] not in base_chunk_id_set
+        and graph_chunk_candidate_is_useful(row, base_threshold=base_floor)
+        and float(row.get("kg_chunk_quality_factor", 1.0)) >= resolved_quality_threshold
     ]
-    for chunk_id in graph_only_ids:
-        if len(final_ids) >= k + max_added_chunks:
-            break
-        final_ids.append(chunk_id)
-
-    if not graph_only_ids:
-        final_ids = [row["chunk_id"] for row in fused[: min(k, len(fused))]]
+    for row in graph_only_rows[:resolved_max_added_chunks]:
+        final_ids.append(row["chunk_id"])
     fused = [fused_by_id[chunk_id] for chunk_id in final_ids if chunk_id in fused_by_id]
+    for row in fused:
+        row.pop("_base_chunk_ids", None)
     fused_ids = [row["chunk_id"] for row in fused]
     added_chunk_ids = [chunk_id for chunk_id in fused_ids if chunk_id not in base_chunk_ids]
+    replaced_chunk_ids = [
+        chunk_id for chunk_id in base_chunk_ids[:k] if chunk_id not in set(fused_ids)
+    ]
     return fused, {
         "enabled": True,
         "seed_entities": seeds,
         "added_chunk_ids": added_chunk_ids,
+        "replaced_chunk_ids": replaced_chunk_ids,
         "supporting_relations": supporting_relations,
         "base_chunk_ids": base_chunk_ids,
         "fused_chunk_ids": fused_ids,
+        "graph_algorithm": resolved_algorithm,
+        "kg_profile": kg_profile,
+        "kg_settings": {
+            "max_added_chunks": resolved_max_added_chunks,
+            "ppr_iterations": resolved_ppr_iterations,
+            "ppr_damping": resolved_ppr_damping,
+            "quality_threshold": resolved_quality_threshold,
+            "intent_weight": resolved_intent_weight,
+        },
     }
 
 
@@ -1027,6 +1758,113 @@ def evaluate_kg_for_question(item: Dict, retrieved: Sequence[Dict], graph: Dict[
     }
 
 
+def relation_supports_triple(relation: Dict[str, object], triple: Dict[str, object]) -> bool:
+    text = "\n".join(
+        [
+            str(relation.get("subject", "")),
+            str(relation.get("predicate", "")),
+            str(relation.get("object", "")),
+            str(relation.get("evidence", "")),
+        ]
+    )
+    if not fast_normalized_contains(text, str(triple["subject"])):
+        return False
+    if not fast_normalized_contains(text, str(triple["object"])):
+        return False
+    return any(fast_normalized_contains(text, cue) for cue in relation_cues_for_triple(triple))
+
+
+def graph_only_chunk_is_noise(row: Dict, item: Dict, required_triples: Sequence[Dict[str, object]]) -> bool:
+    if str(row.get("section_id", "")).casefold() == "preamble":
+        return True
+    if float(row.get("kg_chunk_quality_factor", 1.0)) < 0.5:
+        return True
+    text = retrieved_context_text([row])
+    expected_doc = str(item.get("doc_id", "")).strip()
+    if expected_doc and not row_matches_doc(row, expected_doc):
+        if not any(gold_subject_hit(triple, text) or gold_object_hit(triple, text) for triple in required_triples):
+            return True
+    if required_triples and not any(
+        gold_subject_hit(triple, text) or gold_object_hit(triple, text) or gold_relation_evidence_hit(triple, text)
+        for triple in required_triples
+    ):
+        return True
+    return False
+
+
+def evaluate_kg_retrieval_diagnostics(
+    *,
+    item: Dict,
+    base_retrieved: Sequence[Dict],
+    retrieved: Sequence[Dict],
+    kg_retrieval: Dict[str, object],
+    graph: Dict[str, List[Dict]],
+) -> Dict[str, object]:
+    required_triples = normalize_gold_triples(list(item.get("must_have_triples", [])), item)
+    base_text = retrieved_context_text(base_retrieved)
+    final_text = retrieved_context_text(retrieved)
+    base_hits = [gold_relation_evidence_hit(triple, base_text) for triple in required_triples]
+    final_hits = [gold_relation_evidence_hit(triple, final_text) for triple in required_triples]
+    newly_supported = [
+        triple for triple, before, after in zip(required_triples, base_hits, final_hits) if not before and after
+    ]
+    strict_delta = len(newly_supported) / len(required_triples) if required_triples else None
+
+    added_ids = set(str(chunk_id) for chunk_id in kg_retrieval.get("added_chunk_ids", []))
+    graph_only_rows = [row for row in retrieved if str(row.get("chunk_id", "")) in added_ids]
+    noisy_rows = [row for row in graph_only_rows if graph_only_chunk_is_noise(row, item, required_triples)]
+    useful_rows = [row for row in graph_only_rows if row not in noisy_rows]
+
+    supporting = [
+        relation for relation in kg_retrieval.get("supporting_relations", [])
+        if str(relation.get("chunk_id", "")) in {str(row.get("chunk_id", "")) for row in retrieved}
+    ]
+    intent_scores = [float(relation.get("intent_score", 0.0)) for relation in supporting]
+    faithfulness_scores = [float(relation.get("faithfulness_score", 0.0)) for relation in supporting]
+    depths = [int(relation.get("activation_depth", 0)) for relation in supporting if relation.get("activation_depth")]
+    generic_predicates = {"contains", "part_of", "applies_to", "stands_in"}
+    generic_count = sum(1 for relation in supporting if relation_predicate(relation) in generic_predicates)
+
+    path_supported_triples = [
+        triple for triple in required_triples if any(relation_supports_triple(relation, triple) for relation in supporting)
+    ]
+    return {
+        "kg_strict_relation_evidence_delta": strict_delta,
+        "kg_new_relation_evidence_count": len(newly_supported),
+        "kg_graph_only_chunk_count": len(graph_only_rows),
+        "kg_useful_graph_only_chunk_count": len(useful_rows),
+        "kg_graph_only_noise_rate": (len(noisy_rows) / len(graph_only_rows)) if graph_only_rows else 0.0,
+        "kg_graph_only_preamble_count": sum(
+            1 for row in graph_only_rows if str(row.get("section_id", "")).casefold() == "preamble"
+        ),
+        "kg_relation_intent_alignment": (
+            sum(1 for score in intent_scores if score >= 0.35) / len(intent_scores) if intent_scores else None
+        ),
+        "kg_mean_relation_intent_score": (
+            sum(intent_scores) / len(intent_scores) if intent_scores else None
+        ),
+        "kg_graph_faithfulness": (
+            sum(1 for score in faithfulness_scores if score >= 2 / 3) / len(faithfulness_scores)
+            if faithfulness_scores else None
+        ),
+        "kg_mean_relation_faithfulness": (
+            sum(faithfulness_scores) / len(faithfulness_scores) if faithfulness_scores else None
+        ),
+        "kg_evidence_path_recall": (
+            len(path_supported_triples) / len(required_triples) if required_triples else None
+        ),
+        "kg_mean_path_depth": (sum(depths) / len(depths) if depths else None),
+        "kg_direct_path_rate": (sum(1 for depth in depths if depth <= 1) / len(depths) if depths else None),
+        "kg_generic_relation_share": (generic_count / len(supporting) if supporting else None),
+        "kg_new_relation_evidence_triples": json.dumps(
+            [triple_to_list(triple) for triple in newly_supported], ensure_ascii=False
+        ),
+        "kg_path_supported_triples": json.dumps(
+            [triple_to_list(triple) for triple in path_supported_triples], ensure_ascii=False
+        ),
+    }
+
+
 def summarize_kg_metrics(metric_rows: Sequence[Dict]) -> Dict:
     def average(key: str) -> float | None:
         values = [row[key] for row in metric_rows if row.get(key) is not None]
@@ -1046,7 +1884,19 @@ def summarize_kg_metrics(metric_rows: Sequence[Dict]) -> Dict:
         ),  # same relation-evidence metric before graph expansion
         "mean_kg_relation_evidence_recall_delta": average("kg_relation_evidence_recall_delta"),  # after-KG minus before-KG
         "mean_kg_retrieval_added_chunk_count": average("kg_retrieval_added_chunk_count"),  # average graph-only chunks added
+        "mean_kg_strict_relation_evidence_delta": average("kg_strict_relation_evidence_delta"),
+        "mean_kg_graph_only_noise_rate": average("kg_graph_only_noise_rate"),
+        "mean_kg_relation_intent_alignment": average("kg_relation_intent_alignment"),
+        "mean_kg_mean_relation_intent_score": average("kg_mean_relation_intent_score"),
+        "mean_kg_graph_faithfulness": average("kg_graph_faithfulness"),
+        "mean_kg_evidence_path_recall": average("kg_evidence_path_recall"),
+        "mean_kg_path_depth": average("kg_mean_path_depth"),
+        "mean_kg_direct_path_rate": average("kg_direct_path_rate"),
+        "mean_kg_generic_relation_share": average("kg_generic_relation_share"),
         "questions_with_relation_gap": sum(1 for row in metric_rows if row["has_relation_gap"]),  # entities found but relation missing
+        "questions_with_new_kg_relation_evidence": sum(
+            1 for row in metric_rows if row.get("kg_new_relation_evidence_count", 0) > 0
+        ),
         "questions_with_kg_added_chunks": sum(
             1 for row in metric_rows if row.get("kg_retrieval_added_chunk_count", 0) > 0
         ),  # questions where graph expansion changed the answer context
@@ -1058,89 +1908,3 @@ def summarize_kg_metrics(metric_rows: Sequence[Dict]) -> Dict:
             for error_type in sorted({str(row.get("kg_error_type")) for row in metric_rows})
         },
     }
-
-
-def export_graph_to_neo4j(
-    graph: Dict[str, List[Dict]],
-    *,
-    uri: str,
-    user: str,
-    password: str,
-    database: str | None = None,
-    clear: bool = False,
-) -> Dict:
-    from neo4j import GraphDatabase
-
-    driver = GraphDatabase.driver(uri, auth=(user, password))
-    session_kwargs = {"database": database} if database else {}
-    with driver.session(**session_kwargs) as session:
-        if clear:
-            session.run("MATCH (n) DETACH DELETE n")
-        session.run(
-            "CREATE CONSTRAINT kg_entity_id IF NOT EXISTS "
-            "FOR (e:KGEntity) REQUIRE e.entity_id IS UNIQUE"
-        )
-        for entity in graph["entities"]:
-            session.run(
-                """
-                MERGE (e:KGEntity {entity_id: $entity_id})
-                SET e += $props
-                """,
-                entity_id=entity["entity_id"],
-                props=entity,
-            )
-        for relation in graph["relations"]:
-            session.run(
-                """
-                MERGE (s:KGEntity {entity_id: $subject_id})
-                SET s.name = $subject, s.entity_type = $subject_type
-                MERGE (o:KGEntity {entity_id: $object_id})
-                SET o.name = $object, o.entity_type = $object_type
-                MERGE (s)-[r:KG_RELATION {relation_id: $relation_id}]->(o)
-                SET r += $props
-                """,
-                subject_id=relation["subject_id"],
-                object_id=relation["object_id"],
-                subject=relation["subject"],
-                object=relation["object"],
-                subject_type=relation["subject_type"],
-                object_type=relation["object_type"],
-                relation_id=relation["relation_id"],
-                props=relation,
-            )
-    driver.close()
-    return {"status": "success", "n_entities": len(graph["entities"]), "n_relations": len(graph["relations"])}
-
-
-def maybe_export_graph_to_neo4j(
-    graph: Dict[str, List[Dict]],
-    *,
-    enabled: bool,
-    uri: str | None,
-    user: str | None,
-    password: str | None,
-    database: str | None,
-    clear: bool,
-) -> Dict:
-    if not enabled:
-        return {"status": "disabled"}
-    resolved_uri = uri or os.getenv("NEO4J_URI")
-    resolved_user = user or os.getenv("NEO4J_USER")
-    resolved_password = password or os.getenv("NEO4J_PASSWORD")
-    resolved_database = database or os.getenv("NEO4J_DATABASE")
-    if not resolved_uri or not resolved_user or not resolved_password:
-        return {
-            "status": "skipped_missing_config",
-            "error": "Set NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD or pass the CLI options.",
-        }
-    try:
-        return export_graph_to_neo4j(
-            graph,
-            uri=resolved_uri,
-            user=resolved_user,
-            password=resolved_password,
-            database=resolved_database,
-            clear=clear,
-        )
-    except Exception as exc:
-        return {"status": "error", "error": str(exc)}

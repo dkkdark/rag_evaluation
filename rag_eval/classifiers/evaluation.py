@@ -12,9 +12,14 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Dict, List
 
-from rag_eval.core.models import DiagnosticResult
+from rag_eval.core.models import DiagnosticResult, LLMConfig
 from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
 from rag_eval.classifiers.cpv_baseline import build_cpv_chunks, build_parent_lookup, load_cpv_catalog, load_queries
+from rag_eval.classifiers.cpv_kg import (
+    build_cpv_knowledge_graph,
+    cpv_kg_metrics,
+    graph_expand_and_rerank_cpv,
+)
 from rag_eval.evaluation.adapters import build_items_from_cpv_queries
 from rag_eval.evaluation.core import (
     EvaluationItem,
@@ -37,7 +42,12 @@ from rag_eval.evaluation.metrics import (
     summarize_retrieval_metrics,
     summarize_confidence_calibration,
 )
+from rag_eval.evaluation.llm import augment_query_with_llm
 from rag_eval.retrieval.engines import build_retriever, rerank_with_lexical_signal, retrieve_top_k
+from rag_eval.retrieval.cross_encoder import (
+    DEFAULT_CROSS_ENCODER_MODEL,
+    rerank_with_cross_encoder,
+)
 from rag_eval.reporting.visualization import write_classifier_showcase_bundle
 
 
@@ -103,7 +113,19 @@ def _apply_showcase_bundle(summary: Dict[str, object], showcase_bundle: Dict[str
 
 
 def _normalize_prediction_label(candidate: Dict[str, object]) -> str:
-    for key in ["label", "cpv_code", "answer", "id", "code"]:
+    for key in [
+        "label",
+        "cpv_code",
+        "cpv",
+        "answer",
+        "candidate",
+        "prediction",
+        "predicted",
+        "predicted_answer",
+        "predicted_cpv",
+        "id",
+        "code",
+    ]:
         value = candidate.get(key)
         if value is not None and str(value).strip():
             return str(value).strip()
@@ -111,7 +133,16 @@ def _normalize_prediction_label(candidate: Dict[str, object]) -> str:
 
 
 def _normalize_prediction_score(candidate: Dict[str, object], *, fallback: float) -> float:
-    for key in ["score", "confidence", "probability"]:
+    for key in [
+        "score",
+        "confidence",
+        "probability",
+        "retrieval_score",
+        "vector_score",
+        "rrf_score",
+        "reranker_score",
+        "final_score",
+    ]:
         value = candidate.get(key)
         if value is None or value == "":
             continue
@@ -128,9 +159,182 @@ def _normalize_header(value: object) -> str:
 
 def _first_present(row: Dict[str, object], keys: List[str]) -> object:
     for key in keys:
-        if key in row and row[key] not in {None, ""}:
-            return row[key]
+        normalized_key = _normalize_header(key)
+        for candidate in dict.fromkeys([key, normalized_key]):
+            if candidate in row and row[candidate] not in {None, ""}:
+                return row[candidate]
     return ""
+
+
+def _ranked_aliases(rank: int, bases: List[str]) -> List[str]:
+    aliases: List[str] = []
+    for base in bases:
+        compact = _normalize_header(base)
+        aliases.extend(
+            [
+                f"{compact}{rank}",
+                f"{rank}{compact}",
+                f"{compact}rank{rank}",
+                f"rank{rank}{compact}",
+                f"{base} {rank}",
+                f"{base} #{rank}",
+                f"{rank} {base}",
+            ]
+        )
+    return list(dict.fromkeys(aliases))
+
+
+PREDICTION_FIELD_ALIASES = [
+    "Predicted CPV",
+    "Predicted answer",
+    "Prediction",
+    "Predicted",
+    "Candidate",
+    "Answer CPV",
+    "Answer",
+    "CPV",
+    "Label",
+    "Code",
+]
+SCORE_FIELD_ALIASES = [
+    "Vector Score",
+    "RRF Score",
+    "Score",
+    "Confidence",
+    "Probability",
+    "Retrieval Score",
+    "Reranker Score",
+    "Final Score",
+]
+CHUNK_ID_FIELD_ALIASES = ["Chunk ID", "Chunk IDs", "Retrieved Chunk ID", "Retrieved Chunk IDs", "Candidate ID"]
+CHUNK_TITLE_FIELD_ALIASES = ["Chunk Titel", "Chunk Title", "Title", "Retrieved Chunk Title", "Candidate Title"]
+CHUNK_TEXT_FIELD_ALIASES = [
+    "Chunk Text",
+    "Chunk",
+    "Chunks",
+    "Retrieved Chunk Text",
+    "Retrieved Chunks",
+    "Retrieved Context",
+    "Context",
+    "Contexts",
+    "Candidate Text",
+]
+EXPECTED_FIELD_ALIASES = [
+    "Expected CPV",
+    "Gold CPV",
+    "Reference CPV",
+    "Expected Answer",
+    "Expected",
+    "Gold",
+    "Reference",
+    "Target",
+    "Label",
+]
+
+
+def _input_contract_fields() -> Dict[str, object]:
+    return {
+        "description": "One row per query or one row per ranked candidate. Multiple rows with the same id are treated as one ranked list.",
+        "fields": [
+            {
+                "name": "id",
+                "required": True,
+                "aliases": ["id", "query_id", "question_id", "banf_id"],
+                "description": "Stable record id used to group candidates belonging to one query.",
+            },
+            {
+                "name": "query",
+                "required": True,
+                "aliases": ["query", "question", "user_query", "query_banf", "banf"],
+                "description": "User request or source text to classify.",
+            },
+            {
+                "name": "expected_answer",
+                "required": True,
+                "aliases": ["expected", "expected_answer", "expected_cpv", "gold", "gold_cpv", "reference", "reference_cpv"],
+                "description": "Reference answer used for evaluation.",
+            },
+            {
+                "name": "predicted_answer",
+                "required": True,
+                "aliases": ["prediction", "predicted", "predicted_answer", "predicted_cpv", "answer", "candidate", "cpv", "label", "code"],
+                "description": "Predicted answer/candidate. For wide top-k files use ranked aliases such as predicted_answer_1, predicted_cpv_2, candidate_3.",
+            },
+            {
+                "name": "score",
+                "required": False,
+                "aliases": ["score", "confidence", "probability", "retrieval_score", "vector_score", "rrf_score", "reranker_score", "final_score"],
+                "description": "Candidate score. Raw scores are preserved and normalized only in diagnostics where needed.",
+            },
+            {
+                "name": "answer",
+                "required": False,
+                "aliases": ["answer", "llm_answer", "generated_answer", "final_answer", "rag_answer"],
+                "description": "Optional final answer text if the classifier/RAG system already generated one.",
+            },
+            {
+                "name": "candidate_text",
+                "required": False,
+                "aliases": ["chunk", "chunks", "chunk_text", "retrieved_chunks", "retrieved_context", "context", "candidate_text"],
+                "description": "Optional retrieved text or candidate description used for answer/retrieval diagnostics.",
+            },
+            {
+                "name": "candidate_title",
+                "required": False,
+                "aliases": ["title", "chunk_title", "retrieved_title", "candidate_title"],
+                "description": "Optional candidate title shown in reports and used for retrieval diagnostics.",
+            },
+            {
+                "name": "chunk_id",
+                "required": False,
+                "aliases": ["chunk_id", "chunk_ids", "retrieved_chunk_id", "retrieved_chunk_ids", "candidate_id"],
+                "description": "Optional source/candidate id for traceability.",
+            },
+        ],
+        "ranked_alias_rule": "Append rank numbers to candidate fields, e.g. predicted_answer_1 / score_1 / chunk_text_1 or Predicted CPV #1 / Vector Score #1.",
+    }
+
+
+def _classifier_payload_excluded_keys() -> set[str]:
+    keys = set()
+    for alias in PREDICTION_FIELD_ALIASES + SCORE_FIELD_ALIASES + ["id", "query", "user_query"]:
+        keys.add(alias)
+        keys.add(_normalize_header(alias))
+    return keys
+
+
+def _classifier_next_steps(classifier_type: str) -> List[Dict[str, str]]:
+    common = [
+        {
+            "area": "ranked_output",
+            "step": "Return a ranked list with stable scores and candidate ids, not only the top answer.",
+            "why": "This makes top-1 accuracy, candidate coverage, MRR, calibration, and reranking failures separable.",
+        },
+        {
+            "area": "calibration",
+            "step": "Keep raw confidence/retrieval/reranker scores for every candidate.",
+            "why": "Reliability curves and review thresholds need the original score signal.",
+        },
+    ]
+    if classifier_type == "prepared_rag_results":
+        return [
+            *common,
+            {
+                "area": "input_schema",
+                "step": "Use shared aliases for expected answer, predictions, scores, chunk text, and chunk ids.",
+                "why": "A consistent schema lets the same evaluator compare prepared files, API output, and live chat checks.",
+            },
+        ]
+    if classifier_type == "api_classifier":
+        return [
+            *common,
+            {
+                "area": "api_contract",
+                "step": "Expose top-k candidates, scores, optional explanation, and source/context metadata in one response.",
+                "why": "The evaluator can then distinguish candidate generation failures from selection or prompt failures.",
+            },
+        ]
+    return common
 
 
 def _cell_ref_to_column_index(cell_ref: str) -> int:
@@ -240,59 +444,25 @@ def _parse_float(value: object, fallback: float | None = None) -> float | None:
 
 def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> List[Dict[str, object]]:
     candidates: List[Dict[str, object]] = []
+    prediction_bases = {_normalize_header(base) for base in PREDICTION_FIELD_ALIASES}
     numbered_ranks = sorted(
         {
             int(match.group(1))
             for key in row
-            for match in [re.fullmatch(r"predictedcpv(\d+)", str(key))]
-            if match
+            for normalized_key in [_normalize_header(key)]
+            for match in [re.search(r"(\d+)$", normalized_key)]
+            if match and normalized_key[: match.start(1)] in prediction_bases
         }
     )
     for rank in numbered_ranks:
-        predicted_codes = _extract_cpv_codes(row.get(f"predictedcpv{rank}"))
+        predicted_codes = _extract_cpv_codes(_first_present(row, _ranked_aliases(rank, PREDICTION_FIELD_ALIASES)))
         if not predicted_codes:
             continue
-        score_raw = _first_present(
-            row,
-            [
-                f"vectorscore{rank}",
-                f"rrfscore{rank}",
-                f"score{rank}",
-                f"confidence{rank}",
-                f"probability{rank}",
-                f"retrievalscore{rank}",
-            ],
-        )
+        score_raw = _first_present(row, _ranked_aliases(rank, SCORE_FIELD_ALIASES))
         base_score = _parse_float(score_raw, fallback=max(0.0, 1.0 - rank * 0.001))
-        chunk_id = _first_present(
-            row,
-            [
-                f"chunkid{rank}",
-                f"chunkids{rank}",
-                f"retrievedchunkid{rank}",
-                f"retrievedchunkids{rank}",
-            ],
-        )
-        chunk_title = _first_present(
-            row,
-            [
-                f"chunktitel{rank}",
-                f"chunktitle{rank}",
-                f"title{rank}",
-                f"retrievedchunktitle{rank}",
-            ],
-        )
-        chunk_text = _first_present(
-            row,
-            [
-                f"chunktext{rank}",
-                f"chunk{rank}",
-                f"chunks{rank}",
-                f"retrievedchunktext{rank}",
-                f"retrievedchunks{rank}",
-                f"context{rank}",
-            ],
-        )
+        chunk_id = _first_present(row, _ranked_aliases(rank, CHUNK_ID_FIELD_ALIASES))
+        chunk_title = _first_present(row, _ranked_aliases(rank, CHUNK_TITLE_FIELD_ALIASES))
+        chunk_text = _first_present(row, _ranked_aliases(rank, CHUNK_TEXT_FIELD_ALIASES))
         for offset, predicted_code in enumerate(predicted_codes):
             candidates.append(
                 {
@@ -309,12 +479,10 @@ def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> 
     if candidates:
         return candidates
 
-    predicted_codes = _extract_cpv_codes(
-        _first_present(row, ["predictedcpv", "prediction", "predicted", "cpv", "answercpv"])
-    )
+    predicted_codes = _extract_cpv_codes(_first_present(row, PREDICTION_FIELD_ALIASES))
     if not predicted_codes:
         predicted_codes = [""]
-    score_raw = _first_present(row, ["rrfscore", "vectorscore", "score", "confidence", "probability", "retrievalscore"])
+    score_raw = _first_present(row, SCORE_FIELD_ALIASES)
     base_score = _parse_float(score_raw, fallback=max(0.0, 1.0 - row_index * 0.001))
     rank_raw = _first_present(row, ["rank", "position", "candidate_rank", "topkrank"])
     try:
@@ -326,16 +494,9 @@ def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> 
             "label": predicted_code,
             "score": float(base_score or 0.0) - (offset * 0.000001),
             "rank": rank_value,
-            "chunk_id": str(
-                _first_present(row, ["chunkid", "chunkids", "retrievedchunkids", "retrievedchunkid"])
-            ).strip(),
-            "chunk_title": str(_first_present(row, ["chunktitel", "chunktitle", "title"])).strip(),
-            "chunk_text": str(
-                _first_present(
-                    row,
-                    ["chunk", "chunks", "chunktext", "retrievedchunks", "retrievedchunktext", "context", "contexts"],
-                )
-            ).strip(),
+            "chunk_id": str(_first_present(row, CHUNK_ID_FIELD_ALIASES)).strip(),
+            "chunk_title": str(_first_present(row, CHUNK_TITLE_FIELD_ALIASES)).strip(),
+            "chunk_text": str(_first_present(row, CHUNK_TEXT_FIELD_ALIASES)).strip(),
             "source_row": row,
             "source_row_index": row_index,
         }
@@ -401,9 +562,9 @@ def _prepared_candidate_row(
     row["chunking_strategy"] = "prepared_result"
     row["source_type"] = "prepared_rag_result"
     source_row = candidate["source_row"]
-    chunk_id = _first_present(source_row, ["chunkid", "chunkids", "retrievedchunkids", "retrievedchunkid"])
-    chunk_text = _first_present(source_row, ["chunk", "chunks", "chunktext", "retrievedchunks", "retrievedchunktext", "context", "contexts"])
-    chunk_title = _first_present(source_row, ["chunktitel", "chunktitle", "title", "retrievedchunktitle"])
+    chunk_id = _first_present(source_row, CHUNK_ID_FIELD_ALIASES)
+    chunk_text = _first_present(source_row, CHUNK_TEXT_FIELD_ALIASES)
+    chunk_title = _first_present(source_row, CHUNK_TITLE_FIELD_ALIASES)
     if candidate.get("chunk_id"):
         chunk_id = candidate["chunk_id"]
     if candidate.get("chunk_text"):
@@ -566,6 +727,9 @@ def _standardize_rag_results_columns(df):
     leading_columns = [
         "question_id",
         "question",
+        "retrieval_query",
+        "query_augmentation_mode",
+        "query_augmentation_status",
         "gold_answer",
         "expected_keywords",
         "retrieved_chunks",
@@ -612,6 +776,11 @@ def _retrieved_chunks_payload(rows: List[Dict[str, object]]) -> str:
                 "rank": rank,
                 "chunk_id": row.get("chunk_id", ""),
                 "score": row.get("score"),
+                "base_retrieval_score": row.get("base_retrieval_score"),
+                "kg_graph_score": row.get("kg_graph_score"),
+                "retrieval_source": row.get("retrieval_source", "vector"),
+                "kg_candidate_reason": row.get("kg_candidate_reason", ""),
+                "kg_path": row.get("kg_path", ""),
                 "doc_id": row.get("doc_id", ""),
                 "title": row.get("title", ""),
                 "text": row.get("text", ""),
@@ -839,6 +1008,14 @@ def _cpv_rank_diagnostics(
     }
 
 
+def _json_list(value: object) -> str:
+    if value is None:
+        return "[]"
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _average_numeric(rows: List[Dict[str, object]], key: str) -> float | None:
     values = [
         float(row[key])
@@ -930,6 +1107,26 @@ def _summarize_cpv_diagnostics(rows: List[Dict[str, object]], *, top_k: int) -> 
             {"pair": pair, "count": count}
             for pair, count in confusion_pairs.most_common(10)
         ],
+        "kg": {
+            "enabled_rate": _rate(rows, "kg_enabled"),
+            "mean_candidate_pool_size": _average_numeric(rows, "kg_candidate_pool_size"),
+            "mean_added_candidate_count": _average_numeric(rows, "kg_added_candidate_count"),
+            "mean_useful_added_candidate_count": _average_numeric(rows, "kg_useful_added_candidate_count"),
+            "strict_gold_delta_rate": _rate(rows, "kg_strict_gold_delta"),
+            "expansion_gold_added_rate": _rate(rows, "kg_expansion_gold_added"),
+            "expansion_gold_available_rate": _rate(rows, "kg_expansion_gold_available"),
+            "mean_expansion_noise_rate": _average_numeric(rows, "kg_expansion_noise_rate"),
+            "branch_recall_at_k": _rate(rows, "branch_recall_at_k"),
+            "class_recall_at_k": _rate(rows, "class_recall_at_k"),
+            "sibling_disambiguation_success_rate": _rate(rows, "sibling_disambiguation_success"),
+            "oracle_rerank_ceiling_rate": _rate(rows, "oracle_rerank_ceiling"),
+            "oracle_pool_gap_rate": _rate(rows, "kg_oracle_pool_gap"),
+            "path_explanation_coverage": _average_numeric(rows, "path_explanation_coverage"),
+            "path_coverage_at_k": _average_numeric(rows, "kg_path_coverage_at_k"),
+            "ppr_path_share": _average_numeric(rows, "kg_ppr_path_share"),
+            "sibling_path_share": _average_numeric(rows, "kg_sibling_path_share"),
+            "hierarchy_path_share": _average_numeric(rows, "kg_hierarchy_path_share"),
+        },
         "additional_data_that_would_help": data_needs,
     }
 
@@ -1039,6 +1236,16 @@ def evaluate_local_ted_cpv_classifier(
     create_showcase: bool,
     rerank_top_n: int = 0,
     rerank_weight: float = 0.25,
+    cross_encoder_rerank: bool = False,
+    cross_encoder_model: str | None = None,
+    cross_encoder_top_n: int = 10,
+    kg_enabled: bool = False,
+    kg_graph_weight: float = 0.35,
+    kg_profile: str = "balanced",
+    kg_algorithm: str | None = None,
+    llm_config: LLMConfig | None = None,
+    query_augmentation: str | None = None,
+    query_augmentation_max_terms: int = 8,
 ) -> Dict[str, object]:
     import pandas as pd
 
@@ -1046,6 +1253,8 @@ def evaluate_local_ted_cpv_classifier(
     queries = load_queries(queries_path)
     chunks = build_cpv_chunks(catalog, use_examples=use_examples)
     retriever_state = build_retriever(chunks, retriever, embedding_model)
+    cpv_graph = build_cpv_knowledge_graph(catalog) if kg_enabled else None
+    chunks_by_code = {str(chunk["cpv_code"]): chunk for chunk in chunks}
     # mean_cpv_hierarchy_similarity_top1 shows how close top-1 is to the reference label.
     parent_lookup = build_parent_lookup(catalog)
     label_by_code = {record.code: record.label for record in catalog}
@@ -1058,20 +1267,87 @@ def evaluate_local_ted_cpv_classifier(
     retrieval_metric_rows: List[Dict[str, object]] = []
     diagnostic_rows: List[Dict[str, object]] = []
 
+    resolved_cross_encoder_model = cross_encoder_model or DEFAULT_CROSS_ENCODER_MODEL
+    ce_top_n = max(1, int(cross_encoder_top_n)) if cross_encoder_rerank else 0
+    candidate_k = max(top_k, ce_top_n) if cross_encoder_rerank else top_k
+
+    pool_size = min(
+        max(top_k, rerank_top_n or top_k, ce_top_n, 25 if kg_enabled else top_k),
+        len(chunks),
+    )
+    effective_rerank_top_n = rerank_top_n if rerank_top_n else (10 if kg_enabled else 0)
+    effective_rerank_weight = rerank_weight if rerank_top_n else (0.3 if kg_enabled else 0.25)
+    resolved_query_augmentation = query_augmentation or "none"
+    base_llm_config = llm_config or LLMConfig(False, "gpt-4.1-mini", "OPENAI_API_KEY", 0.0)
+
     for query in queries:
-        retrieved = retrieve_top_k(
-            query=query.query,
+        query_augmentation_config = (
+            LLMConfig(True, base_llm_config.model, base_llm_config.api_key_env, 0.0)
+            if resolved_query_augmentation in {"llm", "hyde"}
+            else base_llm_config
+        )
+        query_augmentation_result = augment_query_with_llm(
+            query.query,
+            query_augmentation_config,
+            mode=resolved_query_augmentation,
+            max_terms=query_augmentation_max_terms,
+        )
+        retrieval_query = query_augmentation_result.answer or query.query
+
+        base_retrieved = retrieve_top_k(
+            query=retrieval_query,
             retriever_state=retriever_state,
             chunks=chunks,
-            k=min(max(top_k, rerank_top_n or top_k), len(chunks)),
+            k=pool_size,
         )
-        retrieved = rerank_with_lexical_signal(
-            query=query.query,
-            rows=retrieved,
-            top_k=min(top_k, len(retrieved)),
-            rerank_top_n=rerank_top_n,
-            rerank_weight=rerank_weight,
+        base_retrieved = rerank_with_lexical_signal(
+            query=retrieval_query,
+            rows=base_retrieved,
+            top_k=min(max(top_k, 25 if kg_enabled else top_k), len(base_retrieved)),
+            rerank_top_n=effective_rerank_top_n,
+            rerank_weight=effective_rerank_weight,
         )
+        kg_retrieval = {
+            "enabled": False,
+            "base_codes": [str(row["cpv_code"]) for row in base_retrieved[:top_k]],
+            "candidate_pool_codes": [str(row["cpv_code"]) for row in base_retrieved],
+            "added_codes": [],
+            "paths": {},
+        }
+        if kg_enabled and cpv_graph is not None:
+            retrieved, kg_retrieval = graph_expand_and_rerank_cpv(
+                query=retrieval_query,
+                base_rows=base_retrieved,
+                chunks_by_code=chunks_by_code,
+                graph=cpv_graph,
+                top_k=min(candidate_k, len(chunks)),
+                graph_weight=kg_graph_weight,
+                kg_profile=kg_profile,
+                graph_algorithm=kg_algorithm,
+            )
+        else:
+            retrieved = base_retrieved[: min(candidate_k, len(base_retrieved))]
+
+        if cross_encoder_rerank:
+            ce_source = [
+                dict(row)
+                for row in (
+                    kg_retrieval.get("pool_rows")
+                    if kg_enabled and kg_retrieval.get("pool_rows")
+                    else retrieved
+                )
+            ]
+            ce_source.sort(key=lambda row: float(row.get("score") or 0.0), reverse=True)
+            retrieved = rerank_with_cross_encoder(
+                query=retrieval_query,
+                rows=ce_source[: min(ce_top_n, len(ce_source))],
+                top_k=min(top_k, len(chunks)),
+                rerank_top_n=ce_top_n,
+                model_name=resolved_cross_encoder_model,
+            )
+        else:
+            retrieved = retrieved[: min(top_k, len(retrieved))]
+
         prediction_records.append(
             PredictionRecord(
                 id=query.id,
@@ -1079,7 +1355,12 @@ def evaluate_local_ted_cpv_classifier(
                     RankedCandidate(label=str(row["cpv_code"]), score=float(row["score"]))
                     for row in retrieved
                 ],
-                metadata={"query": query.query},
+                metadata={
+                    "query": query.query,
+                    "retrieval_query": retrieval_query,
+                    "query_augmentation_mode": resolved_query_augmentation,
+                    "query_augmentation_status": query_augmentation_result.status,
+                },
             )
         )
 
@@ -1135,6 +1416,15 @@ def evaluate_local_ted_cpv_classifier(
             top_k=top_k,
             prediction_confidence=prediction_confidence,
         )
+        cpv_graph_metrics = cpv_kg_metrics(
+            gold_code=query.gold_cpv_code,
+            base_codes=kg_retrieval["base_codes"],
+            final_codes=[str(row["cpv_code"]) for row in retrieved[:top_k]],
+            candidate_pool_codes=kg_retrieval["candidate_pool_codes"],
+            added_codes=kg_retrieval["added_codes"],
+            paths=kg_retrieval["paths"],
+            top_k=top_k,
+        ) if kg_enabled else {}
 
         for rank, row in enumerate(retrieved, start=1):
             relevance_grade = retrieval_relevance_grade(item, row)
@@ -1142,11 +1432,21 @@ def evaluate_local_ted_cpv_classifier(
                 {
                     "question_id": query.id,
                     "question": query.query,
+                    "retrieval_query": retrieval_query,
+                    "query_augmentation_mode": resolved_query_augmentation,
+                    "query_augmentation_status": query_augmentation_result.status,
                     "rank": rank,
                     "auto_flag": classifier_auto_flag,
                     "retriever": retriever,
                     "chunk_id": row["chunk_id"],
                     "score": row["score"],
+                    "base_retrieval_score": row.get("base_retrieval_score", row["score"]),
+                    "cross_encoder_score": row.get("cross_encoder_score", 0.0),
+                    "kg_graph_score": row.get("kg_graph_score", 0.0),
+                    "kg_path_score": row.get("kg_path_score", 0.0),
+                    "retrieval_source": row.get("retrieval_source", "vector"),
+                    "kg_candidate_reason": row.get("kg_candidate_reason", ""),
+                    "kg_path": row.get("kg_path", ""),
                     "doc_id": row["doc_id"],
                     "section_id": row["section_id"],
                     "title": row["title"],
@@ -1162,6 +1462,9 @@ def evaluate_local_ted_cpv_classifier(
             {
                 "question_id": query.id,
                 "question": query.query,
+                "retrieval_query": retrieval_query,
+                "query_augmentation_mode": resolved_query_augmentation,
+                "query_augmentation_status": query_augmentation_result.status,
                 **classification_metrics,
                 "answer_accuracy_label": classifier_auto_flag,
                 "expected_answerable": answer_metrics.expected_answerable,
@@ -1208,6 +1511,9 @@ def evaluate_local_ted_cpv_classifier(
             {
                 "question_id": query.id,
                 "question": query.query,
+                "retrieval_query": retrieval_query,
+                "query_augmentation_mode": resolved_query_augmentation,
+                "query_augmentation_status": query_augmentation_result.status,
                 **classification_metrics,
                 "program_id": "cpv",
                 "program_name": "CPV",
@@ -1229,6 +1535,9 @@ def evaluate_local_ted_cpv_classifier(
             {
                 "question_id": query.id,
                 "question": query.query,
+                "retrieval_query": retrieval_query,
+                "query_augmentation_mode": resolved_query_augmentation,
+                "query_augmentation_status": query_augmentation_result.status,
                 "program_id": "cpv",
                 "program_name": "CPV",
                 "doc_id": query.gold_cpv_code,
@@ -1237,6 +1546,9 @@ def evaluate_local_ted_cpv_classifier(
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
                 **cpv_rank_diagnostics,
+                **cpv_graph_metrics,
+                "kg_candidate_added_codes": _json_list(cpv_graph_metrics.get("kg_candidate_added_codes")),
+                "kg_candidate_pool_codes": _json_list(cpv_graph_metrics.get("kg_candidate_pool_codes")),
                 "runtime_retrieval_status": answer_metrics.runtime_retrieval_status,
                 "context_claim_recall": answer_metrics.context_claim_recall,
                 "grounded_claim_ratio": answer_metrics.grounded_claim_ratio,
@@ -1251,6 +1563,9 @@ def evaluate_local_ted_cpv_classifier(
                 {
                 "question_id": query.id,
                 "question": query.query,
+                "retrieval_query": retrieval_query,
+                "query_augmentation_mode": resolved_query_augmentation,
+                "query_augmentation_status": query_augmentation_result.status,
                 "program_id": "cpv",
                 "program_name": "CPV",
                 "doc_id": query.gold_cpv_code,
@@ -1260,6 +1575,7 @@ def evaluate_local_ted_cpv_classifier(
                 "expected_keywords": json.dumps(item["expected_keywords"], ensure_ascii=False),
                 **classification_metrics,
                 **cpv_rank_diagnostics,
+                **cpv_graph_metrics,
                 **_all_retrieval_metric_fields(retrieval_metrics),
                 **_all_answer_metric_fields(answer_metrics),
                 "expected_answerable": answer_metrics.expected_answerable,
@@ -1270,7 +1586,12 @@ def evaluate_local_ted_cpv_classifier(
                 "prediction_confidence": prediction_confidence,
                 "retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved], ensure_ascii=False),
                 "retrieved_chunks": _retrieved_chunks_payload(retrieved),
-                "base_retrieved_chunk_ids": json.dumps([row["chunk_id"] for row in retrieved], ensure_ascii=False),
+                "base_retrieved_chunk_ids": json.dumps(
+                    [row["chunk_id"] for row in base_retrieved[:top_k]], ensure_ascii=False
+                ),
+                "kg_candidate_added_codes": _json_list(cpv_graph_metrics.get("kg_candidate_added_codes")),
+                "kg_candidate_pool_codes": _json_list(cpv_graph_metrics.get("kg_candidate_pool_codes")),
+                "kg_top1_path": cpv_graph_metrics.get("kg_top1_path", ""),
                 "mrr_at_k": retrieval_metrics["mrr_at_k"],
                 "ndcg_at_k": retrieval_metrics["ndcg_at_k"],
                 "recall_at_k": retrieval_metrics["recall_at_k"],
@@ -1387,6 +1708,12 @@ def evaluate_local_ted_cpv_classifier(
             "top_n": rerank_top_n,
             "weight": rerank_weight,
         },
+        "cross_encoder_reranker": {
+            "enabled": cross_encoder_rerank,
+            "type": "cross_encoder",
+            "model": resolved_cross_encoder_model if cross_encoder_rerank else None,
+            "top_n": ce_top_n if cross_encoder_rerank else 0,
+        },
         "n_chunks": len(chunks),
         "n_questions": len(queries),
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
@@ -1395,14 +1722,26 @@ def evaluate_local_ted_cpv_classifier(
         "retrieval_metrics": aggregate_retrieval_metrics,
         "diagnostics": aggregate_diagnostics,
         "llm": {
-            "enabled": False,
-            "model": None,
+            "enabled": base_llm_config.enabled or resolved_query_augmentation in {"llm", "hyde"},
+            "model": base_llm_config.model if (base_llm_config.enabled or resolved_query_augmentation in {"llm", "hyde"}) else None,
             "answer_generation": False,
+        },
+        "evaluation_settings": {
+            "query_augmentation": resolved_query_augmentation,
+            "query_augmentation_max_terms": query_augmentation_max_terms,
         },
         "classifier": {
             "type": "ted_cpv",
             "label": classifier_label,
             "use_examples": use_examples,
+            "kg": {
+                "enabled": kg_enabled,
+                "type": "cpv_taxonomy_graph",
+                "graph_weight": kg_graph_weight if kg_enabled else None,
+                "profile": kg_profile if kg_enabled else None,
+                "algorithm": kg_algorithm if kg_enabled else None,
+                "n_nodes": len(cpv_graph.nodes) if cpv_graph is not None else 0,
+            },
             "avg_top1_top2_margin": (
                 sum(top1_top2_margins) / len(top1_top2_margins) if top1_top2_margins else None
             ),
@@ -1493,9 +1832,7 @@ def evaluate_prepared_rag_results_classifier(
     for row_index, row in enumerate(rows, start=1):
         query_id = str(_first_present(row, ["id", "queryid", "questionid", "banfid"]) or row_index).strip()
         query_text = str(_first_present(row, ["querybanf", "query", "question", "banf"]) or "").strip()
-        expected_codes = _extract_cpv_codes(
-            _first_present(row, ["expectedcpv", "goldcpv", "referencecpv", "expected", "gold"])
-        )
+        expected_codes = _extract_cpv_codes(_first_present(row, EXPECTED_FIELD_ALIASES))
         llm_answer = str(
             _first_present(row, ["llmanswer", "answer", "generatedanswer", "finalanswer", "raganswer"]) or ""
         ).strip()
@@ -1958,7 +2295,8 @@ def evaluate_prepared_rag_results_classifier(
             "calibration": classifier_calibration,
             "cpv_diagnostics": aggregate_cpv_diagnostics,
             "input_contract": {
-                "current_columns": ["ID", "Query", "Expected answer", "Predicted answer", "Score"],
+                **_input_contract_fields(),
+                "current_columns": list(rows[0].keys()) if rows else [],
                 "current_top_k_columns": [
                     "Predicted answer #1",
                     "Score #1",
@@ -1967,19 +2305,9 @@ def evaluate_prepared_rag_results_classifier(
                     "Predicted answer #3",
                     "Score #3",
                 ],
-                "supported_future_columns": [
-                    "Rank",
-                    "Score",
-                    "Confidence",
-                    "LLM Answer",
-                    "Answer",
-                    "Chunks",
-                    "Chunk Text",
-                    "Retrieved Chunks",
-                    "Chunk ID",
-                ],
-                "top_k_layout": "Multiple rows with the same ID are treated as ranked candidates for one query.",
+                "top_k_layout": "Multiple rows with the same ID are treated as ranked candidates for one query; wide ranked columns with #1/#2/#3 are also supported.",
             },
+            "recommended_next_steps": _classifier_next_steps("prepared_rag_results"),
         },
         "visualization": {
             "enabled": create_visualization or create_showcase,
@@ -2109,7 +2437,12 @@ def evaluate_api_ted_cpv_classifier(
                 RankedCandidate(
                     label=label,
                     score=score,
-                    metadata={k: v for k, v in candidate.items() if k not in {"label", "cpv_code", "answer", "id", "code", "score", "confidence", "probability"}},
+                    metadata={
+                        k: v
+                        for k, v in candidate.items()
+                        if k not in _classifier_payload_excluded_keys()
+                        and _normalize_header(k) not in _classifier_payload_excluded_keys()
+                    },
                 )
             )
             retrieved_rows_for_query.append(
@@ -2315,6 +2648,9 @@ def evaluate_api_ted_cpv_classifier(
                 {
                     "question_id": query.id,
                     "question": query.query,
+                    "retrieval_query": retrieval_query,
+                    "query_augmentation_mode": resolved_query_augmentation,
+                    "query_augmentation_status": query_augmentation_result.status,
                     "program_id": "cpv",
                     "program_name": "CPV",
                     "doc_id": query.gold_cpv_code,
@@ -2480,17 +2816,17 @@ def evaluate_api_ted_cpv_classifier(
             "ranking_metrics": ranking_metrics,
             "calibration": classifier_calibration,
             "cpv_diagnostics": aggregate_cpv_diagnostics,
-            "response_contract": {
-                "required": ["id", "query", "predictions[].label|cpv_code|answer", "predictions[].score|confidence"],
-                "optional": [
-                    "answer",
-                    "explanation",
-                    "metadata",
-                    "confidence",
-                    "retrieved_contexts",
-                    "latency_ms",
-                ],
+            "request_contract": {
+                "required": ["id", "query", "top_k"],
+                "description": "The evaluator sends one query per request and expects a ranked candidate list back.",
             },
+            "response_contract": {
+                **_input_contract_fields(),
+                "required": ["id", "query", "predictions"],
+                "prediction_list_aliases": ["predictions", "top_k_answers"],
+                "optional": ["answer", "explanation", "metadata", "latency_ms"],
+            },
+            "recommended_next_steps": _classifier_next_steps("api_classifier"),
         },
         "visualization": {
             "enabled": create_visualization or create_showcase,

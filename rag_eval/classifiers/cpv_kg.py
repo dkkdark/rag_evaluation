@@ -1,0 +1,989 @@
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List, Sequence
+
+from rag_eval.classifiers.cpv_baseline import CPVRecord, build_parent_lookup
+from rag_eval.evaluation.core import best_cpv_hierarchy_match
+from rag_eval.retrieval.engines import lexical_overlap_score, min_max_normalize
+
+
+CPV_LEVELS = [2, 4, 6, 8]
+CPV_DEFAULT_POOL_SIZE = 40
+
+CPV_SELECTION_WEIGHTS = {
+    "base": 0.52,
+    "lexical": 0.33,
+    "graph": 0.15,
+    "sibling_boost": 0.22,
+    "class_cluster_boost": 0.16,
+}
+CPV_REFINEMENT_BASE_WINDOW = 15
+CPV_REFINEMENT_SEED_WINDOW = 5
+
+
+@dataclass
+class CPVGraphNode:
+    code: str
+    label: str
+    description: str
+    parent_code: str
+    path_codes: List[str]
+    path_labels: List[str]
+    examples: List[str]
+
+
+@dataclass
+class CPVKnowledgeGraph:
+    nodes: Dict[str, CPVGraphNode]
+    parent_lookup: Dict[str, str]
+    children_lookup: Dict[str, List[str]]
+    sibling_lookup: Dict[str, List[str]]
+
+
+def normalize_cpv_code(value: str) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits if len(digits) == 8 else ""
+
+
+def cpv_prefix_code(code: str, width: int) -> str:
+    normalized = normalize_cpv_code(code)
+    if not normalized or width > len(normalized):
+        return ""
+    return normalized[:width] + ("0" * (8 - width))
+
+
+def code_level(code: str) -> int:
+    normalized = normalize_cpv_code(code)
+    if not normalized:
+        return 0
+    for width in CPV_LEVELS:
+        candidate = cpv_prefix_code(normalized, width)
+        if candidate == normalized:
+            return width
+    return 8
+
+
+def build_children_lookup(parent_lookup: Dict[str, str]) -> Dict[str, List[str]]:
+    children: Dict[str, List[str]] = {}
+    for child, parent in parent_lookup.items():
+        if not child or not parent:
+            continue
+        children.setdefault(parent, []).append(child)
+    for rows in children.values():
+        rows.sort()
+    return children
+
+
+def ancestor_codes(code: str, parent_lookup: Dict[str, str], *, include_self: bool = True) -> List[str]:
+    current = normalize_cpv_code(code)
+    if not current:
+        return []
+    out = [current] if include_self else []
+    seen = set(out)
+    while current:
+        parent = parent_lookup.get(current, "")
+        if not parent or parent in seen:
+            break
+        out.append(parent)
+        seen.add(parent)
+        current = parent
+    return out
+
+
+def build_cpv_knowledge_graph(records: Sequence[CPVRecord]) -> CPVKnowledgeGraph:
+    parent_lookup = build_parent_lookup(records)
+    records_by_code = {record.code: record for record in records}
+    children_lookup = build_children_lookup(parent_lookup)
+
+    nodes: Dict[str, CPVGraphNode] = {}
+    for record in records:
+        path_codes = list(reversed(ancestor_codes(record.code, parent_lookup, include_self=True)))
+        path_labels = [
+            records_by_code[path_code].label
+            for path_code in path_codes
+            if path_code in records_by_code and records_by_code[path_code].label
+        ]
+        nodes[record.code] = CPVGraphNode(
+            code=record.code,
+            label=record.label,
+            description=record.description,
+            parent_code=parent_lookup.get(record.code, record.parent_code),
+            path_codes=path_codes,
+            path_labels=path_labels,
+            examples=list(record.examples),
+        )
+
+    sibling_lookup: Dict[str, List[str]] = {}
+    for code in nodes:
+        parent = parent_lookup.get(code, "")
+        if not parent:
+            sibling_lookup[code] = []
+            continue
+        sibling_lookup[code] = [sibling for sibling in children_lookup.get(parent, []) if sibling != code]
+
+    return CPVKnowledgeGraph(
+        nodes=nodes,
+        parent_lookup=parent_lookup,
+        children_lookup=children_lookup,
+        sibling_lookup=sibling_lookup,
+    )
+
+
+def cpv_path_text(node: CPVGraphNode) -> str:
+    parts = list(node.path_labels) + [node.label, node.description]
+    if node.examples:
+        parts.append(" ".join(node.examples[:3]))
+    return "\n".join(part for part in parts if part.strip())
+
+
+def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
+    profiles = {
+        "conservative": {
+            "algorithm": "hierarchy",
+            "max_siblings": 4,
+            "max_children": 6,
+            "max_seed_codes": 8,
+            "max_graph_candidates": 35,
+            "proximity_weight": 0.78,
+        },
+        "balanced": {
+            "algorithm": "hierarchy",
+            "max_siblings": 8,
+            "max_children": 12,
+            "max_seed_codes": 12,
+            "max_graph_candidates": 60,
+            "proximity_weight": 0.70,
+        },
+        "exploratory": {
+            "algorithm": "ppr",
+            "max_siblings": 16,
+            "max_children": 24,
+            "max_seed_codes": 18,
+            "max_graph_candidates": 120,
+            "proximity_weight": 0.62,
+        },
+        "ppr_only": {
+            "algorithm": "ppr",
+            "max_siblings": 12,
+            "max_children": 18,
+            "max_seed_codes": 12,
+            "max_graph_candidates": 80,
+            "proximity_weight": 0.68,
+        },
+        "direct_only": {
+            "algorithm": "hierarchy",
+            "max_siblings": 8,
+            "max_children": 12,
+            "max_seed_codes": 12,
+            "max_graph_candidates": 60,
+            "proximity_weight": 0.70,
+        },
+        "selection": {
+            "algorithm": "ppr",
+            "max_siblings": 24,
+            "max_children": 32,
+            "max_seed_codes": 20,
+            "max_graph_candidates": 160,
+            "proximity_weight": 0.62,
+        },
+    }
+    return dict(profiles.get(profile, profiles["balanced"]))
+
+
+def graph_neighbor_codes(
+    code: str,
+    graph: CPVKnowledgeGraph,
+    *,
+    max_siblings: int = 8,
+    max_children: int = 12,
+) -> Dict[str, str]:
+    neighbors: Dict[str, str] = {}
+    normalized = normalize_cpv_code(code)
+    if not normalized:
+        return neighbors
+
+    for ancestor in ancestor_codes(normalized, graph.parent_lookup, include_self=False):
+        if ancestor in graph.nodes:
+            neighbors.setdefault(ancestor, "ancestor")
+
+    siblings = graph.sibling_lookup.get(normalized, [])
+    for sibling in siblings[:max_siblings]:
+        if sibling in graph.nodes:
+            neighbors.setdefault(sibling, "sibling")
+
+    for child in graph.children_lookup.get(normalized, [])[:max_children]:
+        if child in graph.nodes:
+            neighbors.setdefault(child, "child")
+
+    return neighbors
+
+
+def _candidate_path(
+    *,
+    seed_code: str,
+    candidate_code: str,
+    relation_type: str,
+    graph: CPVKnowledgeGraph,
+) -> str:
+    seed_node = graph.nodes.get(seed_code)
+    candidate_node = graph.nodes.get(candidate_code)
+    if seed_node is None or candidate_node is None:
+        return relation_type
+    seed_label = seed_node.label or seed_code
+    candidate_label = candidate_node.label or candidate_code
+    return f"{seed_code} {seed_label} -[{relation_type}]- {candidate_code} {candidate_label}"
+
+
+def _candidate_rich_text(
+    code: str,
+    *,
+    graph: CPVKnowledgeGraph,
+    chunks_by_code: Dict[str, Dict[str, object]],
+) -> str:
+    node = graph.nodes.get(code)
+    chunk = chunks_by_code.get(code)
+    parts: List[str] = []
+    if node is not None:
+        parts.append(cpv_path_text(node))
+    if chunk is not None:
+        parts.append(str(chunk.get("title") or ""))
+        parts.append(str(chunk.get("text") or ""))
+    return "\n".join(part for part in parts if part.strip())
+
+
+def _expand_cpv_candidate_pool(
+    *,
+    query: str,
+    base_rows: Sequence[Dict[str, object]],
+    chunks_by_code: Dict[str, Dict[str, object]],
+    graph: CPVKnowledgeGraph,
+    kg_profile: str,
+    graph_algorithm: str | None = None,
+    max_seed_codes: int | None = None,
+    max_graph_candidates: int | None = None,
+) -> tuple[
+    List[str],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, float],
+    Dict[str, str],
+    Dict[str, str],
+    Dict[str, object],
+]:
+    settings = cpv_kg_profile_settings(kg_profile)
+    resolved_algorithm = graph_algorithm or str(settings["algorithm"])
+    resolved_max_seed_codes = int(max_seed_codes if max_seed_codes is not None else settings["max_seed_codes"])
+    resolved_max_graph_candidates = int(
+        max_graph_candidates if max_graph_candidates is not None else settings["max_graph_candidates"]
+    )
+    max_siblings = int(settings["max_siblings"])
+    max_children = int(settings["max_children"])
+    proximity_weight = float(settings["proximity_weight"])
+
+    base_codes = [
+        str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+        for row in base_rows
+        if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+    ]
+    if not base_codes:
+        return [], {}, {}, {}, {}, {}, {
+            "kg_profile": kg_profile,
+            "graph_algorithm": resolved_algorithm,
+            "kg_settings": settings,
+        }
+
+    base_scores = [float(row.get("score") or 0.0) for row in base_rows]
+    base_norm = dict(zip(base_codes, min_max_normalize(base_scores)))
+    seed_codes = list(dict.fromkeys(base_codes[:resolved_max_seed_codes]))
+
+    candidate_reasons: Dict[str, str] = {code: "base" for code in base_codes}
+    candidate_paths: Dict[str, str] = {}
+    proximity_scores: Dict[str, float] = {}
+    for rank, seed_code in enumerate(seed_codes):
+        seed_strength = max(base_norm.get(seed_code, 0.0), 1.0 / (rank + 1))
+        proximity_scores[seed_code] = max(proximity_scores.get(seed_code, 0.0), seed_strength)
+        for neighbor_code, relation_type in graph_neighbor_codes(
+            seed_code,
+            graph,
+            max_siblings=max_siblings,
+            max_children=max_children,
+        ).items():
+            if neighbor_code not in chunks_by_code:
+                continue
+            decay = {
+                "ancestor": 0.64,
+                "sibling": 0.52,
+                "child": 0.58,
+            }.get(relation_type, 0.45)
+            proximity_scores[neighbor_code] = max(
+                proximity_scores.get(neighbor_code, 0.0),
+                seed_strength * decay,
+            )
+            candidate_reasons.setdefault(neighbor_code, relation_type)
+            candidate_paths.setdefault(
+                neighbor_code,
+                _candidate_path(
+                    seed_code=seed_code,
+                    candidate_code=neighbor_code,
+                    relation_type=relation_type,
+                    graph=graph,
+                ),
+            )
+            if len(candidate_reasons) >= len(base_codes) + resolved_max_graph_candidates:
+                break
+    if resolved_algorithm == "ppr":
+        frontier = {code: proximity_scores.get(code, 0.0) for code in seed_codes}
+        for depth in range(3):
+            next_frontier: Dict[str, float] = {}
+            for seed_code, seed_strength in frontier.items():
+                for neighbor_code, relation_type in graph_neighbor_codes(
+                    seed_code,
+                    graph,
+                    max_siblings=max_siblings,
+                    max_children=max_children,
+                ).items():
+                    if neighbor_code not in chunks_by_code:
+                        continue
+                    decay = {"ancestor": 0.58, "sibling": 0.42, "child": 0.50}.get(relation_type, 0.35)
+                    score = seed_strength * decay * (0.72 ** depth)
+                    if score > proximity_scores.get(neighbor_code, 0.0):
+                        proximity_scores[neighbor_code] = score
+                        next_frontier[neighbor_code] = score
+                        candidate_reasons.setdefault(neighbor_code, f"ppr_{relation_type}")
+                        candidate_paths.setdefault(
+                            neighbor_code,
+                            _candidate_path(
+                                seed_code=seed_code,
+                                candidate_code=neighbor_code,
+                                relation_type=f"ppr_{relation_type}",
+                                graph=graph,
+                            ),
+                        )
+                    if len(candidate_reasons) >= len(base_codes) + resolved_max_graph_candidates:
+                        break
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    candidate_codes = list(candidate_reasons.keys())
+    lexical_scores: Dict[str, float] = {}
+    for code in candidate_codes:
+        node = graph.nodes.get(code)
+        chunk = chunks_by_code.get(code)
+        text = cpv_path_text(node) if node else str(chunk.get("text", "") if chunk else "")
+        lexical_scores[code] = lexical_overlap_score(query, text)
+    lexical_norm = dict(zip(candidate_codes, min_max_normalize([lexical_scores[code] for code in candidate_codes])))
+    graph_raw = [
+        proximity_weight * proximity_scores.get(code, 0.0) + (1.0 - proximity_weight) * lexical_norm.get(code, 0.0)
+        for code in candidate_codes
+    ]
+    graph_norm = dict(zip(candidate_codes, min_max_normalize(graph_raw)))
+
+    meta = {
+        "kg_profile": kg_profile,
+        "graph_algorithm": resolved_algorithm,
+        "kg_settings": {
+            "max_seed_codes": resolved_max_seed_codes,
+            "max_graph_candidates": resolved_max_graph_candidates,
+            "max_siblings": max_siblings,
+            "max_children": max_children,
+            "proximity_weight": proximity_weight,
+        },
+    }
+    return candidate_codes, base_norm, graph_norm, proximity_scores, candidate_reasons, candidate_paths, meta
+
+
+def graph_expand_cpv_pool(
+    *,
+    query: str,
+    base_rows: Sequence[Dict[str, object]],
+    chunks_by_code: Dict[str, Dict[str, object]],
+    graph: CPVKnowledgeGraph,
+    kg_profile: str = "balanced",
+    graph_algorithm: str | None = None,
+    max_seed_codes: int | None = None,
+    max_graph_candidates: int | None = None,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    (
+        candidate_codes,
+        base_norm,
+        graph_norm,
+        proximity_scores,
+        candidate_reasons,
+        candidate_paths,
+        meta,
+    ) = _expand_cpv_candidate_pool(
+        query=query,
+        base_rows=base_rows,
+        chunks_by_code=chunks_by_code,
+        graph=graph,
+        kg_profile=kg_profile,
+        graph_algorithm=graph_algorithm,
+        max_seed_codes=max_seed_codes,
+        max_graph_candidates=max_graph_candidates,
+    )
+    base_codes = [
+        str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+        for row in base_rows
+        if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+    ]
+    if not candidate_codes:
+        return list(base_rows), {
+            "enabled": True,
+            "base_codes": base_codes,
+            "candidate_pool_codes": base_codes,
+            "added_codes": [],
+            "paths": {},
+            **meta,
+        }
+
+    pool_rows: List[Dict[str, object]] = []
+    for code in candidate_codes:
+        chunk = chunks_by_code.get(code)
+        if chunk is None:
+            continue
+        row = dict(chunk)
+        row["base_retrieval_score"] = float(base_norm.get(code, 0.0))
+        row["kg_graph_score"] = float(graph_norm.get(code, 0.0))
+        row["kg_path_score"] = float(proximity_scores.get(code, 0.0))
+        row["score"] = float(base_norm.get(code, 0.0))
+        row["retriever"] = "cpv_kg_augmented" if code not in base_norm else str(
+            next((base_row.get("retriever", "") for base_row in base_rows if base_row.get("cpv_code") == code), "")
+        )
+        row["retrieval_source"] = (
+            "vector+graph" if code in base_norm and graph_norm.get(code, 0.0) > 0 else "graph" if code not in base_norm else "vector"
+        )
+        row["kg_candidate_reason"] = candidate_reasons.get(code, "")
+        row["kg_path"] = candidate_paths.get(code, "")
+        pool_rows.append(row)
+
+    added_codes = [code for code in candidate_codes if code not in set(base_codes)]
+    return pool_rows, {
+        "enabled": True,
+        "base_codes": base_codes,
+        "candidate_pool_codes": candidate_codes,
+        "added_codes": added_codes,
+        "paths": candidate_paths,
+        **meta,
+    }
+
+
+def _group_codes_by_prefix(codes: Sequence[str], prefix_len: int) -> Dict[str, List[str]]:
+    groups: Dict[str, List[str]] = defaultdict(list)
+    for code in codes:
+        normalized = normalize_cpv_code(code)
+        if len(normalized) >= prefix_len:
+            groups[normalized[:prefix_len]].append(normalized)
+    return dict(groups)
+
+
+def _refinement_candidate_codes(
+    pool_codes: Sequence[str],
+    *,
+    graph: CPVKnowledgeGraph,
+    base_scores: Dict[str, float],
+    rows_by_code: Dict[str, Dict[str, object]],
+) -> set[str]:
+    base_sorted = sorted(pool_codes, key=lambda code: base_scores.get(code, 0.0), reverse=True)
+    refinement = set(base_sorted[:CPV_REFINEMENT_BASE_WINDOW])
+    for code in base_sorted[:CPV_REFINEMENT_SEED_WINDOW]:
+        for sibling in graph.sibling_lookup.get(code, []):
+            if sibling in rows_by_code:
+                refinement.add(sibling)
+        parent = graph.parent_lookup.get(code, "")
+        if parent:
+            for child in graph.children_lookup.get(parent, []):
+                if child in rows_by_code:
+                    refinement.add(child)
+    for code in pool_codes:
+        row = rows_by_code.get(code, {})
+        reason = str(row.get("kg_candidate_reason") or "")
+        if reason and reason != "base":
+            refinement.add(code)
+    return refinement
+
+
+def hierarchy_select_cpv_candidates(
+    *,
+    query: str,
+    pool_rows: Sequence[Dict[str, object]],
+    graph: CPVKnowledgeGraph,
+    chunks_by_code: Dict[str, Dict[str, object]],
+    top_k: int,
+    selection_weights: Dict[str, float] | None = None,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    weights = dict(CPV_SELECTION_WEIGHTS)
+    if selection_weights:
+        weights.update(selection_weights)
+
+    if top_k <= 0 or not pool_rows:
+        return [], {"selection_enabled": True, "pool_size": 0}
+
+    pool_codes = [
+        str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+        for row in pool_rows
+        if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+    ]
+    if not pool_codes:
+        return [], {"selection_enabled": True, "pool_size": 0}
+
+    rows_by_code = {
+        str(row.get("cpv_code") or row.get("chunk_id") or "").strip(): dict(row)
+        for row in pool_rows
+    }
+
+    lexical_scores = {
+        code: lexical_overlap_score(
+            query,
+            _candidate_rich_text(code, graph=graph, chunks_by_code=chunks_by_code),
+        )
+        for code in pool_codes
+    }
+    base_scores = {
+        code: float(rows_by_code[code].get("base_retrieval_score", rows_by_code[code].get("score", 0.0)))
+        for code in pool_codes
+    }
+    graph_scores = {
+        code: float(rows_by_code[code].get("kg_graph_score", 0.0))
+        for code in pool_codes
+    }
+
+    base_norm = dict(zip(pool_codes, min_max_normalize([base_scores[code] for code in pool_codes])))
+    lexical_norm = dict(zip(pool_codes, min_max_normalize([lexical_scores[code] for code in pool_codes])))
+    graph_norm = dict(zip(pool_codes, min_max_normalize([graph_scores[code] for code in pool_codes])))
+
+    final_scores: Dict[str, float] = {}
+    sibling_boost_applied: Dict[str, float] = {}
+    class_boost_applied: Dict[str, float] = {}
+    refinement_codes = _refinement_candidate_codes(
+        pool_codes,
+        graph=graph,
+        base_scores=base_scores,
+        rows_by_code=rows_by_code,
+    )
+    for code in pool_codes:
+        final_scores[code] = float(base_scores.get(code, 0.0))
+
+    for code in refinement_codes:
+        final_scores[code] = (
+            weights["base"] * base_norm.get(code, 0.0)
+            + weights["lexical"] * lexical_norm.get(code, 0.0)
+            + weights["graph"] * graph_norm.get(code, 0.0)
+        )
+
+    parent_groups: Dict[str, List[str]] = defaultdict(list)
+    for code in refinement_codes:
+        parent = graph.parent_lookup.get(code, "")
+        if parent:
+            parent_groups[parent].append(code)
+    for siblings in parent_groups.values():
+        if len(siblings) < 2:
+            continue
+        sibling_lex = [lexical_norm.get(code, 0.0) for code in siblings]
+        max_lex = max(sibling_lex) if sibling_lex else 0.0
+        if max_lex <= 0.0:
+            continue
+        for code in siblings:
+            boost = weights["sibling_boost"] * (lexical_norm.get(code, 0.0) / max_lex)
+            final_scores[code] += boost
+            sibling_boost_applied[code] = boost
+
+    for prefix_len in (6, 4):
+        for _, members in _group_codes_by_prefix(list(refinement_codes), prefix_len).items():
+            if len(members) < 2:
+                continue
+            cluster_lex = [lexical_norm.get(code, 0.0) for code in members]
+            max_lex = max(cluster_lex) if cluster_lex else 0.0
+            if max_lex <= 0.0:
+                continue
+            for code in members:
+                boost = weights["class_cluster_boost"] * (lexical_norm.get(code, 0.0) / max_lex)
+                final_scores[code] += boost
+                class_boost_applied[code] = class_boost_applied.get(code, 0.0) + boost
+
+    base_sorted = sorted(pool_codes, key=lambda code: base_scores.get(code, 0.0), reverse=True)
+    if base_sorted:
+        top_base = base_sorted[0]
+        parent = graph.parent_lookup.get(top_base, "")
+        if parent:
+            sibling_cluster = [
+                code
+                for code in refinement_codes
+                if graph.parent_lookup.get(code, "") == parent
+            ]
+            if len(sibling_cluster) >= 2:
+                lexical_winner = max(sibling_cluster, key=lambda code: lexical_scores.get(code, 0.0))
+                if lexical_winner != top_base:
+                    margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_base, 0.0)
+                    if margin >= 0.07:
+                        final_scores[lexical_winner] = max(
+                            final_scores.get(lexical_winner, 0.0),
+                            final_scores.get(top_base, 0.0) + margin * weights["sibling_boost"],
+                        )
+        top_window = base_sorted[: min(CPV_REFINEMENT_BASE_WINDOW, len(base_sorted))]
+        if len(top_window) >= 2:
+            lexical_winner = max(top_window, key=lambda code: lexical_scores.get(code, 0.0))
+            if lexical_winner != top_base:
+                margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_base, 0.0)
+                if margin >= 0.14:
+                    final_scores[lexical_winner] = max(
+                        final_scores.get(lexical_winner, 0.0),
+                        final_scores.get(top_base, 0.0) + margin * weights["lexical"],
+                    )
+
+    refined_sorted = sorted(refinement_codes, key=lambda code: final_scores.get(code, 0.0), reverse=True)
+    tail = [code for code in base_sorted if code not in refinement_codes]
+    ranked_codes = list(dict.fromkeys(refined_sorted + tail))
+
+    selected: List[Dict[str, object]] = []
+    for code in ranked_codes[: min(top_k, len(ranked_codes))]:
+        row = rows_by_code.get(code)
+        if row is None:
+            continue
+        row["score"] = float(final_scores.get(code, 0.0))
+        row["hierarchy_selection_score"] = float(final_scores.get(code, 0.0))
+        row["hierarchy_lexical_score"] = float(lexical_scores.get(code, 0.0))
+        row["hierarchy_sibling_boost"] = float(sibling_boost_applied.get(code, 0.0))
+        row["hierarchy_class_boost"] = float(class_boost_applied.get(code, 0.0))
+        row["retriever"] = str(row.get("retriever") or "hierarchy_selection")
+        selected.append(row)
+
+    return selected, {
+        "selection_enabled": True,
+        "pool_size": len(pool_codes),
+        "refinement_size": len(refinement_codes),
+        "sibling_groups_applied": sum(1 for siblings in parent_groups.values() if len(siblings) >= 2),
+        "class_clusters_applied": sum(
+            1 for prefix_len in (6, 4) for members in _group_codes_by_prefix(list(refinement_codes), prefix_len).values() if len(members) >= 2
+        ),
+    }
+
+
+def expand_and_select_cpv(
+    *,
+    query: str,
+    base_rows: Sequence[Dict[str, object]],
+    chunks_by_code: Dict[str, Dict[str, object]],
+    graph: CPVKnowledgeGraph,
+    top_k: int,
+    kg_enabled: bool,
+    kg_profile: str = "selection",
+    graph_algorithm: str | None = None,
+    graph_weight: float = 0.35,
+    max_seed_codes: int | None = None,
+    max_graph_candidates: int | None = None,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    del graph_weight  # kept for API compatibility; hierarchy_select uses CPV_SELECTION_WEIGHTS
+    profile = kg_profile if kg_enabled else "balanced"
+    if kg_enabled:
+        pool_rows, kg_meta = graph_expand_cpv_pool(
+            query=query,
+            base_rows=base_rows,
+            chunks_by_code=chunks_by_code,
+            graph=graph,
+            kg_profile=profile,
+            graph_algorithm=graph_algorithm,
+            max_seed_codes=max_seed_codes,
+            max_graph_candidates=max_graph_candidates,
+        )
+    else:
+        pool_rows = [dict(row) for row in base_rows]
+        base_codes = [
+            str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+            for row in base_rows
+            if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+        ]
+        for row in pool_rows:
+            row["base_retrieval_score"] = float(row.get("score") or 0.0)
+            row.setdefault("kg_graph_score", 0.0)
+        kg_meta = {
+            "enabled": False,
+            "base_codes": base_codes,
+            "candidate_pool_codes": base_codes,
+            "added_codes": [],
+            "paths": {},
+        }
+
+    selected, selection_meta = hierarchy_select_cpv_candidates(
+        query=query,
+        pool_rows=pool_rows,
+        graph=graph,
+        chunks_by_code=chunks_by_code,
+        top_k=top_k,
+    )
+    final_codes = [str(row.get("cpv_code") or "") for row in selected]
+    base_codes = [str(code) for code in kg_meta.get("base_codes", [])]
+    kg_meta["added_codes"] = [code for code in final_codes if code not in set(base_codes[:top_k])]
+    kg_meta["paths"] = {
+        str(row.get("cpv_code") or ""): str(row.get("kg_path") or "")
+        for row in selected
+        if str(row.get("kg_path") or "").strip()
+    }
+    kg_meta.update(selection_meta)
+    return selected, kg_meta
+
+
+def graph_expand_and_rerank_cpv(
+    *,
+    query: str,
+    base_rows: Sequence[Dict[str, object]],
+    chunks_by_code: Dict[str, Dict[str, object]],
+    graph: CPVKnowledgeGraph,
+    top_k: int,
+    graph_weight: float = 0.35,
+    kg_profile: str = "balanced",
+    graph_algorithm: str | None = None,
+    max_seed_codes: int | None = None,
+    max_graph_candidates: int | None = None,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    (
+        candidate_codes,
+        base_norm,
+        graph_norm,
+        proximity_scores,
+        candidate_reasons,
+        candidate_paths,
+        meta,
+    ) = _expand_cpv_candidate_pool(
+        query=query,
+        base_rows=base_rows,
+        chunks_by_code=chunks_by_code,
+        graph=graph,
+        kg_profile=kg_profile,
+        graph_algorithm=graph_algorithm,
+        max_seed_codes=max_seed_codes,
+        max_graph_candidates=max_graph_candidates,
+    )
+    base_codes = [
+        str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+        for row in base_rows
+        if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+    ]
+    if top_k <= 0:
+        return [], {
+            "enabled": True,
+            "base_codes": [],
+            "candidate_pool_codes": [],
+            "added_codes": [],
+            "paths": {},
+            **meta,
+        }
+    if not candidate_codes:
+        return list(base_rows[:top_k]), {
+            "enabled": True,
+            "base_codes": base_codes,
+            "candidate_pool_codes": base_codes,
+            "added_codes": [],
+            "paths": {},
+            **meta,
+        }
+
+    lexical_scores: Dict[str, float] = {}
+    for code in candidate_codes:
+        lexical_scores[code] = lexical_overlap_score(
+            query,
+            _candidate_rich_text(code, graph=graph, chunks_by_code=chunks_by_code),
+        )
+    lexical_norm = dict(zip(candidate_codes, min_max_normalize([lexical_scores[code] for code in candidate_codes])))
+
+    reranked: List[Dict[str, object]] = []
+    for code in candidate_codes:
+        chunk = chunks_by_code.get(code)
+        if chunk is None:
+            continue
+        base_score = base_norm.get(code, 0.0)
+        graph_score = graph_norm.get(code, 0.0)
+        final_score = (1.0 - graph_weight) * base_score + graph_weight * graph_score
+        row = dict(chunk)
+        row["score"] = float(final_score)
+        row["base_retrieval_score"] = float(base_score)
+        row["kg_graph_score"] = float(graph_score)
+        row["kg_path_score"] = float(lexical_norm.get(code, 0.0))
+        row["retriever"] = "cpv_kg_augmented" if code not in base_norm else str(
+            next((base_row.get("retriever", "") for base_row in base_rows if base_row.get("cpv_code") == code), "")
+        )
+        row["retrieval_source"] = (
+            "vector+graph" if code in base_norm and graph_score > 0 else "graph" if code not in base_norm else "vector"
+        )
+        row["kg_candidate_reason"] = candidate_reasons.get(code, "")
+        row["kg_path"] = candidate_paths.get(code, "")
+        reranked.append(row)
+
+    reranked.sort(key=lambda row: float(row.get("score") or 0.0), reverse=True)
+    final_rows = reranked[: min(top_k, len(reranked))]
+    final_codes = [str(row.get("cpv_code") or "") for row in final_rows]
+    added_codes = [code for code in final_codes if code not in set(base_codes[:top_k])]
+    return final_rows, {
+        "enabled": True,
+        "base_codes": base_codes[:top_k],
+        "candidate_pool_codes": candidate_codes,
+        "added_codes": added_codes,
+        "paths": {code: candidate_paths.get(code, "") for code in final_codes if candidate_paths.get(code)},
+        "pool_rows": reranked,
+        **meta,
+    }
+
+
+def _is_direct_sibling(code_a: str, code_b: str, graph: CPVKnowledgeGraph) -> bool:
+    if code_a == code_b:
+        return False
+    parent_a = graph.parent_lookup.get(code_a, "")
+    parent_b = graph.parent_lookup.get(code_b, "")
+    return bool(parent_a and parent_a == parent_b)
+
+
+def _is_strict_ancestor(candidate: str, reference: str, graph: CPVKnowledgeGraph) -> bool:
+    return candidate in set(
+        ancestor_codes(reference, graph.parent_lookup, include_self=False)
+    )
+
+
+def post_refine_cpv_ranking(
+    *,
+    query: str,
+    ranked_rows: Sequence[Dict[str, object]],
+    pool_rows: Sequence[Dict[str, object]],
+    graph: CPVKnowledgeGraph,
+    chunks_by_code: Dict[str, Dict[str, object]],
+    top_k: int,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    del pool_rows  # pool is kept for API compatibility; refinement only reorders current top-k.
+    if top_k <= 0 or not ranked_rows:
+        return [], {"post_refine_applied": False}
+
+    current = [dict(row) for row in ranked_rows[:top_k]]
+    ranked_codes = [
+        str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+        for row in current
+        if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+    ]
+    if len(ranked_codes) < 2:
+        return current, {"post_refine_applied": False}
+
+    rows_by_code = {code: dict(row) for code, row in zip(ranked_codes, current)}
+    lexical_scores = {
+        code: lexical_overlap_score(
+            query,
+            _candidate_rich_text(code, graph=graph, chunks_by_code=chunks_by_code),
+        )
+        for code in ranked_codes
+    }
+    lexical_norm = dict(
+        zip(ranked_codes, min_max_normalize([lexical_scores[code] for code in ranked_codes]))
+    )
+
+    top_code = ranked_codes[0]
+    promoted_code: str | None = None
+    promote_reason = ""
+
+    sibling_cluster = [code for code in ranked_codes if _is_direct_sibling(code, top_code, graph)]
+    if len(sibling_cluster) >= 2:
+        lexical_winner = max(sibling_cluster, key=lambda code: lexical_scores.get(code, 0.0))
+        margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_code, 0.0)
+        if lexical_winner != top_code and margin >= 0.12:
+            promoted_code = lexical_winner
+            promote_reason = "sibling_lexical"
+
+    if promoted_code is None:
+        lexical_winner = max(ranked_codes, key=lambda code: lexical_scores.get(code, 0.0))
+        margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_code, 0.0)
+        if lexical_winner != top_code and margin >= 0.18:
+            promoted_code = lexical_winner
+            promote_reason = "topk_lexical"
+
+    if promoted_code is None or promoted_code == top_code:
+        return current, {"post_refine_applied": False, "post_refine_reason": None}
+
+    reordered_codes = [promoted_code] + [code for code in ranked_codes if code != promoted_code]
+    refined: List[Dict[str, object]] = []
+    for code in reordered_codes:
+        row = rows_by_code[code]
+        if code == promoted_code:
+            row = dict(row)
+            row["post_refine_promoted"] = True
+            row["post_refine_reason"] = promote_reason
+            row["score"] = float(row.get("score") or 0.0) + 0.05
+        refined.append(row)
+
+    return refined, {
+        "post_refine_applied": True,
+        "post_refine_reason": promote_reason,
+        "post_refine_promoted_code": promoted_code,
+    }
+
+
+def cpv_kg_metrics(
+    *,
+    gold_code: str,
+    base_codes: Sequence[str],
+    final_codes: Sequence[str],
+    candidate_pool_codes: Sequence[str],
+    added_codes: Sequence[str],
+    paths: Dict[str, str],
+    top_k: int,
+) -> Dict[str, object]:
+    gold = str(gold_code).strip()
+    base_top = [str(code).strip() for code in base_codes[:top_k] if str(code).strip()]
+    final_top = [str(code).strip() for code in final_codes[:top_k] if str(code).strip()]
+    pool = [str(code).strip() for code in candidate_pool_codes if str(code).strip()]
+    added = [str(code).strip() for code in added_codes if str(code).strip()]
+
+    base_hit = gold in base_top
+    final_hit = gold in final_top
+    pool_hit = gold in pool
+    top1_exact = bool(final_top and final_top[0] == gold)
+    base_top1_match = best_cpv_hierarchy_match(base_top[0], [gold]) if base_top else None
+    base_top1_close_wrong = bool(
+        base_top and base_top[0] != gold and base_top1_match and float(base_top1_match["score"]) >= 0.25
+    )
+    best_final_match = max(
+        [
+            float(match["score"])
+            for code in final_top
+            for match in [best_cpv_hierarchy_match(code, [gold])]
+            if match is not None
+        ]
+        or [0.0]
+    )
+    added_noise = [
+        code
+        for code in added
+        for match in [best_cpv_hierarchy_match(code, [gold])]
+        if match is None or float(match["score"]) <= 0.0
+    ]
+    path_values = [path for code, path in paths.items() if code in final_top and path]
+    ppr_paths = [path for path in path_values if "ppr_" in path]
+    sibling_paths = [path for path in path_values if "sibling" in path]
+    ancestor_child_paths = [path for path in path_values if "ancestor" in path or "child" in path]
+    added_useful = [
+        code
+        for code in added
+        for match in [best_cpv_hierarchy_match(code, [gold])]
+        if match is not None and float(match["score"]) > 0.0
+    ]
+    return {
+        "kg_enabled": True,
+        "kg_candidate_pool_size": len(pool),
+        "kg_added_candidate_count": len(added),
+        "kg_expansion_gold_added": bool(not base_hit and final_hit),
+        "kg_expansion_gold_available": bool(not base_hit and pool_hit),
+        "kg_expansion_noise_rate": (len(added_noise) / len(added)) if added else 0.0,
+        "kg_useful_added_candidate_count": len(added_useful),
+        "kg_strict_gold_delta": 1.0 if (not base_hit and final_hit) else 0.0,
+        "branch_recall_at_k": bool(best_final_match >= 0.25),
+        "class_recall_at_k": bool(best_final_match >= 0.75),
+        "sibling_disambiguation_success": bool(base_top1_close_wrong and top1_exact),
+        "oracle_rerank_ceiling": bool(pool_hit),
+        "path_explanation_coverage": 1.0 if (final_top and paths.get(final_top[0])) else 0.0,
+        "kg_path_coverage_at_k": len(path_values) / len(final_top) if final_top else 0.0,
+        "kg_ppr_path_share": len(ppr_paths) / len(path_values) if path_values else 0.0,
+        "kg_sibling_path_share": len(sibling_paths) / len(path_values) if path_values else 0.0,
+        "kg_hierarchy_path_share": len(ancestor_child_paths) / len(path_values) if path_values else 0.0,
+        "kg_oracle_pool_gap": 1.0 if (pool_hit and not final_hit) else 0.0,
+        "kg_candidate_added_codes": added,
+        "kg_candidate_pool_codes": pool,
+        "kg_top1_path": paths.get(final_top[0], "") if final_top else "",
+    }

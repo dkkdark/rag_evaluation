@@ -32,9 +32,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--classifier-type",
-        choices=["examination_regulations", "ted_cpv", "api_classifier", "prepared_rag_results"],
-        default="examination_regulations",
-        help="Classifier to evaluate when --mode=classifier. Supports local pipelines and an external API-backed classifier.",
+        choices=["document_qa", "examination_regulations", "ted_cpv", "api_classifier", "prepared_rag_results"],
+        default="document_qa",
+        help="Classifier to evaluate when --mode=classifier. document_qa is the file-based RAG QA flow; examination_regulations is kept as a backwards-compatible alias.",
     )
     parser.add_argument(
         "--docs",
@@ -144,6 +144,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Comma-separated retrievers used when --retriever=auto.",
     )
     parser.add_argument(
+        "--sweep-configs-json",
+        default=None,
+        help="Optional JSON list of explicit sweep configs. Each item may contain chunking, chunk_size, overlap, retriever, and hybrid_alpha. When set, configs run in list order.",
+    )
+    parser.add_argument(
         "--hybrid-alpha",
         type=float,
         default=0.5,
@@ -160,6 +165,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.25,
         help="How strongly the lightweight reranker influences final ranking inside --rerank-top-n.",
+    )
+    parser.add_argument(
+        "--cross-encoder-rerank",
+        action="store_true",
+        help="Rerank top CPV candidates with a cross-encoder after retrieval and optional KG.",
+    )
+    parser.add_argument(
+        "--cross-encoder-model",
+        default=None,
+        help="Cross-encoder model id (default: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1).",
+    )
+    parser.add_argument(
+        "--cross-encoder-top-n",
+        type=int,
+        default=10,
+        help="How many top candidates to pass to the cross-encoder reranker.",
     )
     parser.add_argument(
         "--create-strategy-visualization",
@@ -227,6 +248,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Sampling temperature for the claim-level judge.",
     )
     parser.add_argument(
+        "--answer-mode",
+        choices=["extractive", "grounded_llm", "cite_first", "claim_checklist"],
+        default="cite_first",
+        help="Answer synthesis mode for document QA.",
+    )
+    parser.add_argument(
+        "--context-mode",
+        choices=["ranked", "kg_first", "kg_organized", "group_by_doc", "dedupe_section"],
+        default="dedupe_section",
+        help="Context assembly mode for document QA.",
+    )
+    parser.add_argument("--max-context-chunks", type=int, default=None, help="Limit chunks passed to answer/evaluation.")
+    parser.add_argument("--max-context-chars", type=int, default=None, help="Limit total context characters.")
+    parser.add_argument(
+        "--query-augmentation",
+        choices=["none", "llm", "hyde"],
+        default="none",
+        help="Use an LLM to expand retrieval queries before retrieval; hyde generates a hypothetical source passage.",
+    )
+    parser.add_argument(
+        "--query-augmentation-max-terms",
+        type=int,
+        default=8,
+        help="Maximum added terms requested from the query-augmentation LLM.",
+    )
+    parser.add_argument("--decision-min-confidence", type=float, default=0.0)
+    parser.add_argument("--decision-min-context-claim-recall", type=float, default=0.0)
+    parser.add_argument("--decision-min-grounded-claim-ratio", type=float, default=1.0)
+    parser.add_argument(
         "--disable-runtime-retrieval-evaluator",
         action="store_true",
         help="Disable gold-free runtime retrieval quality signals.",
@@ -237,39 +287,78 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Use the runtime retrieval evaluator as a generation gate and abstain when evidence is weak or missing.",
     )
     parser.add_argument(
+        "--self-rag-retry-on-weak-evidence",
+        action="store_true",
+        help="When runtime retrieval is weak, rewrite the query and retrieve again before answer generation.",
+    )
+    parser.add_argument(
+        "--self-rag-retry-max-attempts",
+        type=int,
+        default=1,
+        help="Maximum Self-RAG-style query rewrite/retrieval retries for weak evidence.",
+    )
+    parser.add_argument(
+        "--self-rag-critique",
+        action="store_true",
+        help="Run an LLM self-critique/revision pass after answer generation and before scoring.",
+    )
+    parser.add_argument(
         "--kg-enable",
         action="store_true",
         help="Build a provenance-aware knowledge graph, use it for graph-augmented retrieval, and write KG metrics.",
     )
     parser.add_argument(
-        "--neo4j-enable",
-        action="store_true",
-        help="Export the knowledge graph to Neo4j. Requires --kg-enable and Neo4j credentials.",
+        "--kg-graph-weight",
+        type=float,
+        default=0.35,
+        help="Weight of graph signals when KG retrieval/reranking is enabled.",
     )
     parser.add_argument(
-        "--neo4j-uri",
+        "--kg-profile",
+        choices=["conservative", "balanced", "exploratory", "ppr_only", "direct_only", "selection"],
+        default="exploratory",
+        help="KG retrieval preset for research comparisons.",
+    )
+    parser.add_argument(
+        "--kg-profiles",
+        default="",
+        help="Comma-separated KG profiles to compare in sweep mode when --kg-enable is set.",
+    )
+    parser.add_argument(
+        "--kg-algorithm",
+        choices=["direct", "ppr", "ppr_direct"],
         default=None,
-        help="Neo4j URI. Falls back to NEO4J_URI when omitted.",
+        help="Override the KG traversal algorithm from --kg-profile.",
     )
     parser.add_argument(
-        "--neo4j-user",
+        "--kg-max-added-chunks",
+        type=int,
         default=None,
-        help="Neo4j username. Falls back to NEO4J_USER when omitted.",
+        help="Override max graph-only chunks added to the retrieved context.",
     )
     parser.add_argument(
-        "--neo4j-password",
+        "--kg-ppr-iterations",
+        type=int,
         default=None,
-        help="Neo4j password. Falls back to NEO4J_PASSWORD when omitted.",
+        help="Override Personalized PageRank-style propagation iterations.",
     )
     parser.add_argument(
-        "--neo4j-database",
+        "--kg-ppr-damping",
+        type=float,
         default=None,
-        help="Optional Neo4j database. Falls back to NEO4J_DATABASE when omitted.",
+        help="Override Personalized PageRank-style damping factor.",
     )
     parser.add_argument(
-        "--neo4j-clear",
-        action="store_true",
-        help="Clear the target Neo4j database before importing the graph.",
+        "--kg-quality-threshold",
+        type=float,
+        default=None,
+        help="Override minimum graph-only chunk quality factor.",
+    )
+    parser.add_argument(
+        "--kg-intent-weight",
+        type=float,
+        default=None,
+        help="Override intent-score contribution to KG candidate ranking.",
     )
     return parser
 
@@ -330,6 +419,15 @@ def build_judge_config_from_args(args) -> LLMConfig:
         model=args.judge_model or args.llm_model,
         api_key_env=args.openai_api_key_env,
         temperature=args.judge_temperature,
+    )
+
+
+def llm_is_used_for_optional_steps(args) -> bool:
+    return (
+        args.llm_enable
+        or args.query_augmentation in {"llm", "hyde"}
+        or args.self_rag_retry_on_weak_evidence
+        or args.self_rag_critique
     )
 
 
@@ -410,6 +508,76 @@ def build_retriever_types(args, resolved_retriever: str) -> List[str]:
     return [resolved_retriever]
 
 
+def build_sweep_configs(args, resolved_retriever: str) -> List[Dict]:
+    valid_chunking = {"fixed_words", "fixed_tokens", "by_section", "by_paragraph"}
+    valid_retrievers = {"tfidf", "bm25", "dense", "hybrid"}
+    if args.sweep_configs_json:
+        raw_configs = json.loads(args.sweep_configs_json)
+        if not isinstance(raw_configs, list) or not raw_configs:
+            raise ValueError("--sweep-configs-json must be a non-empty JSON list.")
+        configs: List[Dict] = []
+        for index, raw_config in enumerate(raw_configs, start=1):
+            if not isinstance(raw_config, dict):
+                raise ValueError(f"Sweep config #{index} must be a JSON object.")
+            strategy = str(raw_config.get("chunking") or raw_config.get("strategy") or "").strip()
+            retriever_type = str(raw_config.get("retriever") or "").strip()
+            if strategy not in valid_chunking:
+                raise ValueError(f"Unsupported chunking in sweep config #{index}: {strategy!r}")
+            if retriever_type not in valid_retrievers:
+                raise ValueError(f"Unsupported retriever in sweep config #{index}: {retriever_type!r}")
+            chunk_size = int(raw_config.get("chunk_size") or 0)
+            overlap = int(raw_config.get("overlap") or 0)
+            if strategy in {"fixed_words", "fixed_tokens"}:
+                chunk_size = chunk_size or args.chunk_size
+            else:
+                chunk_size = 0
+                overlap = 0
+            configs.append(
+                {
+                    "order": index,
+                    "name": str(raw_config.get("name") or f"custom_{index}"),
+                    "strategy": strategy,
+                    "chunk_size": chunk_size,
+                    "overlap": overlap,
+                    "retriever": retriever_type,
+                    "hybrid_alpha": float(raw_config.get("hybrid_alpha", args.hybrid_alpha)),
+                    "kg_profile": str(raw_config.get("kg_profile") or args.kg_profile),
+                    "kg_algorithm": raw_config.get("kg_algorithm", args.kg_algorithm),
+                }
+            )
+        return configs
+
+    configs = []
+    kg_profiles = (
+        [item.strip() for item in args.kg_profiles.split(",") if item.strip()]
+        if args.kg_enable and args.kg_profiles.strip()
+        else [args.kg_profile]
+    )
+    for index, ((strategy, chunk_size, overlap), retriever_type) in enumerate(
+        (
+            (experiment, retriever_type)
+            for experiment in build_experiments(args)
+            for retriever_type in build_retriever_types(args, resolved_retriever)
+        ),
+        start=1,
+    ):
+        for kg_profile in kg_profiles:
+            configs.append(
+                {
+                    "order": len(configs) + 1,
+                    "name": f"{strategy}_{chunk_size}_{overlap}_{retriever_type}_kg_{kg_profile}",
+                    "strategy": strategy,
+                    "chunk_size": chunk_size,
+                    "overlap": overlap,
+                    "retriever": retriever_type,
+                    "hybrid_alpha": args.hybrid_alpha,
+                    "kg_profile": kg_profile,
+                    "kg_algorithm": args.kg_algorithm,
+                }
+            )
+    return configs
+
+
 def run_classifier_mode(args) -> Dict:
     ensure_dir(args.output_dir)
     run_dir = build_run_dir(args.output_dir, args.run_name)
@@ -429,8 +597,19 @@ def run_classifier_mode(args) -> Dict:
             create_showcase=args.create_strategy_showcase,
             rerank_top_n=args.rerank_top_n,
             rerank_weight=args.rerank_weight,
+            cross_encoder_rerank=args.cross_encoder_rerank,
+            cross_encoder_model=args.cross_encoder_model,
+            cross_encoder_top_n=args.cross_encoder_top_n,
+            kg_enabled=args.kg_enable,
+            kg_graph_weight=args.kg_graph_weight,
+            kg_profile=args.kg_profile,
+            kg_algorithm=args.kg_algorithm,
+            llm_config=build_llm_config_from_args(args),
+            query_augmentation=args.query_augmentation,
+            query_augmentation_max_terms=args.query_augmentation_max_terms,
         )
-        summary = strip_disabled_kg_from_summary(summary)
+        if not args.kg_enable:
+            summary = strip_disabled_kg_from_summary(summary)
         run_summary = {
             "run_dir": run_dir,
             "mode": "classifier",
@@ -440,6 +619,14 @@ def run_classifier_mode(args) -> Dict:
             "showcase": {"enabled": args.create_strategy_showcase},
             "classifier_summary": summary,
             "outputs": summary["outputs"],
+            "kg": {
+                "enabled": args.kg_enable,
+            },
+            "cross_encoder_reranker": {
+                "enabled": args.cross_encoder_rerank,
+                "model": args.cross_encoder_model,
+                "top_n": args.cross_encoder_top_n,
+            },
         }
         write_json(os.path.join(run_dir, "run_summary.json"), run_summary)
         return run_summary
@@ -531,14 +718,28 @@ def run_classifier_mode(args) -> Dict:
         create_strategy_visualization=args.create_strategy_visualization,
         create_strategy_showcase=args.create_strategy_showcase,
         kg_enabled=args.kg_enable,
-        neo4j_enabled=args.kg_enable and args.neo4j_enable,
-        neo4j_uri=args.neo4j_uri,
-        neo4j_user=args.neo4j_user,
-        neo4j_password=args.neo4j_password,
-        neo4j_database=args.neo4j_database,
-        neo4j_clear=args.neo4j_clear,
+        kg_graph_weight=args.kg_graph_weight,
+        kg_profile=args.kg_profile,
+        kg_algorithm=args.kg_algorithm,
+        kg_max_added_chunks=args.kg_max_added_chunks,
+        kg_ppr_iterations=args.kg_ppr_iterations,
+        kg_ppr_damping=args.kg_ppr_damping,
+        kg_quality_threshold=args.kg_quality_threshold,
+        kg_intent_weight=args.kg_intent_weight,
+        answer_mode=args.answer_mode,
+        context_mode=args.context_mode,
+        max_context_chunks=args.max_context_chunks,
+        max_context_chars=args.max_context_chars,
+        query_augmentation=args.query_augmentation,
+        query_augmentation_max_terms=args.query_augmentation_max_terms,
+        decision_min_confidence=args.decision_min_confidence,
+        decision_min_context_claim_recall=args.decision_min_context_claim_recall,
+        decision_min_grounded_claim_ratio=args.decision_min_grounded_claim_ratio,
         runtime_retrieval_evaluator_enabled=not args.disable_runtime_retrieval_evaluator,
         abstain_on_weak_evidence=args.abstain_on_weak_evidence,
+        self_rag_retry_on_weak_evidence=args.self_rag_retry_on_weak_evidence,
+        self_rag_retry_max_attempts=args.self_rag_retry_max_attempts,
+        self_rag_critique=args.self_rag_critique,
         rerank_top_n=args.rerank_top_n,
         rerank_weight=args.rerank_weight,
         )
@@ -585,9 +786,12 @@ def run_classifier_mode(args) -> Dict:
         "chunking_mode": args.chunking,
         "retriever_mode": resolved_retriever,
         "llm": {
-            "enabled": llm_config.enabled,
-            "model": llm_config.model if llm_config.enabled else None,
+            "enabled": llm_is_used_for_optional_steps(args),
+            "model": llm_config.model if llm_is_used_for_optional_steps(args) else None,
             "answer_generation": llm_config.enabled,
+            "query_augmentation": args.query_augmentation,
+            "self_rag_retry_on_weak_evidence": args.self_rag_retry_on_weak_evidence,
+            "self_rag_critique": args.self_rag_critique,
         },
         "reranker": {
             "enabled": args.rerank_top_n > 1 and args.rerank_weight > 0.0,
@@ -602,6 +806,9 @@ def run_classifier_mode(args) -> Dict:
         "runtime_retrieval_evaluator": {
             "enabled": not args.disable_runtime_retrieval_evaluator,
             "abstain_on_weak_evidence": args.abstain_on_weak_evidence,
+            "self_rag_retry_on_weak_evidence": args.self_rag_retry_on_weak_evidence,
+            "self_rag_retry_max_attempts": args.self_rag_retry_max_attempts,
+            "self_rag_critique": args.self_rag_critique,
         },
         "visualization": {"enabled": args.create_strategy_visualization or args.create_strategy_showcase},
         "showcase": {"enabled": args.create_strategy_showcase},
@@ -616,7 +823,6 @@ def run_classifier_mode(args) -> Dict:
     if args.kg_enable:
         run_summary["kg"] = {
             "enabled": args.kg_enable,
-            "neo4j_enabled": args.kg_enable and args.neo4j_enable,
         }
     write_json(os.path.join(run_dir, "run_summary.json"), run_summary)
     return run_summary
@@ -637,42 +843,54 @@ def main() -> None:
     resolved_retriever = resolve_retriever_mode(args)
     llm_config = build_llm_config_from_args(args)
     judge_config = build_judge_config_from_args(args)
-    experiments = build_experiments(args)
-    retriever_types = build_retriever_types(args, resolved_retriever)
+    sweep_configs = build_sweep_configs(args, resolved_retriever)
 
     experiment_summaries: List[Dict] = []
-    for strategy, chunk_size, overlap in experiments:
-        for retriever_type in retriever_types:
-            experiment_summaries.append(
-                run_single_experiment(
-                    sections=corpus["sections"],
-                    paragraphs=corpus["paragraphs"],
-                    questions=corpus["questions"],
-                    run_dir=run_dir,
-                    strategy=strategy,
-                    chunk_size=chunk_size,
-                    chunk_overlap=overlap,
-                    top_k=args.top_k,
-                    retriever_type=retriever_type,
-                    embedding_model=args.embedding_model,
-                    hybrid_alpha=args.hybrid_alpha,
-                    llm_config=llm_config,
-                    judge_config=judge_config,
-                    create_strategy_visualization=args.create_strategy_visualization,
-                    create_strategy_showcase=args.create_strategy_showcase,
-                    kg_enabled=args.kg_enable,
-                    neo4j_enabled=args.kg_enable and args.neo4j_enable,
-                    neo4j_uri=args.neo4j_uri,
-                    neo4j_user=args.neo4j_user,
-                    neo4j_password=args.neo4j_password,
-                    neo4j_database=args.neo4j_database,
-                    neo4j_clear=args.neo4j_clear,
-                    runtime_retrieval_evaluator_enabled=not args.disable_runtime_retrieval_evaluator,
-                    abstain_on_weak_evidence=args.abstain_on_weak_evidence,
-                    rerank_top_n=args.rerank_top_n,
-                    rerank_weight=args.rerank_weight,
-                )
+    for config in sweep_configs:
+        experiment_summaries.append(
+            run_single_experiment(
+                sections=corpus["sections"],
+                paragraphs=corpus["paragraphs"],
+                questions=corpus["questions"],
+                run_dir=run_dir,
+                strategy=config["strategy"],
+                chunk_size=config["chunk_size"],
+                chunk_overlap=config["overlap"],
+                top_k=args.top_k,
+                retriever_type=config["retriever"],
+                embedding_model=args.embedding_model,
+                hybrid_alpha=config["hybrid_alpha"],
+                llm_config=llm_config,
+                judge_config=judge_config,
+                create_strategy_visualization=args.create_strategy_visualization,
+                create_strategy_showcase=args.create_strategy_showcase,
+                kg_enabled=args.kg_enable,
+                kg_graph_weight=args.kg_graph_weight,
+                kg_profile=config.get("kg_profile", args.kg_profile),
+                kg_algorithm=config.get("kg_algorithm", args.kg_algorithm),
+                kg_max_added_chunks=args.kg_max_added_chunks,
+                kg_ppr_iterations=args.kg_ppr_iterations,
+                kg_ppr_damping=args.kg_ppr_damping,
+                kg_quality_threshold=args.kg_quality_threshold,
+                kg_intent_weight=args.kg_intent_weight,
+                answer_mode=args.answer_mode,
+                context_mode=args.context_mode,
+                max_context_chunks=args.max_context_chunks,
+                max_context_chars=args.max_context_chars,
+                query_augmentation=args.query_augmentation,
+                query_augmentation_max_terms=args.query_augmentation_max_terms,
+                decision_min_confidence=args.decision_min_confidence,
+                decision_min_context_claim_recall=args.decision_min_context_claim_recall,
+                decision_min_grounded_claim_ratio=args.decision_min_grounded_claim_ratio,
+                runtime_retrieval_evaluator_enabled=not args.disable_runtime_retrieval_evaluator,
+                abstain_on_weak_evidence=args.abstain_on_weak_evidence,
+                self_rag_retry_on_weak_evidence=args.self_rag_retry_on_weak_evidence,
+                self_rag_retry_max_attempts=args.self_rag_retry_max_attempts,
+                self_rag_critique=args.self_rag_critique,
+                rerank_top_n=args.rerank_top_n,
+                rerank_weight=args.rerank_weight,
             )
+        )
 
     ranking_weights = {
         "answer": args.weight_answer,
@@ -740,12 +958,16 @@ def main() -> None:
         "n_sections": len(corpus["sections"]),
         "n_paragraphs": len(corpus["paragraphs"]),
         "n_questions": len(corpus["questions"]),
-        "chunking_mode": args.chunking,
-        "retriever_mode": resolved_retriever,
+        "chunking_mode": "custom" if args.sweep_configs_json else args.chunking,
+        "retriever_mode": "custom" if args.sweep_configs_json else resolved_retriever,
+        "sweep_configs": sweep_configs,
         "llm": {
-            "enabled": llm_config.enabled,
-            "model": llm_config.model if llm_config.enabled else None,
+            "enabled": llm_is_used_for_optional_steps(args),
+            "model": llm_config.model if llm_is_used_for_optional_steps(args) else None,
             "answer_generation": llm_config.enabled,
+            "query_augmentation": args.query_augmentation,
+            "self_rag_retry_on_weak_evidence": args.self_rag_retry_on_weak_evidence,
+            "self_rag_critique": args.self_rag_critique,
         },
         "reranker": {
             "enabled": args.rerank_top_n > 1 and args.rerank_weight > 0.0,
@@ -760,6 +982,9 @@ def main() -> None:
         "runtime_retrieval_evaluator": {
             "enabled": not args.disable_runtime_retrieval_evaluator,
             "abstain_on_weak_evidence": args.abstain_on_weak_evidence,
+            "self_rag_retry_on_weak_evidence": args.self_rag_retry_on_weak_evidence,
+            "self_rag_retry_max_attempts": args.self_rag_retry_max_attempts,
+            "self_rag_critique": args.self_rag_critique,
         },
         "visualization": {
             "enabled": args.create_strategy_visualization or args.create_strategy_showcase,
@@ -769,7 +994,6 @@ def main() -> None:
         },
         "kg": {
             "enabled": args.kg_enable,
-            "neo4j_enabled": args.kg_enable and args.neo4j_enable,
         },
         "experiments": experiment_summaries,
         "ranking_weights": ranking_weights,

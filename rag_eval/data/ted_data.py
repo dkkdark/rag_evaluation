@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import re
+import time
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from typing import Dict, Iterable, List, Sequence
@@ -35,15 +37,33 @@ NOISE_PATTERNS = [
 ]
 
 
-def _post_json(url: str, payload: Dict) -> Dict:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return json.load(response)
+def _post_json(url: str, payload: Dict, *, timeout: int = 60, retries: int = 5) -> Dict:
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code == 429 and attempt + 1 < retries:
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                time.sleep(min(2 ** attempt, 10))
+                continue
+            raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("TED API request failed without an error.")
 
 
 def _pick_language_value(value: object) -> str:
@@ -110,9 +130,12 @@ def fetch_ted_notice_pages(
     limit: int = 100,
     start_page: int = 1,
     pages: int = 1,
+    pause_seconds: float = 0.35,
 ) -> List[Dict]:
     all_notices: List[Dict] = []
     for page in range(start_page, start_page + pages):
+        if page > start_page and pause_seconds > 0:
+            time.sleep(pause_seconds)
         all_notices.extend(fetch_ted_notice_batch(query=query, fields=fields, limit=limit, page=page))
     return all_notices
 
@@ -248,6 +271,74 @@ def transform_ted_notices_to_cpv_split_dataset(
         "n_test_queries": len(queries),
     }
     return catalog, queries, split_summary
+
+
+def read_cpv_catalog_csv(path: str) -> List[Dict[str, str]]:
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows: List[Dict[str, str]] = []
+        for row in reader:
+            rows.append(
+                {
+                    "code": str(row.get("code", "")).strip(),
+                    "label": str(row.get("label", "")).strip(),
+                    "description": str(row.get("description", "")).strip(),
+                    "parent_code": str(row.get("parent_code", "")).strip(),
+                    "examples": str(row.get("examples", "")).strip(),
+                }
+            )
+        return rows
+
+
+def _split_examples_field(raw_value: str) -> List[str]:
+    return [item.strip() for item in raw_value.split(" || ") if item.strip()]
+
+
+def collect_ted_examples_by_cpv(
+    notices: Sequence[Dict],
+    *,
+    max_examples_per_cpv: int = 8,
+    valid_codes: set[str] | None = None,
+) -> Dict[str, List[str]]:
+    examples_by_cpv: Dict[str, List[str]] = defaultdict(list)
+    for notice in notices:
+        extracted = _extract_notice_example(notice)
+        if extracted is None:
+            continue
+        cpv_code = extracted["cpv_code"]
+        if valid_codes is not None and cpv_code not in valid_codes:
+            continue
+        bucket = examples_by_cpv[cpv_code]
+        for text in extracted["examples"]:
+            if text in bucket or len(bucket) >= max_examples_per_cpv:
+                continue
+            bucket.append(text)
+    return dict(examples_by_cpv)
+
+
+def enrich_cpv_catalog_with_ted_examples(
+    base_rows: Sequence[Dict[str, str]],
+    examples_by_cpv: Dict[str, Sequence[str]],
+    *,
+    max_examples_per_cpv: int = 8,
+) -> List[Dict[str, str]]:
+    enriched: List[Dict[str, str]] = []
+    for row in base_rows:
+        merged = _split_examples_field(str(row.get("examples", "")))
+        for text in examples_by_cpv.get(row["code"], []):
+            if text in merged or len(merged) >= max_examples_per_cpv:
+                continue
+            merged.append(text)
+        enriched.append(
+            {
+                "code": row["code"],
+                "label": row["label"],
+                "description": row["description"],
+                "parent_code": row.get("parent_code", ""),
+                "examples": " || ".join(merged),
+            }
+        )
+    return enriched
 
 
 def write_cpv_catalog_csv(path: str, rows: Sequence[Dict]) -> None:
