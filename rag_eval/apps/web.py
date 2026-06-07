@@ -150,6 +150,7 @@ def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "kg_ppr_damping",
             "kg_quality_threshold",
             "kg_intent_weight",
+            "kg_ablation_edge_dropouts",
         ):
             active.pop(key, None)
 
@@ -272,6 +273,7 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--kg-ppr-damping": payload.get("kg_ppr_damping"),
         "--kg-quality-threshold": payload.get("kg_quality_threshold"),
         "--kg-intent-weight": payload.get("kg_intent_weight"),
+        "--kg-ablation-edge-dropouts": payload.get("kg_ablation_edge_dropouts"),
         "--rerank-top-n": payload.get("rerank_top_n"),
         "--rerank-weight": payload.get("rerank_weight"),
         "--cross-encoder-model": payload.get("cross_encoder_model"),
@@ -1645,6 +1647,7 @@ INDEX_HTML = r"""<!doctype html>
             <label><span class="label-row">PPR damping <span class="hint" title="Optional propagation damping factor for PDF KG.">i</span></span><input name="kg_ppr_damping" type="number" step="0.01" min="0" max="1" placeholder="profile default" /></label>
             <label><span class="label-row">KG quality min <span class="hint" title="Optional minimum quality factor for graph-only chunks.">i</span></span><input name="kg_quality_threshold" type="number" step="0.05" min="0" max="1" placeholder="profile default" /></label>
             <label><span class="label-row">Intent weight <span class="hint" title="Optional contribution of relation intent matching to KG ranking.">i</span></span><input name="kg_intent_weight" type="number" step="0.05" min="0" max="1" placeholder="profile default" /></label>
+            <label><span class="label-row">Edge dropouts <span class="hint" title="Comma-separated KG edge dropout rates for incompleteness testing, e.g. 0.1,0.3.">i</span></span><input name="kg_ablation_edge_dropouts" placeholder="off" /></label>
           </div>
           <div class="checks setting-group" data-show-for="document_qa examination_regulations sweep">
             <label class="check"><input type="checkbox" name="llm_enable" /> LLM answers <span class="hint" title="Generate grounded answers from retrieved chunks instead of extractive fallback only.">i</span></label>
@@ -1678,6 +1681,17 @@ INDEX_HTML = r"""<!doctype html>
     const state = { runs: [], selected: null, details: null, activeTable: null, options: null, workspace: "admin", chatTurns: [], customSweepConfigs: [] };
     const csvCandidates = [
       "experiment_ranking_csv",
+      "design_trace_csv",
+      "design_factor_effects_csv",
+      "paired_design_comparisons_csv",
+      "failure_attribution_csv",
+      "group_failure_explanations_csv",
+      "component_attribution_csv",
+      "failure_taxonomy_csv",
+      "task_type_attribution_csv",
+      "design_pareto_frontier_csv",
+      "cost_latency_attribution_csv",
+      "parsing_diagnostics_csv",
       "rag_results_csv",
       "retrieval_metrics_csv",
       "answer_metrics_csv",
@@ -1761,7 +1775,7 @@ INDEX_HTML = r"""<!doctype html>
         if (inactive.has(box.name)) payload[box.name] = false;
       }
       if (!payload.kg_enable) {
-        ["kg_graph_weight","kg_profile","kg_algorithm","kg_max_added_chunks","kg_ppr_iterations","kg_ppr_damping","kg_quality_threshold","kg_intent_weight"].forEach(key => delete payload[key]);
+        ["kg_graph_weight","kg_profile","kg_algorithm","kg_max_added_chunks","kg_ppr_iterations","kg_ppr_damping","kg_quality_threshold","kg_intent_weight","kg_ablation_edge_dropouts"].forEach(key => delete payload[key]);
       }
       if (!payload.cross_encoder_rerank) {
         delete payload.cross_encoder_model;
@@ -1964,6 +1978,11 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function collectRecommendations(summary) {
+      const design = summary.design_attribution || (summary.classifier_summary && summary.classifier_summary.design_attribution) || {};
+      const rootCauses = design.root_cause_recommendations || [];
+      if (rootCauses.length) {
+        return rootCauses.slice(0, 4);
+      }
       const advisor = (summary.classifier_summary && summary.classifier_summary.advisor) || {};
       const experiments = summary.experiments || [];
       let items = [];
@@ -2015,15 +2034,26 @@ INDEX_HTML = r"""<!doctype html>
         <div class="recommendation">
           <strong>${htmlEscape(item.priority || "P?")} · ${htmlEscape(item.component || "general")} · ${htmlEscape(item.issue || "Recommendation")}</strong>
           ${item.experiment ? `<div class="meta">Best config: ${htmlEscape(item.experiment)}</div>` : ""}
+          ${item.n_cases ? `<div class="meta">Errors in category: ${fmt(item.n_cases)}</div>` : ""}
           <div>${htmlEscape(item.recommendation || "")}</div>
           ${item.evidence ? `<div class="meta">Evidence: ${htmlEscape(item.evidence)}</div>` : ""}
+          ${item.likely_causes ? `<div class="meta">Likely causes: ${htmlEscape(item.likely_causes).replaceAll(" | ", "<br />")}</div>` : ""}
           ${item.next_experiment ? `<div class="meta">Next: ${htmlEscape(item.next_experiment)}</div>` : ""}
         </div>
       `).join("")}</div>`;
     }
 
+    function bestExperimentSummary(summary) {
+      const bestName = summary.best_experiment && summary.best_experiment.experiment;
+      const experiments = summary.experiments || [];
+      if (bestName && experiments.length) {
+        return experiments.find(experiment => experiment.experiment === bestName) || summary.classifier_summary || {};
+      }
+      return summary.classifier_summary || {};
+    }
+
     function renderOutcomeCounts(summary) {
-      const classifier = summary.classifier_summary || {};
+      const classifier = bestExperimentSummary(summary);
       const answerMetrics = classifier.answer_metrics || {};
       const classifierType = classifier.classifier?.type || "";
       const isCpv = ["ted_cpv", "api_classifier", "prepared_rag_results"].includes(classifierType);
@@ -2057,7 +2087,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderKeyMetrics(summary) {
-      const classifier = summary.classifier_summary || {};
+      const classifier = bestExperimentSummary(summary);
       const answerMetrics = classifier.answer_metrics || {};
       const ranking = classifier.classifier?.ranking_metrics || {};
       const cpvDiagnostics = classifier.classifier?.cpv_diagnostics || {};

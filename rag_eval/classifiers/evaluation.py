@@ -132,6 +132,18 @@ def _normalize_prediction_label(candidate: Dict[str, object]) -> str:
     return ""
 
 
+def _normalized_prediction_confidence(score: object) -> float | None:
+    try:
+        if score is None or score == "":
+            return None
+        value = float(score)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= value <= 1.0:
+        return value
+    return None
+
+
 def _normalize_prediction_score(candidate: Dict[str, object], *, fallback: float) -> float:
     for key in [
         "score",
@@ -1407,7 +1419,7 @@ def evaluate_local_ted_cpv_classifier(
         )
         classifier_auto_flag = _cpv_auto_flag(classification_metrics)
         diagnostics = _cpv_diagnostics(classification_metrics, retrieval_metrics)
-        prediction_confidence = float(retrieved[0]["score"]) if retrieved else None
+        prediction_confidence = _normalized_prediction_confidence(retrieved[0]["score"]) if retrieved else None
         cpv_rank_diagnostics = _cpv_rank_diagnostics(
             expected_codes=[query.gold_cpv_code],
             ranked_labels=[str(row["cpv_code"]) for row in retrieved[:top_k]],
@@ -1956,7 +1968,7 @@ def evaluate_prepared_rag_results_classifier(
         classifier_auto_flag = _cpv_auto_flag(classification_metrics)
         diagnostics = _cpv_diagnostics(classification_metrics, retrieval_metrics)
         prediction_confidence = (
-            float(normalized_candidates[0].score)
+            _normalized_prediction_confidence(normalized_candidates[0].score)
             if normalized_candidates and normalized_candidates[0].score is not None
             else None
         )
@@ -2516,7 +2528,7 @@ def evaluate_api_ted_cpv_classifier(
         classifier_auto_flag = _cpv_auto_flag(classification_metrics)
         diagnostics = _cpv_diagnostics(classification_metrics, retrieval_metrics)
         prediction_confidence = (
-            float(normalized_candidates[0].score)
+            _normalized_prediction_confidence(normalized_candidates[0].score)
             if normalized_candidates and normalized_candidates[0].score is not None
             else None
         )

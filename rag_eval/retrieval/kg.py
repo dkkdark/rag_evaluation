@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Sequence
@@ -230,6 +231,9 @@ class KGRelation:
     section_id: str
     chunk_id: str
     sentence_id: str
+    source_char_start: int
+    source_char_end: int
+    source_text_hash: str
     evidence: str
 
 
@@ -243,6 +247,10 @@ def normalize_name(value: str) -> str:
 def stable_id(*parts: object) -> str:
     raw = "|".join(str(part) for part in parts)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def stable_text_hash(value: str) -> str:
+    return hashlib.sha1(str(value).encode("utf-8")).hexdigest()[:16]
 
 
 def relation_predicate(relation: Dict) -> str:
@@ -373,6 +381,9 @@ def structural_relation(
         section_id=chunk["section_id"],
         chunk_id=chunk["chunk_id"],
         sentence_id=sentence_id,
+        source_char_start=0,
+        source_char_end=len(evidence),
+        source_text_hash=stable_text_hash(evidence),
         evidence=evidence,
     )
 
@@ -668,6 +679,9 @@ def extract_relations_for_sentence(chunk: Dict, sentence_id: str, sentence_text:
                         section_id=chunk["section_id"],
                         chunk_id=chunk["chunk_id"],
                         sentence_id=sentence_id,
+                        source_char_start=min(subject.start_char, obj.start_char),
+                        source_char_end=max(subject.end_char, obj.end_char),
+                        source_text_hash=stable_text_hash(sentence_text),
                         evidence=sentence_text,
                     )
                 )
@@ -709,6 +723,149 @@ def build_knowledge_graph(
         "entities": [asdict(entity) for entity in dedupe_entities(entities)],
         "relations": [asdict(relation) for relation in dedupe_relations(relations)],
     }
+
+
+def graph_quality_diagnostics(graph: Dict[str, List[Dict]], chunks: Sequence[Dict] | None = None) -> Dict[str, object]:
+    entities = list(graph.get("entities", []))
+    relations = list(graph.get("relations", []))
+    entity_ids = {str(entity.get("entity_id", "")) for entity in entities if str(entity.get("entity_id", "")).strip()}
+    relation_endpoints = [
+        (str(relation.get("subject_id", "")), str(relation.get("object_id", "")))
+        for relation in relations
+        if str(relation.get("subject_id", "")).strip() or str(relation.get("object_id", "")).strip()
+    ]
+    connected_entity_ids = {
+        endpoint
+        for pair in relation_endpoints
+        for endpoint in pair
+        if endpoint
+    }
+    degree: Dict[str, int] = {entity_id: 0 for entity_id in entity_ids}
+    adjacency: Dict[str, set[str]] = {entity_id: set() for entity_id in entity_ids}
+    for source_id, target_id in relation_endpoints:
+        if source_id in degree:
+            degree[source_id] += 1
+        if target_id in degree:
+            degree[target_id] += 1
+        if source_id in adjacency and target_id in adjacency:
+            adjacency[source_id].add(target_id)
+            adjacency[target_id].add(source_id)
+
+    seen: set[str] = set()
+    component_sizes: List[int] = []
+    for entity_id in entity_ids:
+        if entity_id in seen:
+            continue
+        stack = [entity_id]
+        seen.add(entity_id)
+        size = 0
+        while stack:
+            current = stack.pop()
+            size += 1
+            for neighbor in adjacency.get(current, set()):
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    stack.append(neighbor)
+        component_sizes.append(size)
+
+    predicate_counts: Dict[str, int] = {}
+    for relation in relations:
+        predicate = relation_predicate(relation) or "unknown"
+        predicate_counts[predicate] = predicate_counts.get(predicate, 0) + 1
+    relation_count = sum(predicate_counts.values())
+    relation_type_entropy = None
+    if relation_count:
+        relation_type_entropy = -sum(
+            (count / relation_count) * math.log2(count / relation_count)
+            for count in predicate_counts.values()
+            if count > 0
+        )
+
+    normalized_counts: Dict[str, int] = {}
+    for entity in entities:
+        normalized = str(entity.get("normalized_name") or normalize_name(str(entity.get("name", ""))))
+        if normalized:
+            normalized_counts[normalized] = normalized_counts.get(normalized, 0) + 1
+    duplicate_entity_mentions = sum(max(0, count - 1) for count in normalized_counts.values())
+    generic_predicates = {"contains", "part_of", "applies_to", "stands_in"}
+    chunk_ids = {str(chunk.get("chunk_id", "")) for chunk in (chunks or []) if str(chunk.get("chunk_id", "")).strip()}
+    entity_chunk_ids = {str(entity.get("chunk_id", "")) for entity in entities if str(entity.get("chunk_id", "")).strip()}
+    relation_chunk_ids = {str(relation.get("chunk_id", "")) for relation in relations if str(relation.get("chunk_id", "")).strip()}
+
+    def has_entity_grounding(entity: Dict) -> bool:
+        return bool(
+            str(entity.get("chunk_id", "")).strip()
+            and str(entity.get("sentence_id", "")).strip()
+            and str(entity.get("source_text", "")).strip()
+        )
+
+    def has_relation_grounding(relation: Dict) -> bool:
+        return bool(
+            str(relation.get("chunk_id", "")).strip()
+            and str(relation.get("sentence_id", "")).strip()
+            and str(relation.get("evidence", "")).strip()
+        )
+
+    return {
+        "kg_node_grounding_rate": (
+            sum(1 for entity in entities if has_entity_grounding(entity)) / len(entities) if entities else None
+        ),
+        "kg_edge_grounding_rate": (
+            sum(1 for relation in relations if has_relation_grounding(relation)) / len(relations) if relations else None
+        ),
+        "kg_missing_source_span_rate": (
+            sum(1 for entity in entities if not has_entity_grounding(entity)) / len(entities) if entities else None
+        ),
+        "kg_avg_degree": (sum(degree.values()) / len(degree) if degree else None),
+        "kg_isolated_entity_rate": (
+            sum(1 for entity_id in entity_ids if entity_id not in connected_entity_ids) / len(entity_ids)
+            if entity_ids else None
+        ),
+        "kg_connected_component_count": len(component_sizes),
+        "kg_largest_component_ratio": (max(component_sizes) / len(entity_ids) if component_sizes and entity_ids else None),
+        "kg_relation_type_entropy": relation_type_entropy,
+        "kg_relation_type_counts": predicate_counts,
+        "kg_duplicate_entity_rate": (
+            duplicate_entity_mentions / len(entities) if entities else None
+        ),
+        "kg_missing_provenance_rate": (
+            sum(1 for relation in relations if not has_relation_grounding(relation)) / len(relations)
+            if relations else None
+        ),
+        "kg_doc_coverage_rate": (
+            len({str(entity.get("doc_id", "")) for entity in entities if str(entity.get("doc_id", "")).strip()})
+            / len({str(chunk.get("doc_id", "")) for chunk in (chunks or []) if str(chunk.get("doc_id", "")).strip()})
+            if chunks else None
+        ),
+        "kg_chunk_coverage_rate": (
+            len(entity_chunk_ids | relation_chunk_ids) / len(chunk_ids) if chunk_ids else None
+        ),
+        "kg_generic_relation_share": (
+            sum(count for predicate, count in predicate_counts.items() if predicate in generic_predicates) / relation_count
+            if relation_count else None
+        ),
+    }
+
+
+def ablate_kg_graph_edges(graph: Dict[str, List[Dict]], dropout_rate: float, *, salt: str = "") -> Dict[str, List[Dict]]:
+    resolved_rate = min(max(float(dropout_rate), 0.0), 1.0)
+    if resolved_rate <= 0:
+        return {"entities": list(graph.get("entities", [])), "relations": list(graph.get("relations", []))}
+    kept_relations = []
+    for relation in graph.get("relations", []):
+        relation_id = str(
+            relation.get("relation_id")
+            or stable_id(
+                relation.get("chunk_id", ""),
+                relation.get("subject", ""),
+                relation.get("predicate", ""),
+                relation.get("object", ""),
+            )
+        )
+        bucket = int(hashlib.sha1(f"{salt}|{relation_id}".encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
+        if bucket >= resolved_rate:
+            kept_relations.append(relation)
+    return {"entities": list(graph.get("entities", [])), "relations": kept_relations}
 
 
 def dedupe_entities(entities: Sequence[KGEntity]) -> List[KGEntity]:
@@ -1809,11 +1966,14 @@ def evaluate_kg_retrieval_diagnostics(
         triple for triple, before, after in zip(required_triples, base_hits, final_hits) if not before and after
     ]
     strict_delta = len(newly_supported) / len(required_triples) if required_triples else None
+    missing_before = sum(1 for hit in base_hits if not hit)
+    added_evidence_recall = len(newly_supported) / missing_before if missing_before else None
 
     added_ids = set(str(chunk_id) for chunk_id in kg_retrieval.get("added_chunk_ids", []))
     graph_only_rows = [row for row in retrieved if str(row.get("chunk_id", "")) in added_ids]
     noisy_rows = [row for row in graph_only_rows if graph_only_chunk_is_noise(row, item, required_triples)]
     useful_rows = [row for row in graph_only_rows if row not in noisy_rows]
+    added_evidence_precision = len(useful_rows) / len(graph_only_rows) if graph_only_rows else None
 
     supporting = [
         relation for relation in kg_retrieval.get("supporting_relations", [])
@@ -1828,12 +1988,21 @@ def evaluate_kg_retrieval_diagnostics(
     path_supported_triples = [
         triple for triple in required_triples if any(relation_supports_triple(relation, triple) for relation in supporting)
     ]
+    correct_path_triples = [
+        triple for triple in path_supported_triples if gold_relation_evidence_hit(triple, final_text)
+    ]
+    path_correctness = len(correct_path_triples) / len(path_supported_triples) if path_supported_triples else None
+    graph_noise = (len(noisy_rows) / len(graph_only_rows)) if graph_only_rows else 0.0
     return {
         "kg_strict_relation_evidence_delta": strict_delta,
+        "kg_graph_gain_at_k": strict_delta,
         "kg_new_relation_evidence_count": len(newly_supported),
         "kg_graph_only_chunk_count": len(graph_only_rows),
         "kg_useful_graph_only_chunk_count": len(useful_rows),
-        "kg_graph_only_noise_rate": (len(noisy_rows) / len(graph_only_rows)) if graph_only_rows else 0.0,
+        "kg_graph_only_noise_rate": graph_noise,
+        "kg_graph_noise_at_k": graph_noise,
+        "kg_added_evidence_precision": added_evidence_precision,
+        "kg_added_evidence_recall": added_evidence_recall,
         "kg_graph_only_preamble_count": sum(
             1 for row in graph_only_rows if str(row.get("section_id", "")).casefold() == "preamble"
         ),
@@ -1853,6 +2022,10 @@ def evaluate_kg_retrieval_diagnostics(
         "kg_evidence_path_recall": (
             len(path_supported_triples) / len(required_triples) if required_triples else None
         ),
+        "kg_path_availability": (
+            len(path_supported_triples) / len(required_triples) if required_triples else None
+        ),
+        "kg_path_correctness": path_correctness,
         "kg_mean_path_depth": (sum(depths) / len(depths) if depths else None),
         "kg_direct_path_rate": (sum(1 for depth in depths if depth <= 1) / len(depths) if depths else None),
         "kg_generic_relation_share": (generic_count / len(supporting) if supporting else None),
@@ -1861,6 +2034,48 @@ def evaluate_kg_retrieval_diagnostics(
         ),
         "kg_path_supported_triples": json.dumps(
             [triple_to_list(triple) for triple in path_supported_triples], ensure_ascii=False
+        ),
+    }
+
+
+def evaluate_answer_kg_path_grounding(claim_evidence_map: Sequence[Dict], kg_retrieval: Dict[str, object]) -> Dict[str, object]:
+    relation_chunk_ids = {
+        str(relation.get("chunk_id", ""))
+        for relation in kg_retrieval.get("supporting_relations", [])
+        if str(relation.get("chunk_id", "")).strip()
+    }
+    if not claim_evidence_map:
+        return {
+            "answer_claim_kg_path_support_rate": None,
+            "kg_path_grounded_claim_ratio": None,
+            "unsupported_claim_missing_kg_path_rate": None,
+        }
+    supported_claims = 0
+    grounded_claims = 0
+    unsupported_missing_path = 0
+    unsupported_total = 0
+    for claim in claim_evidence_map:
+        supporting_ids = {
+            str(chunk_id)
+            for chunk_id in claim.get("supporting_chunk_ids", [])
+            if str(chunk_id).strip()
+        }
+        has_path = bool(supporting_ids & relation_chunk_ids)
+        if has_path:
+            supported_claims += 1
+        context_nli = str(claim.get("context_nli", "")).casefold()
+        if context_nli in {"supported", "entailed"} and has_path:
+            grounded_claims += 1
+        if context_nli in {"unsupported", "neutral", "contradicted", "contradiction"}:
+            unsupported_total += 1
+            if not has_path:
+                unsupported_missing_path += 1
+    n_claims = len(claim_evidence_map)
+    return {
+        "answer_claim_kg_path_support_rate": supported_claims / n_claims if n_claims else None,
+        "kg_path_grounded_claim_ratio": grounded_claims / n_claims if n_claims else None,
+        "unsupported_claim_missing_kg_path_rate": (
+            unsupported_missing_path / unsupported_total if unsupported_total else None
         ),
     }
 
@@ -1885,14 +2100,23 @@ def summarize_kg_metrics(metric_rows: Sequence[Dict]) -> Dict:
         "mean_kg_relation_evidence_recall_delta": average("kg_relation_evidence_recall_delta"),  # after-KG minus before-KG
         "mean_kg_retrieval_added_chunk_count": average("kg_retrieval_added_chunk_count"),  # average graph-only chunks added
         "mean_kg_strict_relation_evidence_delta": average("kg_strict_relation_evidence_delta"),
+        "mean_kg_graph_gain_at_k": average("kg_graph_gain_at_k"),
         "mean_kg_graph_only_noise_rate": average("kg_graph_only_noise_rate"),
+        "mean_kg_graph_noise_at_k": average("kg_graph_noise_at_k"),
+        "mean_kg_added_evidence_precision": average("kg_added_evidence_precision"),
+        "mean_kg_added_evidence_recall": average("kg_added_evidence_recall"),
         "mean_kg_relation_intent_alignment": average("kg_relation_intent_alignment"),
         "mean_kg_mean_relation_intent_score": average("kg_mean_relation_intent_score"),
         "mean_kg_graph_faithfulness": average("kg_graph_faithfulness"),
         "mean_kg_evidence_path_recall": average("kg_evidence_path_recall"),
+        "mean_kg_path_availability": average("kg_path_availability"),
+        "mean_kg_path_correctness": average("kg_path_correctness"),
         "mean_kg_path_depth": average("kg_mean_path_depth"),
         "mean_kg_direct_path_rate": average("kg_direct_path_rate"),
         "mean_kg_generic_relation_share": average("kg_generic_relation_share"),
+        "mean_answer_claim_kg_path_support_rate": average("answer_claim_kg_path_support_rate"),
+        "mean_kg_path_grounded_claim_ratio": average("kg_path_grounded_claim_ratio"),
+        "mean_unsupported_claim_missing_kg_path_rate": average("unsupported_claim_missing_kg_path_rate"),
         "questions_with_relation_gap": sum(1 for row in metric_rows if row["has_relation_gap"]),  # entities found but relation missing
         "questions_with_new_kg_relation_evidence": sum(
             1 for row in metric_rows if row.get("kg_new_relation_evidence_count", 0) > 0

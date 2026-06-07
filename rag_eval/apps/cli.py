@@ -14,6 +14,7 @@ from rag_eval.classifiers.evaluation import (
 )
 from rag_eval.retrieval.experiment import build_run_dir, ensure_dir, parse_csv_list, run_single_experiment
 from rag_eval.data.io import extract_paragraphs, load_questions, parse_pdf_sections, resolve_doc_paths
+from rag_eval.evaluation.design_attribution import write_design_attribution_artifacts
 from rag_eval.evaluation.metrics import build_recommendation, rank_experiments, score_experiment
 from rag_eval.core.models import LLMConfig, Section
 from rag_eval.retrieval.engines import DEFAULT_EMBEDDING_MODEL
@@ -360,6 +361,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override intent-score contribution to KG candidate ranking.",
     )
+    parser.add_argument(
+        "--kg-ablation-edge-dropouts",
+        default="",
+        help="Comma-separated edge dropout rates for KG incompleteness testing, e.g. 0.1,0.3,0.5.",
+    )
     return parser
 
 
@@ -383,6 +389,83 @@ def prune_disabled_kg_from_results_csv(path: str) -> None:
 def write_json(path: str, payload: Dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def build_kg_profile_comparison_rows(experiment_summaries: List[Dict]) -> List[Dict]:
+    rows: List[Dict] = []
+    for summary in experiment_summaries:
+        kg_summary = summary.get("kg", {}) if isinstance(summary.get("kg"), dict) else {}
+        if not kg_summary.get("enabled"):
+            continue
+        base_row = {
+            "experiment": summary.get("experiment"),
+            "chunking_strategy": summary.get("chunking_strategy"),
+            "retriever": summary.get("retriever"),
+            "chunk_size": summary.get("chunk_size"),
+            "chunk_overlap": summary.get("chunk_overlap"),
+            "kg_profile": kg_summary.get("profile"),
+            "kg_algorithm": kg_summary.get("algorithm"),
+            "question_type": "all",
+            "n_questions": summary.get("n_questions"),
+        }
+        metrics = kg_summary.get("metrics", {}) if isinstance(kg_summary.get("metrics"), dict) else {}
+        answer_metrics = summary.get("answer_metrics", {}) if isinstance(summary.get("answer_metrics"), dict) else {}
+        retrieval_metrics = summary.get("retrieval_metrics", {}) if isinstance(summary.get("retrieval_metrics"), dict) else {}
+        rows.append(
+            {
+                **base_row,
+                "mean_mrr_at_k": retrieval_metrics.get("mean_mrr_at_k"),
+                "mean_ndcg_at_k": retrieval_metrics.get("mean_ndcg_at_k"),
+                "mean_recall_at_k": retrieval_metrics.get("mean_recall_at_k"),
+                "mean_grounded_claim_ratio": answer_metrics.get("mean_grounded_claim_ratio"),
+                "mean_hallucinated_claim_ratio": answer_metrics.get("mean_hallucinated_claim_ratio"),
+                "mean_kg_graph_gain_at_k": metrics.get("mean_kg_graph_gain_at_k"),
+                "mean_kg_graph_noise_at_k": metrics.get("mean_kg_graph_noise_at_k"),
+                "mean_kg_added_evidence_precision": metrics.get("mean_kg_added_evidence_precision"),
+                "mean_kg_added_evidence_recall": metrics.get("mean_kg_added_evidence_recall"),
+                "mean_kg_path_availability": metrics.get("mean_kg_path_availability"),
+                "mean_kg_path_correctness": metrics.get("mean_kg_path_correctness"),
+                "mean_kg_graph_faithfulness": metrics.get("mean_kg_graph_faithfulness"),
+            }
+        )
+        kg_by_type = (
+            kg_summary.get("metrics_by_question_type", {})
+            if isinstance(kg_summary.get("metrics_by_question_type"), dict)
+            else {}
+        )
+        retrieval_by_type = (
+            summary.get("retrieval_metrics_by_question_type", {})
+            if isinstance(summary.get("retrieval_metrics_by_question_type"), dict)
+            else {}
+        )
+        answer_by_type = (
+            summary.get("answer_metrics_by_question_type", {})
+            if isinstance(summary.get("answer_metrics_by_question_type"), dict)
+            else {}
+        )
+        for question_type, type_metrics in sorted(kg_by_type.items()):
+            retrieval_type_metrics = retrieval_by_type.get(question_type, {})
+            answer_type_metrics = answer_by_type.get(question_type, {})
+            rows.append(
+                {
+                    **base_row,
+                    "question_type": question_type,
+                    "n_questions": type_metrics.get("n"),
+                    "mean_mrr_at_k": retrieval_type_metrics.get("mean_mrr_at_k"),
+                    "mean_ndcg_at_k": retrieval_type_metrics.get("mean_ndcg_at_k"),
+                    "mean_recall_at_k": retrieval_type_metrics.get("mean_recall_at_k"),
+                    "mean_grounded_claim_ratio": answer_type_metrics.get("mean_grounded_claim_ratio"),
+                    "mean_hallucinated_claim_ratio": answer_type_metrics.get("mean_hallucinated_claim_ratio"),
+                    "mean_kg_graph_gain_at_k": type_metrics.get("mean_kg_graph_gain_at_k"),
+                    "mean_kg_graph_noise_at_k": type_metrics.get("mean_kg_graph_noise_at_k"),
+                    "mean_kg_added_evidence_precision": type_metrics.get("mean_kg_added_evidence_precision"),
+                    "mean_kg_added_evidence_recall": type_metrics.get("mean_kg_added_evidence_recall"),
+                    "mean_kg_path_availability": type_metrics.get("mean_kg_path_availability"),
+                    "mean_kg_path_correctness": type_metrics.get("mean_kg_path_correctness"),
+                    "mean_kg_graph_faithfulness": type_metrics.get("mean_kg_graph_faithfulness"),
+                }
+            )
+    return rows
 
 
 def strip_disabled_kg_from_summary(summary: Dict) -> Dict:
@@ -628,6 +711,7 @@ def run_classifier_mode(args) -> Dict:
                 "top_n": args.cross_encoder_top_n,
             },
         }
+        run_summary = write_design_attribution_artifacts(run_summary, run_dir)
         write_json(os.path.join(run_dir, "run_summary.json"), run_summary)
         return run_summary
 
@@ -666,6 +750,7 @@ def run_classifier_mode(args) -> Dict:
             "classifier_summary": summary,
             "outputs": summary["outputs"],
         }
+        run_summary = write_design_attribution_artifacts(run_summary, run_dir)
         write_json(os.path.join(run_dir, "run_summary.json"), run_summary)
         return run_summary
 
@@ -691,6 +776,7 @@ def run_classifier_mode(args) -> Dict:
             "classifier_summary": summary,
             "outputs": summary["outputs"],
         }
+        run_summary = write_design_attribution_artifacts(run_summary, run_dir)
         write_json(os.path.join(run_dir, "run_summary.json"), run_summary)
         return run_summary
 
@@ -726,6 +812,7 @@ def run_classifier_mode(args) -> Dict:
         kg_ppr_damping=args.kg_ppr_damping,
         kg_quality_threshold=args.kg_quality_threshold,
         kg_intent_weight=args.kg_intent_weight,
+        kg_ablation_edge_dropouts=args.kg_ablation_edge_dropouts,
         answer_mode=args.answer_mode,
         context_mode=args.context_mode,
         max_context_chunks=args.max_context_chunks,
@@ -824,6 +911,7 @@ def run_classifier_mode(args) -> Dict:
         run_summary["kg"] = {
             "enabled": args.kg_enable,
         }
+    run_summary = write_design_attribution_artifacts(run_summary, run_dir)
     write_json(os.path.join(run_dir, "run_summary.json"), run_summary)
     return run_summary
 
@@ -873,6 +961,7 @@ def main() -> None:
                 kg_ppr_damping=args.kg_ppr_damping,
                 kg_quality_threshold=args.kg_quality_threshold,
                 kg_intent_weight=args.kg_intent_weight,
+                kg_ablation_edge_dropouts=args.kg_ablation_edge_dropouts,
                 answer_mode=args.answer_mode,
                 context_mode=args.context_mode,
                 max_context_chunks=args.max_context_chunks,
@@ -902,6 +991,11 @@ def main() -> None:
 
     ranking_csv = os.path.join(run_dir, "experiment_ranking.csv")
     pd.DataFrame(ranked_experiments).to_csv(ranking_csv, index=False)
+    kg_profile_comparison_csv = None
+    kg_profile_comparison_rows = build_kg_profile_comparison_rows(experiment_summaries)
+    if kg_profile_comparison_rows:
+        kg_profile_comparison_csv = os.path.join(run_dir, "kg_profile_comparison.csv")
+        pd.DataFrame(kg_profile_comparison_rows).to_csv(kg_profile_comparison_csv, index=False)
     strategy_showcase_index_md = None
     if args.create_strategy_showcase:
         strategy_showcase_index_md = write_run_showcase_index(
@@ -994,6 +1088,9 @@ def main() -> None:
         },
         "kg": {
             "enabled": args.kg_enable,
+            "profile": args.kg_profile if args.kg_enable else None,
+            "profiles": [item.strip() for item in args.kg_profiles.split(",") if item.strip()] if args.kg_profiles else [],
+            "ablation_edge_dropouts": args.kg_ablation_edge_dropouts,
         },
         "experiments": experiment_summaries,
         "ranking_weights": ranking_weights,
@@ -1004,6 +1101,7 @@ def main() -> None:
             "sections_csv": corpus["sections_csv"],
             "paragraphs_csv": corpus["paragraphs_csv"],
             "experiment_ranking_csv": ranking_csv,
+            "kg_profile_comparison_csv": kg_profile_comparison_csv,
             "best_config_json": best_config_json,
             "best_config_md": best_config_md,
             "questions_json": args.questions,
@@ -1024,6 +1122,7 @@ def main() -> None:
         }
     }
 
+    run_summary = write_design_attribution_artifacts(run_summary, run_dir)
     write_json(os.path.join(run_dir, "run_summary.json"), run_summary)
 
     print(json.dumps(run_summary, ensure_ascii=False, indent=2))

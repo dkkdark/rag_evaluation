@@ -8,10 +8,13 @@ from typing import Dict, List, Optional, Sequence
 from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
 from rag_eval.retrieval.chunking import build_chunks
 from rag_eval.retrieval.kg import (
+    ablate_kg_graph_edges,
     build_kg_supervision_terms,
     build_knowledge_graph,
+    evaluate_answer_kg_path_grounding,
     evaluate_kg_for_question,
     evaluate_kg_retrieval_diagnostics,
+    graph_quality_diagnostics,
     graph_augmented_retrieval,
     summarize_kg_metrics,
 )
@@ -51,6 +54,62 @@ def ensure_dir(path: str) -> None:
 
 def parse_csv_list(raw_value: str) -> List[int]:
     return [int(item.strip()) for item in raw_value.split(",") if item.strip()]
+
+
+def parse_float_csv_list(raw_value: str | Sequence[float] | None) -> List[float]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        values = [item.strip() for item in raw_value.split(",") if item.strip()]
+    else:
+        values = [str(item) for item in raw_value]
+    return [min(max(float(value), 0.0), 1.0) for value in values]
+
+
+def infer_question_type(item: Dict) -> str:
+    explicit = str(
+        item.get("question_type")
+        or item.get("task_type")
+        or item.get("query_type")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+    question = str(item.get("question", "")).casefold()
+    required_triples = list(item.get("must_have_triples", []))
+    if item.get("cpv_code") or item.get("expected_cpv") or item.get("classification_type"):
+        return "taxonomy"
+    if any(term in question for term in ["summarize", "summary", "überblick", "zusammenfassung", "compare all", "across"]):
+        return "summary_global"
+    relation_terms = ["requires", "requirement", "depends", "deadline", "relationship", "relation", "voraussetz", "frist", "abhängig"]
+    if any(term in question for term in relation_terms):
+        return "relation"
+    if len(required_triples) >= 2 or any(term in question for term in [" and ", " und ", "both", "mehrere", "compare"]):
+        return "multi_hop"
+    return "single_hop"
+
+
+def summarize_rows_by_question_type(rows: Sequence[Dict], metric_keys: Sequence[str]) -> Dict[str, Dict[str, object]]:
+    groups: Dict[str, List[Dict]] = {}
+    for row in rows:
+        question_type = str(row.get("question_type") or "unknown")
+        groups.setdefault(question_type, []).append(row)
+    summary: Dict[str, Dict[str, object]] = {}
+    for question_type, group_rows in sorted(groups.items()):
+        type_summary: Dict[str, object] = {"n": len(group_rows)}
+        for key in metric_keys:
+            values = []
+            for row in group_rows:
+                value = row.get(key)
+                if value is None or value == "":
+                    continue
+                try:
+                    values.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            type_summary[f"mean_{key}"] = (sum(values) / len(values)) if values else None
+        summary[question_type] = type_summary
+    return summary
 
 
 def list_field(value: object) -> List[str]:
@@ -227,6 +286,18 @@ def decision_policy_result(
     return {"decision_action": action, "decision_reasons": ",".join(reasons)}
 
 
+def normalized_prediction_confidence(score: object) -> float | None:
+    try:
+        if score is None or score == "":
+            return None
+        value = float(score)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= value <= 1.0:
+        return value
+    return None
+
+
 def build_run_dir(base_output_dir: str, run_name: Optional[str]) -> str:
     run_id = run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(base_output_dir, run_id)
@@ -260,6 +331,7 @@ def run_single_experiment(
     kg_ppr_damping: float | None = None,
     kg_quality_threshold: float | None = None,
     kg_intent_weight: float | None = None,
+    kg_ablation_edge_dropouts: str | Sequence[float] | None = None,
     answer_mode: str = "cite_first",
     context_mode: str = "dedupe_section",
     max_context_chunks: int | None = None,
@@ -286,8 +358,15 @@ def run_single_experiment(
     resolved_query_augmentation = query_augmentation or "none"
     resolved_decision_min_confidence = float(decision_min_confidence or 0.0)
     resolved_decision_min_context_claim_recall = float(decision_min_context_claim_recall or 0.0)
+    resolved_kg_ablation_edge_dropouts = parse_float_csv_list(kg_ablation_edge_dropouts)
 
     experiment_slug = f"{strategy}_{retriever_type}_size{chunk_size}_overlap{chunk_overlap}"
+    if kg_enabled:
+        kg_slug = str(kg_profile or "kg").replace("/", "_").replace(" ", "_")
+        algorithm_slug = str(kg_algorithm or "").replace("/", "_").replace(" ", "_")
+        experiment_slug = f"{experiment_slug}_kg_{kg_slug}"
+        if algorithm_slug:
+            experiment_slug = f"{experiment_slug}_{algorithm_slug}"
     experiment_dir = os.path.join(run_dir, experiment_slug)
     ensure_dir(experiment_dir)
 
@@ -305,10 +384,13 @@ def run_single_experiment(
         if kg_enabled
         else {"entities": [], "relations": []}
     )
+    kg_graph_quality = graph_quality_diagnostics(kg_graph, chunks) if kg_enabled else {}
     kg_entities_csv: Optional[str] = None
     kg_relations_csv: Optional[str] = None
     kg_metrics_csv: Optional[str] = None
     kg_summary_json: Optional[str] = None
+    kg_ablation_csv: Optional[str] = None
+    kg_ablation_summary_json: Optional[str] = None
     if kg_enabled:
         kg_entities_csv = os.path.join(experiment_dir, "kg_entities.csv")
         kg_relations_csv = os.path.join(experiment_dir, "kg_relations.csv")
@@ -333,10 +415,12 @@ def run_single_experiment(
     answer_metric_rows: List[Dict] = []
     retrieval_metric_rows: List[Dict] = []
     kg_metric_rows: List[Dict] = []
+    kg_ablation_rows: List[Dict] = []
     diagnostic_rows: List[Dict] = []
     judge_rows: List[Dict] = []
     claim_evidence_rows: List[Dict] = []
     for item in questions:
+        question_type = infer_question_type(item)
         query_augmentation_config = (
             LLMConfig(True, llm_config.model, llm_config.api_key_env, 0.0)
             if resolved_query_augmentation in {"llm", "hyde"}
@@ -560,6 +644,64 @@ def run_single_experiment(
                 kg_retrieval=kg_retrieval,
                 graph=kg_graph,
             )
+            kg_path_grounding_metrics = evaluate_answer_kg_path_grounding(
+                answer_metrics.claim_evidence_map,
+                kg_retrieval,
+            )
+            for dropout_rate in resolved_kg_ablation_edge_dropouts:
+                ablated_graph = ablate_kg_graph_edges(
+                    kg_graph,
+                    dropout_rate,
+                    salt=f"{item['id']}|{kg_profile}",
+                )
+                ablated_retrieved, ablated_kg_retrieval = graph_augmented_retrieval(
+                    query=retrieval_query,
+                    retrieved=base_retrieved,
+                    graph=ablated_graph,
+                    chunks=answer_scope_chunks or chunks,
+                    k=min(top_k, len(answer_scope_chunks or chunks)),
+                    graph_weight=kg_graph_weight,
+                    kg_profile=kg_profile,
+                    graph_algorithm=kg_algorithm,
+                    max_added_chunks=kg_max_added_chunks,
+                    ppr_iterations=kg_ppr_iterations,
+                    ppr_damping=kg_ppr_damping,
+                    quality_threshold=kg_quality_threshold,
+                    intent_weight=kg_intent_weight,
+                )
+                ablated_retrieved = assemble_context_rows(
+                    ablated_retrieved,
+                    mode=resolved_context_mode,
+                    max_chunks=resolved_max_context_chunks,
+                    max_chars=resolved_max_context_chars,
+                    kg_retrieval=ablated_kg_retrieval,
+                )
+                ablated_metrics = evaluate_kg_for_question(item, ablated_retrieved, ablated_graph)
+                ablated_recall = ablated_metrics.get("gold_kg_relation_evidence_recall")
+                full_recall = kg_metrics.get("gold_kg_relation_evidence_recall")
+                kg_ablation_rows.append(
+                    {
+                        "question_id": item["id"],
+                        "question": item["question"],
+                        "question_type": question_type,
+                        "kg_profile": kg_profile,
+                        "edge_dropout_rate": dropout_rate,
+                        "full_gold_kg_relation_evidence_recall": full_recall,
+                        "ablated_gold_kg_relation_evidence_recall": ablated_recall,
+                        "kg_robustness_score": (
+                            ablated_recall / full_recall
+                            if ablated_recall is not None and full_recall not in {None, 0}
+                            else None
+                        ),
+                        "kg_incompleteness_sensitivity": (
+                            full_recall - ablated_recall
+                            if ablated_recall is not None and full_recall is not None
+                            else None
+                        ),
+                        "ablated_relation_count": len(ablated_graph.get("relations", [])),
+                        "ablated_added_chunk_count": len(ablated_kg_retrieval.get("added_chunk_ids", [])),
+                    }
+                )
             # Compare relation-evidence coverage before and after graph expansion.
             # A positive delta means KG added context that contains more gold facts.
             base_relation_recall = base_kg_metrics["gold_kg_relation_evidence_recall"]
@@ -596,7 +738,9 @@ def run_single_experiment(
                     "kg_settings": json.dumps(
                         kg_retrieval.get("kg_settings", {}), ensure_ascii=False
                     ),
+                    "question_type": question_type,
                     **kg_retrieval_diagnostics,
+                    **kg_path_grounding_metrics,
                 }
             )
         auto_flag = answer_metrics.answer_accuracy_label
@@ -606,8 +750,9 @@ def run_single_experiment(
             llm_status=llm_result.status,
             answer_mode=answer_mode,
         )
+        prediction_confidence = normalized_prediction_confidence(retrieved[0]["score"]) if retrieved else None
         decision_result = decision_policy_result(
-            prediction_confidence=float(retrieved[0]["score"]) if retrieved else None,
+            prediction_confidence=prediction_confidence,
             runtime_retrieval_status=answer_metrics.runtime_retrieval_status,
             context_claim_recall=answer_metrics.context_claim_recall,
             grounded_claim_ratio=answer_metrics.grounded_claim_ratio,
@@ -622,6 +767,7 @@ def run_single_experiment(
                 {
                     "question_id": item["id"],
                     "question": item["question"],
+                    "question_type": question_type,
                     "retrieval_query": retrieval_query,
                     "query_augmentation_mode": resolved_query_augmentation,
                     "query_augmentation_status": query_augmentation_result.status,
@@ -664,6 +810,7 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "question_type": question_type,
                 "retrieval_query": retrieval_query,
                 "query_augmentation_status": query_augmentation_result.status,
                 "self_rag_retry_status": self_rag_retry_status,
@@ -735,6 +882,7 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "question_type": question_type,
                 "retrieval_query": retrieval_query,
                 "context_mode": resolved_context_mode,
                 **decision_result,
@@ -761,6 +909,7 @@ def run_single_experiment(
             {
                 "question_id": item["id"],
                 "question": item["question"],
+                "question_type": question_type,
                 "program_id": item.get("program_id", ""),
                 "program_name": item.get("program_name", ""),
                 "doc_id": item.get("doc_id", ""),
@@ -806,6 +955,7 @@ def run_single_experiment(
         result_row = {
                 "question_id": item["id"],
                 "question": item["question"],
+                "question_type": question_type,
                 "retrieval_query": retrieval_query,
                 "query_augmentation_mode": resolved_query_augmentation,
                 "query_augmentation_status": query_augmentation_result.status,
@@ -823,7 +973,8 @@ def run_single_experiment(
                 "retrieved_chunk_ids": json.dumps(
                     [row["chunk_id"] for row in retrieved], ensure_ascii=False
                 ),
-                "prediction_confidence": float(retrieved[0]["score"]) if retrieved else None,
+                "prediction_confidence": prediction_confidence,
+                "prediction_score_raw": float(retrieved[0]["score"]) if retrieved else None,
                 "retrieved_chunks": json.dumps(
                     [
                         {
@@ -888,6 +1039,21 @@ def run_single_experiment(
                 "kg_relation_evidence_recall_delta": (
                     kg_metrics["kg_relation_evidence_recall_delta"] if kg_metrics else None
                 ),  # improvement from KG expansion
+                "kg_graph_gain_at_k": kg_metrics["kg_graph_gain_at_k"] if kg_metrics else None,
+                "kg_graph_noise_at_k": kg_metrics["kg_graph_noise_at_k"] if kg_metrics else None,
+                "kg_added_evidence_precision": kg_metrics["kg_added_evidence_precision"] if kg_metrics else None,
+                "kg_added_evidence_recall": kg_metrics["kg_added_evidence_recall"] if kg_metrics else None,
+                "kg_path_availability": kg_metrics["kg_path_availability"] if kg_metrics else None,
+                "kg_path_correctness": kg_metrics["kg_path_correctness"] if kg_metrics else None,
+                "answer_claim_kg_path_support_rate": (
+                    kg_metrics["answer_claim_kg_path_support_rate"] if kg_metrics else None
+                ),
+                "kg_path_grounded_claim_ratio": (
+                    kg_metrics["kg_path_grounded_claim_ratio"] if kg_metrics else None
+                ),
+                "unsupported_claim_missing_kg_path_rate": (
+                    kg_metrics["unsupported_claim_missing_kg_path_rate"] if kg_metrics else None
+                ),
                 "kg_error_type": kg_metrics["kg_error_type"] if kg_metrics else None,  # first missing KG evidence layer
                 "gold_answer_overlap": answer_metrics.gold_answer_overlap,
                 "answer_gold_support": answer_metrics.answer_gold_support,
@@ -982,9 +1148,27 @@ def run_single_experiment(
     answer_metrics_csv = os.path.join(experiment_dir, "answer_metrics.csv")
     answer_metrics_df.to_csv(answer_metrics_csv, index=False)
     aggregate_answer_metrics = summarize_answer_metrics(answer_metric_rows)
+    answer_metrics_by_question_type = summarize_rows_by_question_type(
+        answer_metric_rows,
+        [
+            "context_claim_recall",
+            "grounded_claim_ratio",
+            "hallucinated_claim_ratio",
+            "factual_correctness_recall",
+            "evidence_attribution_recall",
+        ],
+    )
     answer_metrics_json = os.path.join(experiment_dir, "answer_metrics_summary.json")
     with open(answer_metrics_json, "w", encoding="utf-8") as f:
-        json.dump(aggregate_answer_metrics, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                **aggregate_answer_metrics,
+                "by_question_type": answer_metrics_by_question_type,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     claim_evidence_csv: Optional[str] = None
     claim_evidence_jsonl: Optional[str] = None
@@ -1000,22 +1184,78 @@ def run_single_experiment(
     retrieval_metrics_csv = os.path.join(experiment_dir, "retrieval_metrics.csv")
     retrieval_metrics_df.to_csv(retrieval_metrics_csv, index=False)
     aggregate_retrieval_metrics = summarize_retrieval_metrics(retrieval_metric_rows)
+    retrieval_metrics_by_question_type = summarize_rows_by_question_type(
+        retrieval_metric_rows,
+        ["mrr_at_k", "ndcg_at_k", "recall_at_k", "ragas_recall_at_k"],
+    )
     retrieval_metrics_json = os.path.join(experiment_dir, "retrieval_metrics_summary.json")
     with open(retrieval_metrics_json, "w", encoding="utf-8") as f:
-        json.dump(aggregate_retrieval_metrics, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {
+                **aggregate_retrieval_metrics,
+                "by_question_type": retrieval_metrics_by_question_type,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     aggregate_kg_metrics = summarize_kg_metrics(kg_metric_rows) if kg_enabled else {}
+    kg_metrics_by_question_type = (
+        summarize_rows_by_question_type(
+            kg_metric_rows,
+            [
+                "gold_kg_relation_evidence_recall",
+                "kg_relation_evidence_recall_delta",
+                "kg_graph_gain_at_k",
+                "kg_graph_noise_at_k",
+                "kg_added_evidence_precision",
+                "kg_added_evidence_recall",
+                "kg_path_availability",
+                "kg_path_correctness",
+                "kg_graph_faithfulness",
+                "answer_claim_kg_path_support_rate",
+                "kg_path_grounded_claim_ratio",
+            ],
+        )
+        if kg_enabled
+        else {}
+    )
+    kg_ablation_summary = (
+        {
+            "edge_dropout_rates": resolved_kg_ablation_edge_dropouts,
+            "overall": summarize_rows_by_question_type(
+                [{**row, "question_type": "all"} for row in kg_ablation_rows],
+                ["kg_robustness_score", "kg_incompleteness_sensitivity", "ablated_gold_kg_relation_evidence_recall"],
+            ).get("all", {}),
+            "by_question_type": summarize_rows_by_question_type(
+                kg_ablation_rows,
+                ["kg_robustness_score", "kg_incompleteness_sensitivity", "ablated_gold_kg_relation_evidence_recall"],
+            ),
+        }
+        if kg_enabled and kg_ablation_rows
+        else {}
+    )
     if kg_enabled:
         kg_metrics_df = pd.DataFrame(kg_metric_rows)
         kg_metrics_csv = os.path.join(experiment_dir, "kg_metrics.csv")
         kg_metrics_df.to_csv(kg_metrics_csv, index=False)
+        if kg_ablation_rows:
+            kg_ablation_csv = os.path.join(experiment_dir, "kg_incompleteness_ablation.csv")
+            pd.DataFrame(kg_ablation_rows).to_csv(kg_ablation_csv, index=False)
+            kg_ablation_summary_json = os.path.join(experiment_dir, "kg_incompleteness_ablation_summary.json")
+            with open(kg_ablation_summary_json, "w", encoding="utf-8") as f:
+                json.dump(kg_ablation_summary, f, ensure_ascii=False, indent=2)
         kg_summary_json = os.path.join(experiment_dir, "kg_summary.json")
         with open(kg_summary_json, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "n_entities": len(kg_graph["entities"]),
                     "n_relations": len(kg_graph["relations"]),
+                    "graph_quality": kg_graph_quality,
                     "metrics": aggregate_kg_metrics,
+                    "metrics_by_question_type": kg_metrics_by_question_type,
+                    "incompleteness_ablation": kg_ablation_summary,
                 },
                 f,
                 ensure_ascii=False,
@@ -1090,16 +1330,22 @@ def run_single_experiment(
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
         "n_incorrect": int((results_df["auto_flag"] == "incorrect").sum()),
         "answer_metrics": aggregate_answer_metrics,
+        "answer_metrics_by_question_type": answer_metrics_by_question_type,
         "retrieval_metrics": aggregate_retrieval_metrics,
+        "retrieval_metrics_by_question_type": retrieval_metrics_by_question_type,
         "kg": {
             "enabled": kg_enabled,
             "graph_weight": kg_graph_weight if kg_enabled else None,
             "profile": kg_profile if kg_enabled else None,
             "algorithm": kg_algorithm if kg_enabled else None,
+            "ablation_edge_dropouts": resolved_kg_ablation_edge_dropouts if kg_enabled else [],
             "weak_supervision_entity_terms": sum(len(rows) for rows in kg_supervision_terms.values()),
             "n_entities": len(kg_graph["entities"]),
             "n_relations": len(kg_graph["relations"]),
+            "graph_quality": kg_graph_quality if kg_enabled else {},
             "metrics": aggregate_kg_metrics,
+            "metrics_by_question_type": kg_metrics_by_question_type,
+            "incompleteness_ablation": kg_ablation_summary,
         },
         "diagnostics": aggregate_diagnostics,
         "llm": {
@@ -1171,6 +1417,8 @@ def run_single_experiment(
             "kg_relations_csv": kg_relations_csv,
             "kg_metrics_csv": kg_metrics_csv,
             "kg_summary_json": kg_summary_json,
+            "kg_incompleteness_ablation_csv": kg_ablation_csv,
+            "kg_incompleteness_ablation_summary_json": kg_ablation_summary_json,
             "diagnostics_csv": diagnostics_csv,
             "diagnostics_summary_json": diagnostics_json,
             "claim_judge_results_jsonl": claim_judge_jsonl,
