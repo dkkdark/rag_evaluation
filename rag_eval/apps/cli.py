@@ -12,6 +12,7 @@ from rag_eval.classifiers.evaluation import (
     evaluate_local_ted_cpv_classifier,
     evaluate_prepared_rag_results_classifier,
 )
+from rag_eval.data.ted_data import TED_DEFAULT_CORPUS_EXPORT_PATH
 from rag_eval.retrieval.experiment import build_run_dir, ensure_dir, parse_csv_list, run_single_experiment
 from rag_eval.data.io import extract_paragraphs, load_questions, parse_pdf_sections, resolve_doc_paths
 from rag_eval.evaluation.design_attribution import write_design_attribution_artifacts
@@ -54,8 +55,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cpv-catalog",
-        default="data/cpv_ted_train_catalog.csv",
-        help="CPV catalog CSV used by the local TED/CPV classifier.",
+        default=TED_DEFAULT_CORPUS_EXPORT_PATH,
+        help="Deprecated name: path to teddata corpus export CSV used to build CPV candidates for TED/CPV evaluation.",
     )
     parser.add_argument(
         "--cpv-queries",
@@ -111,7 +112,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--overlap", type=int, default=60, help="Chunk overlap for fixed strategies."
     )
-    parser.add_argument("--top-k", type=int, default=5, help="How many chunks to retrieve.")
+    parser.add_argument("--top-k", type=int, default=8, help="How many chunks to retrieve.")
     parser.add_argument(
         "--retriever",
         default=None,
@@ -128,6 +129,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--embedding-model",
         default=DEFAULT_EMBEDDING_MODEL,
         help="Model used only with the sentence-transformers backend.",
+    )
+    parser.add_argument(
+        "--search-index-dir",
+        default=".rag_eval_indices",
+        help="Directory used for the local persistent SQLite + FTS5 + FAISS retrieval index.",
     )
     parser.add_argument(
         "--auto-chunk-sizes",
@@ -175,13 +181,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cross-encoder-model",
         default=None,
-        help="Cross-encoder model id (default: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1).",
+        help="Cross-encoder model id (default: Alibaba-NLP/gte-multilingual-reranker-base).",
     )
     parser.add_argument(
         "--cross-encoder-top-n",
         type=int,
         default=10,
         help="How many top candidates to pass to the cross-encoder reranker.",
+    )
+    parser.add_argument(
+        "--llm-rerank",
+        action="store_true",
+        help="Rerank top CPV candidates with an OpenAI model after retrieval, optional KG, and optional cross-encoder.",
+    )
+    parser.add_argument(
+        "--llm-rerank-top-n",
+        type=int,
+        default=8,
+        help="How many top candidates to pass to the LLM reranker.",
+    )
+    parser.add_argument(
+        "--llm-rerank-weight",
+        type=float,
+        default=0.4,
+        help="How strongly the LLM reranker influences final ranking inside --llm-rerank-top-n.",
     )
     parser.add_argument(
         "--create-strategy-visualization",
@@ -218,7 +241,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--llm-model",
-        default="gpt-4.1-mini",
+        default="gpt-5.4",
         help="OpenAI model used to generate answers from retrieved chunks.",
     )
     parser.add_argument(
@@ -264,9 +287,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-context-chars", type=int, default=None, help="Limit total context characters.")
     parser.add_argument(
         "--query-augmentation",
-        choices=["none", "llm", "hyde"],
+        choices=["none", "llm", "hyde", "translate_en"],
         default="none",
-        help="Use an LLM to expand retrieval queries before retrieval; hyde generates a hypothetical source passage.",
+        help=(
+            "Expand retrieval queries before retrieval. Use translate_en for English translation plus "
+            "procurement terms, llm for LLM keyword expansion, or hyde for a hypothetical source passage."
+        ),
     )
     parser.add_argument(
         "--query-augmentation-max-terms",
@@ -489,7 +515,7 @@ def resolve_retriever_mode(args) -> str:
 
 def build_llm_config_from_args(args) -> LLMConfig:
     return LLMConfig(
-        enabled=args.llm_enable,
+        enabled=args.llm_enable or args.llm_rerank,
         model=args.llm_model,
         api_key_env=args.openai_api_key_env,
         temperature=args.llm_temperature,
@@ -508,7 +534,8 @@ def build_judge_config_from_args(args) -> LLMConfig:
 def llm_is_used_for_optional_steps(args) -> bool:
     return (
         args.llm_enable
-        or args.query_augmentation in {"llm", "hyde"}
+        or args.llm_rerank
+        or args.query_augmentation in {"llm", "hyde", "translate_en"}
         or args.self_rag_retry_on_weak_evidence
         or args.self_rag_critique
     )
@@ -661,14 +688,23 @@ def build_sweep_configs(args, resolved_retriever: str) -> List[Dict]:
     return configs
 
 
+def build_search_backend_config_from_args(args) -> Dict[str, object] | None:
+    return {
+        "backend": "sqlite",
+        "index_prefix": "rag-eval",
+        "index_dir": str(args.search_index_dir or ".rag_eval_indices").strip(),
+    }
+
+
 def run_classifier_mode(args) -> Dict:
     ensure_dir(args.output_dir)
     run_dir = build_run_dir(args.output_dir, args.run_name)
     resolved_retriever = resolve_retriever_mode(args)
+    search_backend_config = build_search_backend_config_from_args(args)
 
     if args.classifier_type == "ted_cpv":
         summary = evaluate_local_ted_cpv_classifier(
-            cpv_catalog_path=args.cpv_catalog,
+            ted_corpus_export_path=args.cpv_catalog,
             queries_path=args.cpv_queries,
             retriever=resolved_retriever if resolved_retriever != "auto" else "tfidf",
             embedding_model=args.embedding_model,
@@ -683,6 +719,9 @@ def run_classifier_mode(args) -> Dict:
             cross_encoder_rerank=args.cross_encoder_rerank,
             cross_encoder_model=args.cross_encoder_model,
             cross_encoder_top_n=args.cross_encoder_top_n,
+            llm_rerank=args.llm_rerank,
+            llm_rerank_top_n=args.llm_rerank_top_n,
+            llm_rerank_weight=args.llm_rerank_weight,
             kg_enabled=args.kg_enable,
             kg_graph_weight=args.kg_graph_weight,
             kg_profile=args.kg_profile,
@@ -690,6 +729,8 @@ def run_classifier_mode(args) -> Dict:
             llm_config=build_llm_config_from_args(args),
             query_augmentation=args.query_augmentation,
             query_augmentation_max_terms=args.query_augmentation_max_terms,
+            search_backend_config=search_backend_config,
+            search_index_name=None,
         )
         if not args.kg_enable:
             summary = strip_disabled_kg_from_summary(summary)
@@ -698,6 +739,7 @@ def run_classifier_mode(args) -> Dict:
             "mode": "classifier",
             "classifier_type": args.classifier_type,
             "top_k": args.top_k,
+            "search_backend": summary.get("search_backend", {"backend": "sqlite", "index_name": None}),
             "visualization": {"enabled": args.create_strategy_visualization or args.create_strategy_showcase},
             "showcase": {"enabled": args.create_strategy_showcase},
             "classifier_summary": summary,
@@ -709,6 +751,12 @@ def run_classifier_mode(args) -> Dict:
                 "enabled": args.cross_encoder_rerank,
                 "model": args.cross_encoder_model,
                 "top_n": args.cross_encoder_top_n,
+            },
+            "llm_reranker": {
+                "enabled": args.llm_rerank,
+                "model": args.llm_model,
+                "top_n": args.llm_rerank_top_n,
+                "weight": args.llm_rerank_weight,
             },
         }
         run_summary = write_design_attribution_artifacts(run_summary, run_dir)
@@ -730,7 +778,7 @@ def run_classifier_mode(args) -> Dict:
             auth_token_env=args.api_auth_token_env,
             extra_headers=extra_headers,
             timeout_seconds=args.api_timeout_seconds,
-            cpv_catalog_path=args.cpv_catalog,
+            ted_corpus_export_path=args.cpv_catalog,
             queries_path=args.cpv_queries,
             top_k=args.top_k,
             classifier_label=args.classifier_type,
@@ -757,7 +805,7 @@ def run_classifier_mode(args) -> Dict:
     if args.classifier_type == "prepared_rag_results":
         summary = evaluate_prepared_rag_results_classifier(
             prepared_results_path=args.prepared_results,
-            cpv_catalog_path=args.cpv_catalog,
+            ted_corpus_export_path=args.cpv_catalog,
             top_k=args.top_k,
             classifier_label=args.classifier_type,
             run_dir=run_dir,
@@ -829,6 +877,8 @@ def run_classifier_mode(args) -> Dict:
         self_rag_critique=args.self_rag_critique,
         rerank_top_n=args.rerank_top_n,
         rerank_weight=args.rerank_weight,
+        search_backend_config=search_backend_config,
+        search_index_name=None,
         )
 
     if not args.kg_enable:
@@ -872,6 +922,7 @@ def run_classifier_mode(args) -> Dict:
         "n_questions": len(corpus["questions"]),
         "chunking_mode": args.chunking,
         "retriever_mode": resolved_retriever,
+        "search_backend": summary.get("search_backend", {"backend": "sqlite", "index_name": None}),
         "llm": {
             "enabled": llm_is_used_for_optional_steps(args),
             "model": llm_config.model if llm_is_used_for_optional_steps(args) else None,
@@ -931,6 +982,7 @@ def main() -> None:
     resolved_retriever = resolve_retriever_mode(args)
     llm_config = build_llm_config_from_args(args)
     judge_config = build_judge_config_from_args(args)
+    search_backend_config = build_search_backend_config_from_args(args)
     sweep_configs = build_sweep_configs(args, resolved_retriever)
 
     experiment_summaries: List[Dict] = []
@@ -978,6 +1030,8 @@ def main() -> None:
                 self_rag_critique=args.self_rag_critique,
                 rerank_top_n=args.rerank_top_n,
                 rerank_weight=args.rerank_weight,
+                search_backend_config=search_backend_config,
+                search_index_name=None,
             )
         )
 
@@ -1054,6 +1108,7 @@ def main() -> None:
         "n_questions": len(corpus["questions"]),
         "chunking_mode": "custom" if args.sweep_configs_json else args.chunking,
         "retriever_mode": "custom" if args.sweep_configs_json else resolved_retriever,
+        "search_backend": {"backend": "sqlite", "index_name": None},
         "sweep_configs": sweep_configs,
         "llm": {
             "enabled": llm_is_used_for_optional_steps(args),

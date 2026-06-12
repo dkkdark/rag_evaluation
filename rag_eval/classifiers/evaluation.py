@@ -12,9 +12,17 @@ import zipfile
 import xml.etree.ElementTree as ET
 from typing import Dict, List
 
-from rag_eval.core.models import DiagnosticResult, LLMConfig
+from rag_eval.core.models import DiagnosticResult, LLMCallResult, LLMConfig
 from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
-from rag_eval.classifiers.cpv_baseline import build_cpv_chunks, build_parent_lookup, load_cpv_catalog, load_queries
+from rag_eval.classifiers.cpv_baseline import (
+    build_cpv_chunks,
+    build_cpv_chunks_from_db,
+    build_parent_lookup,
+    load_cpv_catalog_from_ted_corpus_export,
+    load_cpv_catalog_from_db,
+    load_queries,
+    sync_cpv_profiles_to_db,
+)
 from rag_eval.classifiers.cpv_kg import (
     build_cpv_knowledge_graph,
     cpv_kg_metrics,
@@ -42,12 +50,19 @@ from rag_eval.evaluation.metrics import (
     summarize_retrieval_metrics,
     summarize_confidence_calibration,
 )
-from rag_eval.evaluation.llm import augment_query_with_llm
-from rag_eval.retrieval.engines import build_retriever, rerank_with_lexical_signal, retrieve_top_k
+from rag_eval.evaluation.llm import LLM_QUERY_AUGMENTATION_MODES, augment_query_with_llm
+from rag_eval.evaluation.llm import rerank_candidates_with_llm
+from rag_eval.retrieval.engines import (
+    build_cpv_multi_retriever,
+    lexical_overlap_score,
+    retrieve_top_k_cpv_multi,
+    rerank_with_lexical_signal,
+)
 from rag_eval.retrieval.cross_encoder import (
     DEFAULT_CROSS_ENCODER_MODEL,
     rerank_with_cross_encoder,
 )
+from rag_eval.retrieval.local_search import lexical_search as sqlite_lexical_search
 from rag_eval.reporting.visualization import write_classifier_showcase_bundle
 
 
@@ -141,7 +156,9 @@ def _normalized_prediction_confidence(score: object) -> float | None:
         return None
     if 0.0 <= value <= 1.0:
         return value
-    return None
+    if value > 0.0:
+        return value / (1.0 + value)
+    return 0.0
 
 
 def _normalize_prediction_score(candidate: Dict[str, object], *, fallback: float) -> float:
@@ -163,6 +180,411 @@ def _normalize_prediction_score(candidate: Dict[str, object], *, fallback: float
         except (TypeError, ValueError):
             continue
     return fallback
+
+
+_QUERY_NOISE_PATTERNS = [
+    r"\b(?:procedure|procedura|procedimiento|proc[ée]dure|verhandlungsverfahren|concurso|march[eé]|contrato|framework agreement|dynamic purchasing system|dps)\b",
+    r"\b(?:lot(?:s)?|n[. ]?[0-9]+/[0-9]+|nr[. ]?[0-9]+|no[. ]?[0-9]+|ref[. ]?[A-Z0-9/-]+)\b",
+    r"\b(?:relance|avviso di consultazione di mercato|consultation de march[eé]|public procurement|service procurement)\b",
+]
+
+_QUERY_SPLIT_RE = re.compile(r"\s*(?:[-:;|]|[\u2013\u2014])\s*")
+_QUERY_SPACE_RE = re.compile(r"\s+")
+_QUERY_NUMERIC_RE = re.compile(r"\b[0-9][0-9./%-]*\b")
+_QUERY_NONWORD_RE = re.compile(r"[^\w\s/&+]", flags=re.UNICODE)
+_QUERY_SECONDARY_SPLIT_RE = re.compile(
+    r"\b(?:with|including|plus|along with|associated with|optional|mit|avec|con|incl\.?|including|samt|und optional|et services associ[ée]s|servizi associati)\b",
+    flags=re.IGNORECASE,
+)
+_PROCUREMENT_ACTION_PATTERNS = [
+    "supply and installation",
+    "delivery and installation",
+    "operation and maintenance",
+    "repair and maintenance",
+    "maintenance service",
+    "installation",
+    "delivery",
+    "supply",
+    "operation",
+    "maintenance",
+    "repair",
+    "consultancy",
+    "service",
+    "lieferung",
+    "montage",
+    "wartung",
+    "suministro",
+    "instalacion",
+    "mantenimiento",
+    "fourniture",
+    "maintenance",
+    "entretien",
+]
+
+_CONTRACT_TYPE_PATTERNS = {
+    "maintenance_repair": [
+        "maintenance", "maintain", "repair", "servicing", "service and maintenance",
+        "wartung", "instandhaltung", "reparatur", "mantenimiento", "reparacion",
+        "manutenzione", "reparation", "entretien", "exploitation des installations",
+        "exploitation", "operation", "operating", "technical assistance",
+        "assistencia tecnica", "assistencia", "assistenza tecnica",
+    ],
+    "installation_work": [
+        "installation work", "installation works", "install and commission", "installation of",
+        "construction", "adaptation works", "instalacion", "installazione", "travaux",
+        "obra", "obras", "montaz", "montage",
+    ],
+    "supply": [
+        "supply", "supplies", "procurement", "delivery", "purchase", "acquisition",
+        "fourniture", "suministro", "lieferung", "fornitura", "aquisição", "προμήθεια",
+    ],
+    "consultancy": [
+        "consultancy", "consulting", "advisory", "study", "evaluation consultancy",
+        "beratung", "conseil", "consultoria", "estudio",
+    ],
+    "software_it_service": [
+        "software", "digital", "it service", "development service", "network service",
+        "telecommunication service", "support service", "mdm", "internet access",
+    ],
+    "security_service": [
+        "security service", "private security", "guarding", "surveillance service",
+    ],
+}
+
+
+def _normalize_free_text(value: str) -> str:
+    return _QUERY_SPACE_RE.sub(" ", _QUERY_NONWORD_RE.sub(" ", str(value or "").casefold())).strip()
+
+
+def _extract_procurement_object(query_text: str) -> Dict[str, object]:
+    original = str(query_text or "").strip()
+    lowered = original.casefold()
+    cleaned = lowered
+    removed_patterns: List[str] = []
+    for pattern in _QUERY_NOISE_PATTERNS:
+        updated = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+        if updated != cleaned:
+            removed_patterns.append(pattern)
+        cleaned = updated
+    cleaned = _QUERY_NUMERIC_RE.sub(" ", cleaned)
+    full_query = _normalize_free_text(cleaned)
+    raw_segments = [segment.strip() for segment in _QUERY_SPLIT_RE.split(cleaned) if segment.strip()]
+    left_primary = raw_segments[0] if raw_segments else cleaned
+    secondary_parts = [segment for segment in raw_segments[1:] if segment]
+
+    split_match = _QUERY_SECONDARY_SPLIT_RE.search(left_primary)
+    if split_match:
+        left_part = left_primary[: split_match.start()].strip()
+        right_part = left_primary[split_match.end() :].strip()
+        left_primary = left_part or left_primary
+        if right_part:
+            secondary_parts.insert(0, right_part)
+
+    action_terms = [term for term in _PROCUREMENT_ACTION_PATTERNS if term in full_query]
+    action_terms = sorted(set(action_terms), key=lambda term: (-len(term), term))
+    action_pattern = re.compile(
+        r"\b(?:"
+        + "|".join(re.escape(term) for term in action_terms[:8] if term)
+        + r"|and|und|et|y|e|de|des|del|di|of|for|a|an|the|eine?r?)\b",
+        flags=re.IGNORECASE,
+    ) if action_terms else None
+    left_primary_core = left_primary
+    if action_pattern is not None:
+        left_primary_core = _QUERY_SPACE_RE.sub(" ", action_pattern.sub(" ", left_primary)).strip()
+
+    object_candidates: List[str] = []
+    for connector in [" of ", " for ", " de ", " des ", " del ", " di ", " για ", " για την ", " για το "]:
+        if connector in left_primary:
+            object_candidates.append(left_primary.split(connector, 1)[1].strip())
+    if left_primary_core and left_primary_core != left_primary:
+        object_candidates.insert(0, left_primary_core)
+    object_candidates.append(left_primary)
+    object_candidates.extend(raw_segments)
+
+    contract_like_tokens = {
+        "maintenance", "repair", "service", "services", "installation", "operation", "delivery", "supply",
+        "lieferung", "montage", "wartung", "suministro", "instalacion", "mantenimiento", "fourniture", "entretien",
+    }
+    scored_candidates = []
+    for candidate in object_candidates:
+        normalized = _normalize_free_text(candidate)
+        if not normalized:
+            continue
+        tokens = [token for token in normalized.split() if len(token) > 2]
+        if not tokens:
+            continue
+        contract_hits = sum(1 for token in tokens if token in contract_like_tokens)
+        object_hits = sum(1 for token in tokens if token not in (contract_like_tokens | {"optional", "associated"}))
+        scored_candidates.append((normalized, object_hits - contract_hits, contract_hits, len(tokens)))
+    scored_candidates.sort(key=lambda item: (-item[1], item[2], item[3], len(item[0])))
+    preferred_object_query = _normalize_free_text(left_primary_core) if left_primary_core and left_primary_core != left_primary else ""
+    object_query = preferred_object_query or (scored_candidates[0][0] if scored_candidates else full_query)
+    full_query = _normalize_free_text(cleaned)
+    if len(object_query.split()) < 2 and len(object_query) < 10:
+        object_query = _normalize_free_text(original)
+    if len(full_query.split()) < 3:
+        full_query = _normalize_free_text(original)
+    procurement_action = _normalize_free_text(" ".join(action_terms[:3]))
+    secondary_context = _normalize_free_text(" ".join(secondary_parts[:4]))
+    exclude_as_primary = [
+        token
+        for token in _normalize_free_text(" ".join(secondary_parts + action_terms)).split()
+        if token in {"maintenance", "repair", "service", "services", "operation", "optional", "associated"}
+    ]
+    return {
+        "original_query": original,
+        "cleaned_query": full_query,
+        "object_query": object_query,
+        "main_object": object_query,
+        "procurement_action": procurement_action,
+        "secondary_context": secondary_context,
+        "exclude_as_primary": exclude_as_primary,
+        "removed_noise_patterns": removed_patterns,
+    }
+
+
+def _infer_contract_types(text: str) -> List[str]:
+    normalized = _normalize_free_text(text)
+    types: List[str] = []
+    for contract_type, patterns in _CONTRACT_TYPE_PATTERNS.items():
+        if any(pattern in normalized for pattern in patterns):
+            types.append(contract_type)
+    return types
+
+
+def _contract_type_bonus(query_types: List[str], candidate_types: List[str]) -> float:
+    if not query_types:
+        return 0.0
+    query_set = set(query_types)
+    candidate_set = set(candidate_types)
+    specific_types = {"maintenance_repair", "installation_work", "consultancy", "security_service", "software_it_service"}
+    penalties = {
+        frozenset({"maintenance_repair", "installation_work"}): -0.14,
+        frozenset({"maintenance_repair", "supply"}): -0.10,
+        frozenset({"installation_work", "consultancy"}): -0.08,
+        frozenset({"supply", "consultancy"}): -0.08,
+        frozenset({"security_service", "supply"}): -0.10,
+    }
+    for query_type in query_set:
+        for candidate_type in candidate_set:
+            penalty = penalties.get(frozenset({query_type, candidate_type}))
+            if penalty is not None:
+                return penalty
+    specific_overlap = (query_set & specific_types) & (candidate_set & specific_types)
+    if specific_overlap:
+        return 0.18
+    if query_set & candidate_set:
+        return 0.06
+    if "maintenance_repair" in query_set and "maintenance_repair" not in candidate_set:
+        return -0.12
+    if "installation_work" in query_set and "installation_work" not in candidate_set:
+        return -0.10
+    if "consultancy" in query_set and "consultancy" not in candidate_set:
+        return -0.08
+    return -0.04 if candidate_set else 0.0
+
+
+def _apply_contract_type_rerank(rows: List[Dict[str, object]], query_text: str) -> List[Dict[str, object]]:
+    if not rows:
+        return []
+    query_types = _infer_contract_types(query_text)
+    reranked: List[Dict[str, object]] = []
+    for row in rows:
+        updated = dict(row)
+        candidate_text = " ".join(
+            str(updated.get(key) or "")
+            for key in ["cpv_label", "title", "text", "description_en", "keywords_en", "cpv_parent_label"]
+        )
+        candidate_types = _infer_contract_types(candidate_text)
+        bonus = _contract_type_bonus(query_types, candidate_types)
+        updated["query_contract_types"] = ",".join(query_types)
+        updated["candidate_contract_types"] = ",".join(candidate_types)
+        updated["contract_type_bonus"] = bonus
+        updated["score_before_contract_type"] = float(updated.get("score") or 0.0)
+        updated["score"] = float(updated["score_before_contract_type"]) + bonus
+        if abs(bonus) > 1e-12:
+            updated["reranker"] = "contract_type"
+        reranked.append(updated)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return reranked
+
+
+def _apply_object_focus_rerank(
+    rows: List[Dict[str, object]],
+    *,
+    main_object: str,
+    procurement_action: str,
+    secondary_context: str,
+    exclude_as_primary: List[str],
+) -> List[Dict[str, object]]:
+    if not rows:
+        return []
+    reranked: List[Dict[str, object]] = []
+    exclusion_text = " ".join(exclude_as_primary)
+    for row in rows:
+        updated = dict(row)
+        candidate_text = " ".join(
+            str(updated.get(key) or "")
+            for key in [
+                "cpv_label",
+                "description_en",
+                "use_when_text",
+                "do_not_use_when_text",
+                "children_labels",
+                "sibling_labels",
+                "search_text_en",
+                "search_text_multilingual",
+            ]
+        )
+        main_overlap = lexical_overlap_score(main_object, candidate_text)
+        action_overlap = lexical_overlap_score(procurement_action, candidate_text)
+        secondary_overlap = lexical_overlap_score(secondary_context, candidate_text)
+        exclude_overlap = lexical_overlap_score(exclusion_text, candidate_text)
+        focus_bonus = (0.18 * main_overlap) + (0.06 * action_overlap) + (0.02 * secondary_overlap)
+        if exclude_overlap > main_overlap:
+            focus_bonus -= 0.10 * exclude_overlap
+        updated["main_object_overlap"] = main_overlap
+        updated["procurement_action_overlap"] = action_overlap
+        updated["secondary_context_overlap"] = secondary_overlap
+        updated["exclude_as_primary_overlap"] = exclude_overlap
+        updated["score_before_object_focus"] = float(updated.get("score") or 0.0)
+        updated["object_focus_bonus"] = focus_bonus
+        updated["score"] = float(updated["score_before_object_focus"]) + focus_bonus
+        reranked.append(updated)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return reranked
+
+
+def _compact_hint_text(value: str, *, max_tokens: int = 6) -> str:
+    tokens = [token for token in _normalize_free_text(value).split() if len(token) > 2]
+    return " ".join(tokens[:max_tokens])
+
+
+def _augment_query_with_cpv_db_hints(
+    *,
+    sqlite_path: str | None,
+    main_object: str,
+    translated_query: str,
+    procurement_action: str,
+    max_hints: int = 3,
+) -> Dict[str, object]:
+    if not sqlite_path or not os.path.exists(sqlite_path):
+        return {"status": "no_sqlite_index", "english_hints": [], "multilingual_hints": []}
+    query_en = translated_query.strip() or main_object.strip()
+    query_local = main_object.strip() or translated_query.strip()
+    if not query_en and not query_local:
+        return {"status": "empty_query", "english_hints": [], "multilingual_hints": []}
+
+    probe_rows: List[Dict[str, object]] = []
+    if query_en:
+        probe_rows.extend(
+            sqlite_lexical_search(
+                sqlite_path=sqlite_path,
+                query=query_en,
+                k=8,
+                fields=["search_text_en"],
+            )
+        )
+    if query_local:
+        probe_rows.extend(
+            sqlite_lexical_search(
+                sqlite_path=sqlite_path,
+                query=query_local,
+                k=8,
+                fields=["search_text_multilingual"],
+            )
+        )
+
+    english_hints: List[str] = []
+    multilingual_hints: List[str] = []
+    seen = set()
+    for row in probe_rows:
+        code = str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        label = _compact_hint_text(str(row.get("cpv_label") or ""), max_tokens=5)
+        keywords = _compact_hint_text(str(row.get("keywords_en") or row.get("generated_keywords_en") or ""), max_tokens=5)
+        procurement_type = _compact_hint_text(str(row.get("procurement_type") or ""), max_tokens=3)
+        object_overlap = lexical_overlap_score(main_object, " ".join([label, keywords]))
+        if object_overlap < 0.15 and label:
+            continue
+        if label:
+            english_hints.append(label)
+        if keywords and keywords != label:
+            english_hints.append(keywords)
+        if procurement_type and procurement_action and lexical_overlap_score(procurement_action, procurement_type) > 0.2:
+            english_hints.append(procurement_type)
+        aliases = _compact_hint_text(str(row.get("description_multilingual_aliases") or ""), max_tokens=5)
+        if aliases:
+            multilingual_hints.append(aliases)
+        if len(english_hints) >= max_hints * 2 and len(multilingual_hints) >= max_hints:
+            break
+
+    dedup_en = []
+    seen_en = set()
+    for hint in english_hints:
+        key = hint.casefold()
+        if hint and key not in seen_en:
+            seen_en.add(key)
+            dedup_en.append(hint)
+    dedup_local = []
+    seen_local = set()
+    for hint in multilingual_hints:
+        key = hint.casefold()
+        if hint and key not in seen_local:
+            seen_local.add(key)
+            dedup_local.append(hint)
+    return {
+        "status": "ok" if (dedup_en or dedup_local) else "no_hints",
+        "english_hints": dedup_en[: max_hints * 2],
+        "multilingual_hints": dedup_local[:max_hints],
+    }
+
+
+def _should_apply_llm_rerank(rows: List[Dict[str, object]], query_text: str, *, top_k: int) -> tuple[bool, str]:
+    if len(rows) < 2:
+        return False, "not_enough_candidates"
+    head = rows[: min(max(top_k, 3), len(rows))]
+    scores = [float(row.get("score") or 0.0) for row in head[:3]]
+    margin = scores[0] - scores[1] if len(scores) >= 2 else 1.0
+    top_branch_prefixes = {str(row.get("cpv_code") or "")[:5] for row in head[:3] if str(row.get("cpv_code") or "").strip()}
+    query_types = set(_infer_contract_types(query_text))
+    top_candidate_types = [set(str(row.get("candidate_contract_types") or "").split(",")) - {""} for row in head[:3]]
+    specific_types = {"maintenance_repair", "installation_work", "consultancy", "security_service", "software_it_service"}
+    query_specific = query_types & specific_types
+    if margin <= 0.03:
+        return True, "close_score_margin"
+    if len(top_branch_prefixes) <= 2:
+        return True, "same_branch_cluster"
+    if query_specific and any(query_specific.isdisjoint(candidate_types & specific_types) for candidate_types in top_candidate_types[:2]):
+        return True, "specific_contract_type_conflict"
+    if query_types and top_candidate_types and any(query_types.isdisjoint(candidate_types) for candidate_types in top_candidate_types[:2]):
+        return True, "contract_type_conflict"
+    if len(_extract_procurement_object(query_text)["object_query"].split()) <= 4:
+        return True, "short_object_query"
+    return False, "high_confidence_no_llm"
+
+
+def _calibrated_prediction_confidence(rows: List[Dict[str, object]]) -> float | None:
+    if not rows:
+        return None
+    base_confidence = _normalized_prediction_confidence(rows[0].get("score"))
+    if base_confidence is None:
+        return None
+    if len(rows) < 2:
+        return base_confidence
+    top_score = float(rows[0].get("score") or 0.0)
+    second_score = float(rows[1].get("score") or 0.0)
+    margin = max(0.0, top_score - second_score)
+    margin_factor = min(1.0, margin / 0.12)
+    top_branches = {
+        str(row.get("cpv_code") or "")[:5]
+        for row in rows[:3]
+        if str(row.get("cpv_code") or "").strip()
+    }
+    branch_factor = 1.0 if len(top_branches) <= 1 else 0.72 if len(top_branches) == 2 else 0.55
+    return max(0.05, min(1.0, base_confidence * ((0.45 + (0.55 * margin_factor)) * branch_factor)))
 
 
 def _normalize_header(value: object) -> str:
@@ -193,11 +615,37 @@ def _ranked_aliases(rank: int, bases: List[str]) -> List[str]:
                 f"{rank} {base}",
             ]
         )
+        for marker in ("cpv", "chunk", "vector", "score", "reasoning", "title", "id"):
+            marker_index = compact.find(marker)
+            if marker_index > 0:
+                aliases.append(f"{compact[:marker_index]}rank{rank}{compact[marker_index:]}")
+                break
     return list(dict.fromkeys(aliases))
 
 
+ID_FIELD_ALIASES = [
+    "Record ID",
+    "id",
+    "query_id",
+    "question_id",
+    "banf_id",
+]
+QUERY_FIELD_ALIASES = [
+    "Query Text",
+    "query",
+    "question",
+    "user_query",
+    "query_banf",
+    "banf",
+    "Notice Description",
+]
+ANSWER_FIELD_ALIASES = ["LLM Answer", "Answer", "Generated Answer", "Final Answer", "RAG Answer"]
+RETRIEVED_PREDICTION_FIELD_ALIASES = ["Retrieved CPV", "Retrieved CPV Code"]
+RETRIEVED_SCORE_FIELD_ALIASES = ["Retrieved Vector Score", "Retrieved Score"]
+RETRIEVED_CHUNK_TEXT_FIELD_ALIASES = ["Retrieved Chunk Text", "Retrieved Context", "Retrieved Chunks"]
 PREDICTION_FIELD_ALIASES = [
     "Predicted CPV",
+    "Predicted CPV Code",
     "Predicted answer",
     "Prediction",
     "Predicted",
@@ -209,6 +657,8 @@ PREDICTION_FIELD_ALIASES = [
     "Code",
 ]
 SCORE_FIELD_ALIASES = [
+    "Predicted Vector Score",
+    "Retrieved Vector Score",
     "Vector Score",
     "RRF Score",
     "Score",
@@ -232,6 +682,7 @@ CHUNK_TEXT_FIELD_ALIASES = [
     "Candidate Text",
 ]
 EXPECTED_FIELD_ALIASES = [
+    "Ground Truth CPV",
     "Expected CPV",
     "Gold CPV",
     "Reference CPV",
@@ -251,19 +702,19 @@ def _input_contract_fields() -> Dict[str, object]:
             {
                 "name": "id",
                 "required": True,
-                "aliases": ["id", "query_id", "question_id", "banf_id"],
+                "aliases": [_normalize_header(alias) for alias in ID_FIELD_ALIASES],
                 "description": "Stable record id used to group candidates belonging to one query.",
             },
             {
                 "name": "query",
                 "required": True,
-                "aliases": ["query", "question", "user_query", "query_banf", "banf"],
+                "aliases": [_normalize_header(alias) for alias in QUERY_FIELD_ALIASES],
                 "description": "User request or source text to classify.",
             },
             {
                 "name": "expected_answer",
                 "required": True,
-                "aliases": ["expected", "expected_answer", "expected_cpv", "gold", "gold_cpv", "reference", "reference_cpv"],
+                "aliases": [_normalize_header(alias) for alias in EXPECTED_FIELD_ALIASES],
                 "description": "Reference answer used for evaluation.",
             },
             {
@@ -281,7 +732,7 @@ def _input_contract_fields() -> Dict[str, object]:
             {
                 "name": "answer",
                 "required": False,
-                "aliases": ["answer", "llm_answer", "generated_answer", "final_answer", "rag_answer"],
+                "aliases": [_normalize_header(alias) for alias in ANSWER_FIELD_ALIASES],
                 "description": "Optional final answer text if the classifier/RAG system already generated one.",
             },
             {
@@ -454,27 +905,42 @@ def _parse_float(value: object, fallback: float | None = None) -> float | None:
             return fallback
 
 
-def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> List[Dict[str, object]]:
+def _ranked_candidates_from_row(
+    row: Dict[str, object],
+    *,
+    row_index: int,
+    prediction_aliases: List[str],
+    score_aliases: List[str],
+    chunk_text_aliases: List[str],
+    chunk_title_aliases: List[str] | None = None,
+    chunk_id_aliases: List[str] | None = None,
+) -> List[Dict[str, object]]:
     candidates: List[Dict[str, object]] = []
-    prediction_bases = {_normalize_header(base) for base in PREDICTION_FIELD_ALIASES}
-    numbered_ranks = sorted(
-        {
-            int(match.group(1))
-            for key in row
-            for normalized_key in [_normalize_header(key)]
-            for match in [re.search(r"(\d+)$", normalized_key)]
-            if match and normalized_key[: match.start(1)] in prediction_bases
-        }
-    )
-    for rank in numbered_ranks:
-        predicted_codes = _extract_cpv_codes(_first_present(row, _ranked_aliases(rank, PREDICTION_FIELD_ALIASES)))
+    prediction_bases = {_normalize_header(base) for base in prediction_aliases}
+    chunk_title_aliases = chunk_title_aliases or []
+    chunk_id_aliases = chunk_id_aliases or []
+    numbered_ranks = set()
+    for key in row:
+        normalized_key = _normalize_header(key)
+        trailing_match = re.search(r"(\d+)$", normalized_key)
+        if trailing_match and normalized_key[: trailing_match.start(1)] in prediction_bases:
+            numbered_ranks.add(int(trailing_match.group(1)))
+            continue
+        middle_match = re.search(r"rank(\d+)", normalized_key)
+        if not middle_match:
+            continue
+        collapsed_key = normalized_key[: middle_match.start()] + normalized_key[middle_match.end() :]
+        if collapsed_key in prediction_bases:
+            numbered_ranks.add(int(middle_match.group(1)))
+    for rank in sorted(numbered_ranks):
+        predicted_codes = _extract_cpv_codes(_first_present(row, _ranked_aliases(rank, prediction_aliases)))
         if not predicted_codes:
             continue
-        score_raw = _first_present(row, _ranked_aliases(rank, SCORE_FIELD_ALIASES))
+        score_raw = _first_present(row, _ranked_aliases(rank, score_aliases))
         base_score = _parse_float(score_raw, fallback=max(0.0, 1.0 - rank * 0.001))
-        chunk_id = _first_present(row, _ranked_aliases(rank, CHUNK_ID_FIELD_ALIASES))
-        chunk_title = _first_present(row, _ranked_aliases(rank, CHUNK_TITLE_FIELD_ALIASES))
-        chunk_text = _first_present(row, _ranked_aliases(rank, CHUNK_TEXT_FIELD_ALIASES))
+        chunk_id = _first_present(row, _ranked_aliases(rank, chunk_id_aliases))
+        chunk_title = _first_present(row, _ranked_aliases(rank, chunk_title_aliases))
+        chunk_text = _first_present(row, _ranked_aliases(rank, chunk_text_aliases))
         for offset, predicted_code in enumerate(predicted_codes):
             candidates.append(
                 {
@@ -491,10 +957,10 @@ def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> 
     if candidates:
         return candidates
 
-    predicted_codes = _extract_cpv_codes(_first_present(row, PREDICTION_FIELD_ALIASES))
+    predicted_codes = _extract_cpv_codes(_first_present(row, prediction_aliases))
     if not predicted_codes:
         predicted_codes = [""]
-    score_raw = _first_present(row, SCORE_FIELD_ALIASES)
+    score_raw = _first_present(row, score_aliases)
     base_score = _parse_float(score_raw, fallback=max(0.0, 1.0 - row_index * 0.001))
     rank_raw = _first_present(row, ["rank", "position", "candidate_rank", "topkrank"])
     try:
@@ -506,14 +972,36 @@ def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> 
             "label": predicted_code,
             "score": float(base_score or 0.0) - (offset * 0.000001),
             "rank": rank_value,
-            "chunk_id": str(_first_present(row, CHUNK_ID_FIELD_ALIASES)).strip(),
-            "chunk_title": str(_first_present(row, CHUNK_TITLE_FIELD_ALIASES)).strip(),
-            "chunk_text": str(_first_present(row, CHUNK_TEXT_FIELD_ALIASES)).strip(),
+            "chunk_id": str(_first_present(row, chunk_id_aliases)).strip(),
+            "chunk_title": str(_first_present(row, chunk_title_aliases)).strip(),
+            "chunk_text": str(_first_present(row, chunk_text_aliases)).strip(),
             "source_row": row,
             "source_row_index": row_index,
         }
         for offset, predicted_code in enumerate(predicted_codes)
     ]
+
+
+def _prepared_candidates_from_row(row: Dict[str, object], *, row_index: int) -> List[Dict[str, object]]:
+    return _ranked_candidates_from_row(
+        row,
+        row_index=row_index,
+        prediction_aliases=PREDICTION_FIELD_ALIASES,
+        score_aliases=SCORE_FIELD_ALIASES,
+        chunk_text_aliases=CHUNK_TEXT_FIELD_ALIASES,
+        chunk_title_aliases=CHUNK_TITLE_FIELD_ALIASES,
+        chunk_id_aliases=CHUNK_ID_FIELD_ALIASES,
+    )
+
+
+def _prepared_retrieved_candidates_from_row(row: Dict[str, object], *, row_index: int) -> List[Dict[str, object]]:
+    return _ranked_candidates_from_row(
+        row,
+        row_index=row_index,
+        prediction_aliases=RETRIEVED_PREDICTION_FIELD_ALIASES,
+        score_aliases=RETRIEVED_SCORE_FIELD_ALIASES,
+        chunk_text_aliases=RETRIEVED_CHUNK_TEXT_FIELD_ALIASES,
+    )
 
 
 def _rank_prepared_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -1236,7 +1724,7 @@ def _catalog_row_from_prediction(
 
 def evaluate_local_ted_cpv_classifier(
     *,
-    cpv_catalog_path: str,
+    ted_corpus_export_path: str,
     queries_path: str,
     retriever: str,
     embedding_model: str,
@@ -1251,6 +1739,9 @@ def evaluate_local_ted_cpv_classifier(
     cross_encoder_rerank: bool = False,
     cross_encoder_model: str | None = None,
     cross_encoder_top_n: int = 10,
+    llm_rerank: bool = False,
+    llm_rerank_top_n: int = 10,
+    llm_rerank_weight: float = 0.4,
     kg_enabled: bool = False,
     kg_graph_weight: float = 0.35,
     kg_profile: str = "balanced",
@@ -1258,13 +1749,35 @@ def evaluate_local_ted_cpv_classifier(
     llm_config: LLMConfig | None = None,
     query_augmentation: str | None = None,
     query_augmentation_max_terms: int = 8,
+    search_backend_config: Dict[str, object] | None = None,
+    search_index_name: str | None = None,
 ) -> Dict[str, object]:
     import pandas as pd
 
-    catalog = load_cpv_catalog(cpv_catalog_path)
+    ted_notice_db_path = os.path.join(
+        str((search_backend_config or {}).get("index_dir") or ".rag_eval_indices"),
+        "ted_notices.sqlite",
+    )
+    bootstrap_catalog = load_cpv_catalog_from_ted_corpus_export(ted_corpus_export_path)
+    sync_cpv_profiles_to_db(
+        bootstrap_catalog,
+        use_examples=use_examples,
+        ted_notice_db_path=ted_notice_db_path,
+    )
+    catalog = load_cpv_catalog_from_db(ted_notice_db_path) or bootstrap_catalog
     queries = load_queries(queries_path)
-    chunks = build_cpv_chunks(catalog, use_examples=use_examples)
-    retriever_state = build_retriever(chunks, retriever, embedding_model)
+    chunks = build_cpv_chunks_from_db(ted_notice_db_path) or build_cpv_chunks(
+        catalog,
+        use_examples=use_examples,
+        ted_notice_db_path=ted_notice_db_path,
+    )
+    retriever_state = build_cpv_multi_retriever(
+        chunks,
+        embedding_model,
+        retriever,
+        search_backend_config=search_backend_config,
+        index_name=search_index_name,
+    )
     cpv_graph = build_cpv_knowledge_graph(catalog) if kg_enabled else None
     chunks_by_code = {str(chunk["cpv_code"]): chunk for chunk in chunks}
     # mean_cpv_hierarchy_similarity_top1 shows how close top-1 is to the reference label.
@@ -1281,11 +1794,15 @@ def evaluate_local_ted_cpv_classifier(
 
     resolved_cross_encoder_model = cross_encoder_model or DEFAULT_CROSS_ENCODER_MODEL
     ce_top_n = max(1, int(cross_encoder_top_n)) if cross_encoder_rerank else 0
-    candidate_k = max(top_k, ce_top_n) if cross_encoder_rerank else top_k
-
+    llm_top_n = max(1, int(llm_rerank_top_n)) if llm_rerank else 0
+    expanded_selector_pool = 500 if (kg_enabled or rerank_top_n > top_k or cross_encoder_rerank or llm_rerank) else max(top_k, 200)
     pool_size = min(
-        max(top_k, rerank_top_n or top_k, ce_top_n, 25 if kg_enabled else top_k),
+        max(top_k, rerank_top_n or top_k, ce_top_n, llm_top_n, expanded_selector_pool),
         len(chunks),
+    )
+    candidate_k = min(
+        len(chunks),
+        max(top_k, ce_top_n, llm_top_n, pool_size, 200 if (cross_encoder_rerank or llm_rerank or kg_enabled) else top_k),
     )
     effective_rerank_top_n = rerank_top_n if rerank_top_n else (10 if kg_enabled else 0)
     effective_rerank_weight = rerank_weight if rerank_top_n else (0.3 if kg_enabled else 0.25)
@@ -1293,21 +1810,53 @@ def evaluate_local_ted_cpv_classifier(
     base_llm_config = llm_config or LLMConfig(False, "gpt-4.1-mini", "OPENAI_API_KEY", 0.0)
 
     for query in queries:
+        llm_rerank_result = LLMCallResult(answer=None, used=False, status="disabled", error=None)
+        query_object = _extract_procurement_object(query.query)
+        cleaned_query = str(query_object["cleaned_query"])
+        object_query = str(query_object["object_query"])
+        procurement_action = str(query_object.get("procurement_action") or "")
+        secondary_context = str(query_object.get("secondary_context") or "")
+        exclude_as_primary = [str(item) for item in query_object.get("exclude_as_primary", []) if str(item).strip()]
         query_augmentation_config = (
             LLMConfig(True, base_llm_config.model, base_llm_config.api_key_env, 0.0)
-            if resolved_query_augmentation in {"llm", "hyde"}
+            if resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES
             else base_llm_config
         )
         query_augmentation_result = augment_query_with_llm(
-            query.query,
+            object_query,
             query_augmentation_config,
             mode=resolved_query_augmentation,
             max_terms=query_augmentation_max_terms,
         )
-        retrieval_query = query_augmentation_result.answer or query.query
+        retrieval_query = query_augmentation_result.answer or object_query
+        translated_query = retrieval_query
+        if resolved_query_augmentation == "translate_en" and translated_query.startswith(object_query):
+            translated_query = translated_query[len(object_query):].strip() or retrieval_query
+        elif resolved_query_augmentation == "translate_en" and translated_query.startswith(query.query):
+            translated_query = translated_query[len(query.query):].strip() or retrieval_query
+        object_translation = translated_query if translated_query.strip() else retrieval_query
+        db_query_hints = _augment_query_with_cpv_db_hints(
+            sqlite_path=str(retriever_state.get("sqlite_path") or ""),
+            main_object=object_query,
+            translated_query=object_translation,
+            procurement_action=procurement_action,
+        )
+        english_hint_suffix = " ".join(str(item) for item in db_query_hints.get("english_hints", []) if str(item).strip())
+        multilingual_hint_suffix = " ".join(str(item) for item in db_query_hints.get("multilingual_hints", []) if str(item).strip())
+        if english_hint_suffix:
+            object_translation = f"{object_translation} {english_hint_suffix}".strip()
+            translated_query = f"{translated_query} {english_hint_suffix}".strip()
+        if multilingual_hint_suffix:
+            cleaned_query = f"{cleaned_query} {multilingual_hint_suffix}".strip()
 
-        base_retrieved = retrieve_top_k(
-            query=retrieval_query,
+        base_retrieved = retrieve_top_k_cpv_multi(
+            query_original=cleaned_query or query.query,
+            query_translated_to_en=translated_query,
+            query_object=object_query,
+            query_object_translated=object_translation,
+            procurement_action=procurement_action,
+            secondary_context=secondary_context,
+            exclude_as_primary=exclude_as_primary,
             retriever_state=retriever_state,
             chunks=chunks,
             k=pool_size,
@@ -1318,6 +1867,13 @@ def evaluate_local_ted_cpv_classifier(
             top_k=min(max(top_k, 25 if kg_enabled else top_k), len(base_retrieved)),
             rerank_top_n=effective_rerank_top_n,
             rerank_weight=effective_rerank_weight,
+        )
+        base_retrieved = _apply_object_focus_rerank(
+            base_retrieved,
+            main_object=object_query,
+            procurement_action=procurement_action,
+            secondary_context=secondary_context,
+            exclude_as_primary=exclude_as_primary,
         )
         kg_retrieval = {
             "enabled": False,
@@ -1353,10 +1909,41 @@ def evaluate_local_ted_cpv_classifier(
             retrieved = rerank_with_cross_encoder(
                 query=retrieval_query,
                 rows=ce_source[: min(ce_top_n, len(ce_source))],
-                top_k=min(top_k, len(chunks)),
-                rerank_top_n=ce_top_n,
+                top_k=min(max(top_k, llm_top_n), len(chunks)),
+                rerank_top_n=min(max(ce_top_n, 200), len(ce_source)),
                 model_name=resolved_cross_encoder_model,
+                fusion_weight=0.55,
             )
+        else:
+            retrieved = retrieved[: min(max(top_k, llm_top_n), len(retrieved))]
+
+        retrieved = _apply_object_focus_rerank(
+            retrieved,
+            main_object=object_query,
+            procurement_action=procurement_action,
+            secondary_context=secondary_context,
+            exclude_as_primary=exclude_as_primary,
+        )
+        retrieved = _apply_contract_type_rerank(retrieved, f"{object_query} {procurement_action}".strip() or retrieval_query)
+        apply_llm, llm_reason = _should_apply_llm_rerank(retrieved, retrieval_query, top_k=top_k)
+        if llm_rerank and apply_llm:
+            llm_rerank_result_config = LLMConfig(
+                True,
+                base_llm_config.model,
+                base_llm_config.api_key_env,
+                0.0,
+            )
+            retrieved, llm_rerank_result = rerank_candidates_with_llm(
+                question=f"{query.query}\nNormalized procurement object: {object_query}",
+                rows=retrieved,
+                llm_config=llm_rerank_result_config,
+                top_k=min(top_k, len(retrieved)),
+                rerank_top_n=llm_top_n,
+                rerank_weight=llm_rerank_weight,
+            )
+            llm_rerank_result.status = f"{llm_rerank_result.status}:{llm_reason}"
+        elif llm_rerank:
+            llm_rerank_result = LLMCallResult(answer=None, used=False, status=f"skipped:{llm_reason}", error=None)
         else:
             retrieved = retrieved[: min(top_k, len(retrieved))]
 
@@ -1369,9 +1956,17 @@ def evaluate_local_ted_cpv_classifier(
                 ],
                 metadata={
                     "query": query.query,
+                    "cleaned_query": cleaned_query,
+                    "object_query": object_query,
+                    "procurement_action": procurement_action,
+                    "secondary_context": secondary_context,
                     "retrieval_query": retrieval_query,
+                    "db_query_hint_status": db_query_hints.get("status"),
+                    "db_query_hints_en": " | ".join(str(item) for item in db_query_hints.get("english_hints", [])),
+                    "db_query_hints_local": " | ".join(str(item) for item in db_query_hints.get("multilingual_hints", [])),
                     "query_augmentation_mode": resolved_query_augmentation,
                     "query_augmentation_status": query_augmentation_result.status,
+                    "llm_rerank_status": llm_rerank_result.status,
                 },
             )
         )
@@ -1419,7 +2014,7 @@ def evaluate_local_ted_cpv_classifier(
         )
         classifier_auto_flag = _cpv_auto_flag(classification_metrics)
         diagnostics = _cpv_diagnostics(classification_metrics, retrieval_metrics)
-        prediction_confidence = _normalized_prediction_confidence(retrieved[0]["score"]) if retrieved else None
+        prediction_confidence = _calibrated_prediction_confidence(retrieved)
         cpv_rank_diagnostics = _cpv_rank_diagnostics(
             expected_codes=[query.gold_cpv_code],
             ranked_labels=[str(row["cpv_code"]) for row in retrieved[:top_k]],
@@ -1444,9 +2039,12 @@ def evaluate_local_ted_cpv_classifier(
                 {
                     "question_id": query.id,
                     "question": query.query,
+                    "cleaned_query": cleaned_query,
+                    "object_query": object_query,
                     "retrieval_query": retrieval_query,
                     "query_augmentation_mode": resolved_query_augmentation,
                     "query_augmentation_status": query_augmentation_result.status,
+                    "llm_rerank_status": llm_rerank_result.status,
                     "rank": rank,
                     "auto_flag": classifier_auto_flag,
                     "retriever": retriever,
@@ -1454,6 +2052,10 @@ def evaluate_local_ted_cpv_classifier(
                     "score": row["score"],
                     "base_retrieval_score": row.get("base_retrieval_score", row["score"]),
                     "cross_encoder_score": row.get("cross_encoder_score", 0.0),
+                    "llm_rerank_score": row.get("llm_rerank_score", 0.0),
+                    "contract_type_bonus": row.get("contract_type_bonus", 0.0),
+                    "query_contract_types": row.get("query_contract_types", ""),
+                    "candidate_contract_types": row.get("candidate_contract_types", ""),
                     "kg_graph_score": row.get("kg_graph_score", 0.0),
                     "kg_path_score": row.get("kg_path_score", 0.0),
                     "retrieval_source": row.get("retrieval_source", "vector"),
@@ -1477,6 +2079,8 @@ def evaluate_local_ted_cpv_classifier(
                 "retrieval_query": retrieval_query,
                 "query_augmentation_mode": resolved_query_augmentation,
                 "query_augmentation_status": query_augmentation_result.status,
+                "llm_rerank_status": llm_rerank_result.status,
+                "llm_rerank_error": llm_rerank_result.error,
                 **classification_metrics,
                 "answer_accuracy_label": classifier_auto_flag,
                 "expected_answerable": answer_metrics.expected_answerable,
@@ -1526,6 +2130,7 @@ def evaluate_local_ted_cpv_classifier(
                 "retrieval_query": retrieval_query,
                 "query_augmentation_mode": resolved_query_augmentation,
                 "query_augmentation_status": query_augmentation_result.status,
+                "llm_rerank_status": llm_rerank_result.status,
                 **classification_metrics,
                 "program_id": "cpv",
                 "program_name": "CPV",
@@ -1547,9 +2152,12 @@ def evaluate_local_ted_cpv_classifier(
             {
                 "question_id": query.id,
                 "question": query.query,
+                "cleaned_query": cleaned_query,
+                "object_query": object_query,
                 "retrieval_query": retrieval_query,
                 "query_augmentation_mode": resolved_query_augmentation,
                 "query_augmentation_status": query_augmentation_result.status,
+                "llm_rerank_status": llm_rerank_result.status,
                 "program_id": "cpv",
                 "program_name": "CPV",
                 "doc_id": query.gold_cpv_code,
@@ -1575,9 +2183,12 @@ def evaluate_local_ted_cpv_classifier(
                 {
                 "question_id": query.id,
                 "question": query.query,
+                "cleaned_query": cleaned_query,
+                "object_query": object_query,
                 "retrieval_query": retrieval_query,
                 "query_augmentation_mode": resolved_query_augmentation,
                 "query_augmentation_status": query_augmentation_result.status,
+                "llm_rerank_status": llm_rerank_result.status,
                 "program_id": "cpv",
                 "program_name": "CPV",
                 "doc_id": query.gold_cpv_code,
@@ -1708,8 +2319,9 @@ def evaluate_local_ted_cpv_classifier(
 
     summary = {
         "experiment": classifier_label,
-        "chunking_strategy": "cpv_entry",
+        "chunking_strategy": "cpv_profile_db",
         "retriever": retriever,
+        "search_backend": retriever_state.get("search_backend", {"backend": "local", "index_name": None}),
         "chunk_size": 0,
         "chunk_overlap": 0,
         "hybrid_alpha": None,
@@ -1725,6 +2337,15 @@ def evaluate_local_ted_cpv_classifier(
             "type": "cross_encoder",
             "model": resolved_cross_encoder_model if cross_encoder_rerank else None,
             "top_n": ce_top_n if cross_encoder_rerank else 0,
+            "fusion_weight": 0.55 if cross_encoder_rerank else 0.0,
+        },
+        "llm_reranker": {
+            "enabled": llm_rerank,
+            "type": "llm",
+            "model": base_llm_config.model if llm_rerank else None,
+            "top_n": llm_top_n if llm_rerank else 0,
+            "weight": llm_rerank_weight if llm_rerank else 0.0,
+            "conditional": True if llm_rerank else False,
         },
         "n_chunks": len(chunks),
         "n_questions": len(queries),
@@ -1734,13 +2355,15 @@ def evaluate_local_ted_cpv_classifier(
         "retrieval_metrics": aggregate_retrieval_metrics,
         "diagnostics": aggregate_diagnostics,
         "llm": {
-            "enabled": base_llm_config.enabled or resolved_query_augmentation in {"llm", "hyde"},
-            "model": base_llm_config.model if (base_llm_config.enabled or resolved_query_augmentation in {"llm", "hyde"}) else None,
+            "enabled": base_llm_config.enabled or resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES or llm_rerank,
+            "model": base_llm_config.model if (base_llm_config.enabled or resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES or llm_rerank) else None,
             "answer_generation": False,
         },
         "evaluation_settings": {
             "query_augmentation": resolved_query_augmentation,
             "query_augmentation_max_terms": query_augmentation_max_terms,
+            "query_cleaning": True,
+            "contract_type_aware_rerank": True,
         },
         "classifier": {
             "type": "ted_cpv",
@@ -1820,7 +2443,7 @@ def evaluate_local_ted_cpv_classifier(
 def evaluate_prepared_rag_results_classifier(
     *,
     prepared_results_path: str,
-    cpv_catalog_path: str,
+    ted_corpus_export_path: str,
     top_k: int,
     classifier_label: str,
     run_dir: str,
@@ -1833,7 +2456,7 @@ def evaluate_prepared_rag_results_classifier(
     if not rows:
         raise ValueError(f"No data rows found in {prepared_results_path}.")
 
-    catalog = load_cpv_catalog(cpv_catalog_path)
+    catalog = load_cpv_catalog_from_ted_corpus_export(ted_corpus_export_path)
     catalog_chunks = build_cpv_chunks(catalog, use_examples=True)
     parent_lookup = build_parent_lookup(catalog)
     catalog_by_code = {record.code: record for record in catalog}
@@ -1842,12 +2465,10 @@ def evaluate_prepared_rag_results_classifier(
 
     grouped: Dict[str, Dict[str, object]] = {}
     for row_index, row in enumerate(rows, start=1):
-        query_id = str(_first_present(row, ["id", "queryid", "questionid", "banfid"]) or row_index).strip()
-        query_text = str(_first_present(row, ["querybanf", "query", "question", "banf"]) or "").strip()
+        query_id = str(_first_present(row, ID_FIELD_ALIASES) or row_index).strip()
+        query_text = str(_first_present(row, QUERY_FIELD_ALIASES) or "").strip()
         expected_codes = _extract_cpv_codes(_first_present(row, EXPECTED_FIELD_ALIASES))
-        llm_answer = str(
-            _first_present(row, ["llmanswer", "answer", "generatedanswer", "finalanswer", "raganswer"]) or ""
-        ).strip()
+        llm_answer = str(_first_present(row, ANSWER_FIELD_ALIASES) or "").strip()
 
         group = grouped.setdefault(
             query_id,
@@ -1856,7 +2477,8 @@ def evaluate_prepared_rag_results_classifier(
                 "query": query_text,
                 "expected_codes": expected_codes,
                 "llm_answer": llm_answer,
-                "rows": [],
+                "predicted_rows": [],
+                "retrieved_rows": [],
             },
         )
         if query_text and not group["query"]:
@@ -1867,8 +2489,12 @@ def evaluate_prepared_rag_results_classifier(
             group["llm_answer"] = llm_answer
         for candidate in _prepared_candidates_from_row(row, row_index=row_index):
             if candidate.get("rank") is None:
-                candidate["rank"] = len(group["rows"]) + 1
-            group["rows"].append(candidate)
+                candidate["rank"] = len(group["predicted_rows"]) + 1
+            group["predicted_rows"].append(candidate)
+        for candidate in _prepared_retrieved_candidates_from_row(row, row_index=row_index):
+            if candidate.get("rank") is None:
+                candidate["rank"] = len(group["retrieved_rows"]) + 1
+            group["retrieved_rows"].append(candidate)
 
     prediction_records: List[PredictionRecord] = []
     evaluation_items = []
@@ -1877,13 +2503,32 @@ def evaluate_prepared_rag_results_classifier(
     answer_metric_rows: List[Dict[str, object]] = []
     retrieval_metric_rows: List[Dict[str, object]] = []
     diagnostic_rows: List[Dict[str, object]] = []
+    effective_predicted_top_k = max(
+        (len(_rank_prepared_candidates(group["predicted_rows"])) for group in grouped.values()),
+        default=0,
+    )
+    effective_retrieved_top_k = max(
+        (
+            len(_rank_prepared_candidates(group["retrieved_rows"]) or _rank_prepared_candidates(group["predicted_rows"]))
+            for group in grouped.values()
+        ),
+        default=0,
+    )
+    effective_predicted_top_k = min(top_k, effective_predicted_top_k) if effective_predicted_top_k else 0
+    effective_retrieved_top_k = max(
+        effective_predicted_top_k,
+        min(max(top_k, effective_retrieved_top_k), effective_retrieved_top_k) if effective_retrieved_top_k else 0,
+    )
 
     for group in grouped.values():
         query_id = str(group["id"])
         query_text = str(group["query"])
         expected_codes = [str(code) for code in group["expected_codes"] if str(code).strip()]
-        candidates_raw = _rank_prepared_candidates(group["rows"])[:top_k]
-        retrieved_rows_for_query = [
+        candidates_raw = _rank_prepared_candidates(group["predicted_rows"])[:effective_predicted_top_k]
+        retrieved_candidates_raw = _rank_prepared_candidates(group["retrieved_rows"])[:effective_retrieved_top_k]
+        if not retrieved_candidates_raw:
+            retrieved_candidates_raw = candidates_raw
+        predicted_rows_for_query = [
             _prepared_candidate_row(
                 query_id=query_id,
                 candidate_label=str(candidate["label"]),
@@ -1896,15 +2541,28 @@ def evaluate_prepared_rag_results_classifier(
             for rank, candidate in enumerate(candidates_raw, start=1)
             if str(candidate.get("label", "")).strip()
         ]
+        retrieved_rows_for_query = [
+            _prepared_candidate_row(
+                query_id=query_id,
+                candidate_label=str(candidate["label"]),
+                score=float(candidate["score"]),
+                rank=rank,
+                query_text=query_text,
+                catalog_by_code=catalog_by_code,
+                candidate=candidate,
+            )
+            for rank, candidate in enumerate(retrieved_candidates_raw, start=1)
+            if str(candidate.get("label", "")).strip()
+        ]
         normalized_candidates = [
             RankedCandidate(
                 label=str(row["cpv_code"]),
                 score=float(row["score"]),
                 metadata={"source": "prepared_rag_results"},
             )
-            for row in retrieved_rows_for_query
+            for row in predicted_rows_for_query
         ]
-        ranked_labels = [candidate.label for candidate in normalized_candidates[:top_k]]
+        ranked_labels = [candidate.label for candidate in normalized_candidates[:effective_predicted_top_k]]
         classification_metrics = _cpv_classification_metrics(
             expected_codes=expected_codes,
             ranked_labels=ranked_labels,
@@ -1957,7 +2615,7 @@ def evaluate_prepared_rag_results_classifier(
             item=item,
             retrieved=retrieved_rows_for_query,
             candidate_chunks=catalog_chunks,
-            k=min(top_k, len(catalog_chunks)),
+            k=min(effective_retrieved_top_k, len(catalog_chunks)),
         )
         diagnostics = diagnose_failure(
             answer_metrics=answer_metrics,
@@ -1977,11 +2635,11 @@ def evaluate_prepared_rag_results_classifier(
             ranked_labels=ranked_labels,
             scores=[
                 float(candidate.score)
-                for candidate in normalized_candidates[:top_k]
+                for candidate in normalized_candidates[:effective_predicted_top_k]
                 if candidate.score is not None
             ],
             query_text=query_text,
-            top_k=top_k,
+            top_k=effective_predicted_top_k,
             prediction_confidence=prediction_confidence,
         )
 
@@ -2178,6 +2836,7 @@ def evaluate_prepared_rag_results_classifier(
                     "gold_cpv_label": gold_label,
                     "gold_cpv_description": gold_description,
                     "prepared_candidate_count": len(normalized_candidates),
+                    "prepared_retrieved_candidate_count": len(retrieved_rows_for_query),
                 }
             )
         )
@@ -2258,7 +2917,7 @@ def evaluate_prepared_rag_results_classifier(
     aggregate_answer_metrics = _cpv_outcome_summary(metric_rows)
     aggregate_retrieval_metrics = _cpv_retrieval_summary(retrieval_metric_rows)
     aggregate_diagnostics = summarize_diagnostics(diagnostic_rows)
-    aggregate_cpv_diagnostics = _summarize_cpv_diagnostics(metric_rows, top_k=top_k)
+    aggregate_cpv_diagnostics = _summarize_cpv_diagnostics(metric_rows, top_k=effective_predicted_top_k)
     classifier_calibration = summarize_confidence_calibration(
         result_rows,
         confidence_key="prediction_confidence",
@@ -2267,8 +2926,9 @@ def evaluate_prepared_rag_results_classifier(
     ranking_metrics = evaluate_ranked_predictions(
         evaluation_items,
         prediction_records,
-        top_k=top_k,
+        top_k=effective_predicted_top_k,
         distance_fn=cpv_structural_distance,
+        precision_denominator="returned_k",
     )
 
     retrieval_metrics_json = os.path.join(run_dir, "retrieval_metrics_summary.json")
@@ -2285,7 +2945,7 @@ def evaluate_prepared_rag_results_classifier(
         "chunk_size": 0,
         "chunk_overlap": 0,
         "hybrid_alpha": None,
-        "top_k": top_k,
+        "top_k": effective_predicted_top_k,
         "reranker": {"enabled": False, "type": None, "top_n": 0, "weight": 0.0},
         "n_chunks": len(catalog_chunks),
         "n_questions": len(grouped),
@@ -2303,6 +2963,7 @@ def evaluate_prepared_rag_results_classifier(
             "type": "prepared_rag_results",
             "label": classifier_label,
             "source_path": prepared_results_path,
+            "retrieval_top_k": effective_retrieved_top_k,
             "ranking_metrics": ranking_metrics,
             "calibration": classifier_calibration,
             "cpv_diagnostics": aggregate_cpv_diagnostics,
@@ -2384,7 +3045,7 @@ def evaluate_api_ted_cpv_classifier(
     auth_token_env: str,
     extra_headers: Dict[str, object],
     timeout_seconds: float,
-    cpv_catalog_path: str,
+    ted_corpus_export_path: str,
     queries_path: str,
     top_k: int,
     classifier_label: str,
@@ -2394,7 +3055,7 @@ def evaluate_api_ted_cpv_classifier(
 ) -> Dict[str, object]:
     import pandas as pd
 
-    catalog = load_cpv_catalog(cpv_catalog_path)
+    catalog = load_cpv_catalog_from_ted_corpus_export(ted_corpus_export_path)
     queries = load_queries(queries_path)
     catalog_chunks = build_cpv_chunks(catalog, use_examples=True)
     parent_lookup = build_parent_lookup(catalog)

@@ -161,6 +161,7 @@ def evaluate_ranked_predictions(
     *,
     top_k: int = 5,
     distance_fn: Callable[[str, str], int | None] | None = None,
+    precision_denominator: str = "top_k",
 ) -> Dict[str, object]:
     prediction_map = {prediction.id: prediction for prediction in predictions}
 
@@ -202,7 +203,11 @@ def evaluate_ranked_predictions(
             continue
 
         exact_hits = [label for label in ranked_labels if label in gold_set]
-        precision_at_k_values.append(len(exact_hits) / top_k if top_k else 0.0)
+        if precision_denominator == "returned_k":
+            precision_k = len(ranked_labels)
+        else:
+            precision_k = top_k
+        precision_at_k_values.append(len(exact_hits) / precision_k if precision_k else 0.0)
 
         if top1 in gold_set:
             exact_top1 += 1

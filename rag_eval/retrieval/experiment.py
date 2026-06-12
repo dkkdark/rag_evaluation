@@ -20,6 +20,7 @@ from rag_eval.retrieval.kg import (
 )
 from rag_eval.evaluation.judge import judge_claims_with_llm
 from rag_eval.evaluation.llm import (
+    LLM_QUERY_AUGMENTATION_MODES,
     augment_query_with_llm,
     critique_and_revise_answer_with_llm,
     generate_answer_with_llm,
@@ -39,7 +40,7 @@ from rag_eval.evaluation.metrics import (
     summarize_retrieval_metrics,
 )
 from rag_eval.core.models import LLMCallResult, LLMConfig, Paragraph, Section
-from rag_eval.retrieval.engines import build_retriever, rerank_with_lexical_signal, retrieve_top_k
+from rag_eval.retrieval.engines import build_retriever_with_backend, rerank_with_lexical_signal, retrieve_top_k
 from rag_eval.core.text_utils import metadata_value_matches
 from rag_eval.reporting.visualization import (
     write_chunk_relevance_comparison_svg,
@@ -348,6 +349,8 @@ def run_single_experiment(
     self_rag_critique: bool = False,
     rerank_top_n: int = 0,
     rerank_weight: float = 0.25,
+    search_backend_config: Dict[str, object] | None = None,
+    search_index_name: str | None = None,
 ) -> Dict:
     import pandas as pd
 
@@ -397,14 +400,20 @@ def run_single_experiment(
         pd.DataFrame(kg_graph["entities"]).to_csv(kg_entities_csv, index=False)
         pd.DataFrame(kg_graph["relations"]).to_csv(kg_relations_csv, index=False)
 
-    retriever_state = build_retriever(chunks, retriever_type, embedding_model)
+    retriever_state = build_retriever_with_backend(
+        chunks,
+        retriever_type,
+        embedding_model,
+        search_backend_config=search_backend_config,
+        index_name=search_index_name,
+    )
     faiss_path: Optional[str] = None
-    if retriever_type == "dense":
+    if retriever_state.get("backend") == "dense":
         import faiss
 
         faiss_path = os.path.join(experiment_dir, "index.faiss")
         faiss.write_index(retriever_state["index"], faiss_path)
-    elif retriever_type == "hybrid":
+    elif retriever_state.get("backend") == "hybrid":
         import faiss
 
         faiss_path = os.path.join(experiment_dir, "dense_index.faiss")
@@ -423,7 +432,7 @@ def run_single_experiment(
         question_type = infer_question_type(item)
         query_augmentation_config = (
             LLMConfig(True, llm_config.model, llm_config.api_key_env, 0.0)
-            if resolved_query_augmentation in {"llm", "hyde"}
+            if resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES
             else llm_config
         )
         query_augmentation_result = augment_query_with_llm(
@@ -1300,6 +1309,7 @@ def run_single_experiment(
         "experiment": experiment_slug,
         "chunking_strategy": strategy,
         "retriever": retriever_type,
+        "search_backend": retriever_state.get("search_backend", {"backend": "local", "index_name": None}),
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
         "hybrid_alpha": hybrid_alpha if retriever_type == "hybrid" else None,
@@ -1351,7 +1361,7 @@ def run_single_experiment(
         "llm": {
             "enabled": (
                 llm_config.enabled
-                or resolved_query_augmentation in {"llm", "hyde"}
+                or resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES
                 or self_rag_retry_on_weak_evidence
                 or self_rag_critique
             ),
@@ -1359,7 +1369,7 @@ def run_single_experiment(
                 llm_config.model
                 if (
                     llm_config.enabled
-                    or resolved_query_augmentation in {"llm", "hyde"}
+                    or resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES
                     or self_rag_retry_on_weak_evidence
                     or self_rag_critique
                 )

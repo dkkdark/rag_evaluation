@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import binascii
 import csv
-import html
 import json
 import os
 import re
@@ -157,6 +156,9 @@ def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not bool_flag(active, "cross_encoder_rerank"):
         active.pop("cross_encoder_model", None)
         active.pop("cross_encoder_top_n", None)
+    if not bool_flag(active, "llm_rerank"):
+        active.pop("llm_rerank_top_n", None)
+        active.pop("llm_rerank_weight", None)
 
     chunking = str(active.get("chunking") or "")
     if chunking != "auto":
@@ -178,19 +180,20 @@ def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
         active.pop("self_rag_retry_max_attempts", None)
 
     query_augmentation = str(active.get("query_augmentation") or "").strip().lower()
-    if query_augmentation not in {"llm", "hyde"}:
+    if query_augmentation not in {"llm", "hyde", "translate_en"}:
         active.pop("query_augmentation_max_terms", None)
     if query_augmentation in {"", "none"}:
         active.pop("query_augmentation", None)
 
     llm_needed = (
         bool_flag(active, "llm_enable")
+        or bool_flag(active, "llm_rerank")
         or bool_flag(active, "judge_enable")
-        or query_augmentation in {"llm", "hyde"}
+        or query_augmentation in {"llm", "hyde", "translate_en"}
         or bool_flag(active, "self_rag_retry_on_weak_evidence")
         or bool_flag(active, "self_rag_critique")
     )
-    if not (bool_flag(active, "llm_enable") or query_augmentation in {"llm", "hyde"} or bool_flag(active, "self_rag_retry_on_weak_evidence") or bool_flag(active, "self_rag_critique")):
+    if not (bool_flag(active, "llm_enable") or bool_flag(active, "llm_rerank") or query_augmentation in {"llm", "hyde", "translate_en"} or bool_flag(active, "self_rag_retry_on_weak_evidence") or bool_flag(active, "self_rag_critique")):
         active.pop("llm_model", None)
         active.pop("llm_temperature", None)
     if not bool_flag(active, "judge_enable"):
@@ -226,6 +229,10 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
 
     command = [
         evaluation_python(),
+        "-W",
+        "ignore::UserWarning:multiprocessing.resource_tracker",
+        "-W",
+        "ignore:resource_tracker:UserWarning",
         "-m",
         "rag_eval.entrypoints.evaluate_rag",
         "--output-dir",
@@ -239,7 +246,7 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--classifier-type": classifier_type,
         "--docs": docs_value,
         "--questions": payload.get("questions", "data/questions_by_file.json"),
-        "--cpv-catalog": payload.get("cpv_catalog", "data/cpv_ted_train_catalog.csv"),
+        "--cpv-catalog": payload.get("cpv_catalog", "data/teddata_corpus_export.csv"),
         "--cpv-queries": payload.get("cpv_queries", "data/cpv_ted_test_queries.json"),
         "--prepared-results": payload.get("prepared_results", "data/eval_dataset.xlsx"),
         "--api-classifier-url": payload.get("api_classifier_url"),
@@ -247,9 +254,10 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--chunking": payload.get("chunking", "fixed_words"),
         "--chunk-size": payload.get("chunk_size", 450),
         "--overlap": payload.get("overlap", 60),
-        "--top-k": payload.get("top_k", 5),
+        "--top-k": payload.get("top_k", 8),
         "--retriever": payload.get("retriever", "tfidf"),
-        "--embedding-model": payload.get("embedding_model"),
+        "--embedding-model": payload.get("embedding_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"),
+        "--search-index-dir": payload.get("search_index_dir"),
         "--auto-chunk-sizes": payload.get("auto_chunk_sizes"),
         "--auto-overlaps": payload.get("auto_overlaps"),
         "--auto-retrievers": payload.get("auto_retrievers"),
@@ -278,6 +286,8 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--rerank-weight": payload.get("rerank_weight"),
         "--cross-encoder-model": payload.get("cross_encoder_model"),
         "--cross-encoder-top-n": payload.get("cross_encoder_top_n"),
+        "--llm-rerank-top-n": payload.get("llm_rerank_top_n"),
+        "--llm-rerank-weight": payload.get("llm_rerank_weight"),
         "--weight-answer": payload.get("weight_answer"),
         "--weight-correctness": payload.get("weight_correctness"),
         "--weight-retrieval": payload.get("weight_retrieval"),
@@ -303,6 +313,7 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--self-rag-critique": "self_rag_critique",
         "--kg-enable": "kg_enable",
         "--cross-encoder-rerank": "cross_encoder_rerank",
+        "--llm-rerank": "llm_rerank",
     }
     for flag, key in flags.items():
         if bool_flag(payload, key):
@@ -320,12 +331,22 @@ def run_job(job: EvaluationJob) -> None:
         with job.log_path.open("w", encoding="utf-8") as log:
             log.write("$ " + " ".join(job.command) + "\n\n")
             log.flush()
+            env = os.environ.copy()
+            warning_filters = [
+                "ignore::UserWarning:multiprocessing.resource_tracker",
+                "ignore:resource_tracker:UserWarning",
+            ]
+            existing_warnings = str(env.get("PYTHONWARNINGS") or "").strip()
+            merged_warnings = [existing_warnings] if existing_warnings else []
+            merged_warnings.extend(warning_filters)
+            env["PYTHONWARNINGS"] = ",".join(item for item in merged_warnings if item)
             job.process = subprocess.Popen(
                 job.command,
                 cwd=str(PROJECT_ROOT),
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 text=True,
+                env=env,
                 start_new_session=True,
             )
             job.return_code = job.process.wait()
@@ -870,7 +891,7 @@ def evaluate_chat_turn(payload: dict[str, Any]) -> dict[str, Any]:
         from rag_eval.retrieval.chunking import build_chunks
         from rag_eval.retrieval.engines import (
             DEFAULT_EMBEDDING_MODEL,
-            build_retriever,
+            build_retriever_with_backend,
             retrieve_top_k,
         )
 
@@ -897,7 +918,18 @@ def evaluate_chat_turn(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("No chunks were produced from the selected files.")
         retriever_type = str(payload.get("retriever") or "tfidf")
         embedding_model = str(payload.get("embedding_model") or DEFAULT_EMBEDDING_MODEL)
-        retriever_state = build_retriever(chunks, retriever_type, embedding_model)
+        search_backend_config = {
+            "backend": "sqlite",
+            "index_prefix": "rag-eval",
+            "index_dir": str(payload.get("search_index_dir") or ".rag_eval_indices").strip(),
+        }
+        retriever_state = build_retriever_with_backend(
+            chunks,
+            retriever_type,
+            embedding_model,
+            search_backend_config=search_backend_config,
+            index_name=None,
+        )
         retrieval_depth = max(1, top_k)
         rerank_top_n = max(0, int(payload.get("rerank_top_n") or 0))
         generation_top_k = min(retrieval_depth, rerank_top_n) if rerank_top_n > 0 else retrieval_depth
@@ -1491,7 +1523,7 @@ INDEX_HTML = r"""<!doctype html>
             <label><span class="label-row">Run name <span class="hint" title="Default format is web_eval_YYYYMMDD_HHMMSS. Leave as is or rename before launch.">i</span></span><input name="run_name" /></label>
             <label><span class="label-row">Mode <span class="hint" title="classifier runs one selected classifier; sweep compares several RAG retrieval/chunking settings.">i</span></span><select name="mode"><option value="classifier">classifier</option><option value="sweep">sweep</option></select></label>
             <label><span class="label-row">Classifier <span class="hint" title="Choose the evaluation target. Only settings relevant to this classifier are shown below.">i</span></span><select name="classifier_type"><option value="document_qa">document_qa_files</option><option value="ted_cpv">ted_cpv</option><option value="api_classifier">api_classifier</option><option value="prepared_rag_results">prepared_rag_results</option></select></label>
-            <label><span class="label-row">Top K <span class="hint" title="How many candidates/chunks to retrieve for each question. Higher values improve recall but add noise.">i</span></span><input name="top_k" type="number" min="1" value="5" /></label>
+            <label><span class="label-row">Top K <span class="hint" title="How many candidates/chunks to retrieve for each question. Higher values improve recall but add noise.">i</span></span><input name="top_k" type="number" min="1" value="8" /></label>
           </div>
 
           <div class="setting-group" data-show-for="document_qa examination_regulations sweep" style="margin-top:10px">
@@ -1587,7 +1619,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="grid setting-group" data-show-for="ted_cpv api_classifier" style="margin-top:10px">
-            <label><span class="label-row">CPV catalog <span class="hint" title="Training/catalog CSV with CPV codes and descriptions.">i</span></span><input name="cpv_catalog" value="data/cpv_ted_train_catalog.csv" /></label>
+            <label><span class="label-row">TED corpus export <span class="hint" title="teddata corpus export CSV used to build CPV candidates directly from TED notices.">i</span></span><input name="cpv_catalog" value="data/teddata_corpus_export.csv" /></label>
             <label><span class="label-row">CPV queries <span class="hint" title="TED/CPV test queries JSON used for classifier evaluation.">i</span></span><input name="cpv_queries" value="data/cpv_ted_test_queries.json" /></label>
             <label><span class="label-row">Retriever <span class="hint" title="Retriever used by the local CPV classifier. API classifier ignores this.">i</span></span><select name="cpv_retriever"><option>tfidf</option><option>bm25</option><option>dense</option><option>hybrid</option></select></label>
             <label class="check"><input type="checkbox" name="cpv_use_examples" /> Use examples <span class="hint" title="Append real TED examples to CPV labels before ranking.">i</span></label>
@@ -1603,7 +1635,7 @@ INDEX_HTML = r"""<!doctype html>
 
           <div class="grid setting-group" data-show-for="prepared_rag_results" style="margin-top:10px">
             <label><span class="label-row">Prepared results <span class="hint" title="Excel file with existing RAG/classifier outputs. Multiple rows with one ID are treated as top-k candidates.">i</span></span><input name="prepared_results" value="data/eval_dataset.xlsx" /></label>
-            <label><span class="label-row">CPV catalog <span class="hint" title="CPV catalog is used to attach labels and compute hierarchy-aware metrics.">i</span></span><input name="prepared_cpv_catalog" value="data/cpv_ted_train_catalog.csv" /></label>
+            <label><span class="label-row">TED corpus export <span class="hint" title="teddata corpus export CSV used to rebuild CPV candidates and hierarchy labels.">i</span></span><input name="prepared_cpv_catalog" value="data/teddata_corpus_export.csv" /></label>
           </div>
 
           <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
@@ -1614,17 +1646,20 @@ INDEX_HTML = r"""<!doctype html>
           <div class="grid setting-group" data-show-for="ted_cpv" style="margin-top:10px">
             <label class="check" style="grid-column:1/-1"><input type="checkbox" name="cross_encoder_rerank" /> Cross-encoder rerank <span class="hint" title="Rerank the top-N CPV candidates with a cross-encoder after retrieval and KG.">i</span></label>
             <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder top N <span class="hint" title="How many top candidates to rerank with the cross-encoder (typically 10).">i</span></span><input name="cross_encoder_top_n" type="number" min="1" value="10" /></label>
-            <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder model <span class="hint" title="HuggingFace cross-encoder model. Leave empty for the default multilingual model.">i</span></span><input name="cross_encoder_model" placeholder="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1" /></label>
+            <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder model <span class="hint" title="HuggingFace cross-encoder model. Leave empty for the default multilingual model.">i</span></span><input name="cross_encoder_model" placeholder="Alibaba-NLP/gte-multilingual-reranker-base" /></label>
+            <label class="check" style="grid-column:1/-1"><input type="checkbox" name="llm_rerank" /> LLM rerank <span class="hint" title="Rerank top CPV candidates with the configured OpenAI model after retrieval and optional cross-encoder.">i</span></label>
+            <label data-show-if="llm_rerank" class="inactive-field"><span class="label-row">LLM rerank top N <span class="hint" title="How many top candidates to pass to the LLM reranker. Shortlists around 5-8 are usually safer than 30.">i</span></span><input name="llm_rerank_top_n" type="number" min="1" value="8" /></label>
+            <label data-show-if="llm_rerank" class="inactive-field"><span class="label-row">LLM rerank weight <span class="hint" title="How strongly the LLM reranker can override retrieval, KG, and cross-encoder scores. Lower values are more conservative.">i</span></span><input name="llm_rerank_weight" type="number" min="0" max="1" step="0.05" value="0.4" /></label>
           </div>
 
           <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
-            <label data-show-if="llm_enable|judge_enable|query_augmentation:llm|query_augmentation:hyde|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">LLM model <span class="hint" title="OpenAI model used for LLM answer generation, judging, query augmentation, HyDE, or Self-RAG steps.">i</span></span><input name="llm_model" value="gpt-4.1-mini" /></label>
-            <label data-show-if="llm_enable|judge_enable|query_augmentation:llm|query_augmentation:hyde|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">API key env <span class="hint" title="Environment variable containing the OpenAI API key. Required for LLM, HyDE, or Self-RAG steps.">i</span></span><input name="openai_api_key_env" value="OPENAI_API_KEY" /></label>
+            <label data-show-if="llm_enable|llm_rerank|judge_enable|query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">LLM model <span class="hint" title="OpenAI model used for LLM answer generation, LLM reranking, judging, query augmentation, HyDE, or Self-RAG steps.">i</span></span><input name="llm_model" value="gpt-5.4" /></label>
+            <label data-show-if="llm_enable|llm_rerank|judge_enable|query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">API key env <span class="hint" title="Environment variable containing the OpenAI API key. Required for LLM, LLM reranking, HyDE, or Self-RAG steps.">i</span></span><input name="openai_api_key_env" value="OPENAI_API_KEY" /></label>
             <label data-show-if="judge_enable" class="inactive-field"><span class="label-row">Judge model <span class="hint" title="Optional separate OpenAI model for claim-level judging.">i</span></span><input name="judge_model" placeholder="defaults to LLM model" /></label>
           </div>
           <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
-            <label><span class="label-row">Query augmentation <span class="hint" title="Use LLM expansion or HyDE before CPV or document search.">i</span></span><select name="query_augmentation"><option value="">profile/default none</option><option>none</option><option>llm</option><option>hyde</option></select></label>
-            <label data-show-if="query_augmentation:llm|query_augmentation:hyde" class="inactive-field"><span class="label-row">Augment terms <span class="hint" title="Maximum terms for LLM expansion. HyDE ignores this and generates one hypothetical passage.">i</span></span><input name="query_augmentation_max_terms" type="number" min="1" value="8" /></label>
+            <label><span class="label-row">Query augmentation <span class="hint" title="Use English translation plus procurement terms, LLM expansion, or HyDE before CPV or document search.">i</span></span><select name="query_augmentation"><option value="">profile/default none</option><option>none</option><option>translate_en</option><option>llm</option><option>hyde</option></select></label>
+            <label data-show-if="query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en" class="inactive-field"><span class="label-row">Augment terms <span class="hint" title="Maximum English terms for translate_en or LLM expansion. HyDE ignores this and generates one hypothetical passage.">i</span></span><input name="query_augmentation_max_terms" type="number" min="1" value="8" /></label>
           </div>
           <div class="grid setting-group" data-show-for="document_qa examination_regulations sweep" style="margin-top:10px">
             <label><span class="label-row">Answer mode <span class="hint" title="Optional answer synthesis override.">i</span></span><select name="answer_mode"><option value="">profile default</option><option>extractive</option><option>grounded_llm</option><option selected>cite_first</option><option>claim_checklist</option></select></label>
@@ -1769,6 +1804,7 @@ INDEX_HTML = r"""<!doctype html>
       });
       for (const name of inactive) {
         if (name === "selected_docs") continue;
+        if (name === "retriever" && ["ted_cpv", "api_classifier"].includes(payload.classifier_type)) continue;
         delete payload[name];
       }
       for (const box of form.querySelectorAll('input[type="checkbox"]')) {
@@ -1780,6 +1816,10 @@ INDEX_HTML = r"""<!doctype html>
       if (!payload.cross_encoder_rerank) {
         delete payload.cross_encoder_model;
         delete payload.cross_encoder_top_n;
+      }
+      if (!payload.llm_rerank) {
+        delete payload.llm_rerank_top_n;
+        delete payload.llm_rerank_weight;
       }
       const chunking = String(payload.chunking || "");
       if (chunking !== "auto") {
@@ -1796,10 +1836,10 @@ INDEX_HTML = r"""<!doctype html>
       if (Number(payload.rerank_top_n || 0) <= 0) delete payload.rerank_weight;
       if (!payload.self_rag_retry_on_weak_evidence) delete payload.self_rag_retry_max_attempts;
       const queryAug = String(payload.query_augmentation || "").trim().toLowerCase();
-      if (!["llm", "hyde"].includes(queryAug)) delete payload.query_augmentation_max_terms;
+      if (!["llm", "hyde", "translate_en"].includes(queryAug)) delete payload.query_augmentation_max_terms;
       if (!queryAug || queryAug === "none") delete payload.query_augmentation;
-      const llmNeeded = payload.llm_enable || payload.judge_enable || ["llm", "hyde"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique;
-      if (!(payload.llm_enable || ["llm", "hyde"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique)) {
+      const llmNeeded = payload.llm_enable || payload.llm_rerank || payload.judge_enable || ["llm", "hyde", "translate_en"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique;
+      if (!(payload.llm_enable || payload.llm_rerank || ["llm", "hyde", "translate_en"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique)) {
         delete payload.llm_model;
         delete payload.llm_temperature;
       }
@@ -1848,8 +1888,8 @@ INDEX_HTML = r"""<!doctype html>
           payload.retriever = "tfidf";
         }
       }
-      for (const key of ["top_k","chunk_size","overlap","rerank_top_n","cross_encoder_top_n","self_rag_retry_max_attempts"]) payload[key] = Number(payload[key] || 0);
-      for (const key of ["rerank_weight","hybrid_alpha"]) {
+      for (const key of ["top_k","chunk_size","overlap","rerank_top_n","cross_encoder_top_n","llm_rerank_top_n","self_rag_retry_max_attempts"]) payload[key] = Number(payload[key] || 0);
+      for (const key of ["rerank_weight","hybrid_alpha","llm_rerank_weight"]) {
         if (key in payload) payload[key] = Number(payload[key] || 0);
       }
       pruneInactivePayload(payload, form);
@@ -2482,8 +2522,8 @@ INDEX_HTML = r"""<!doctype html>
       const form = document.getElementById("runForm");
       if (options.questions[0]) form.elements.questions.value = options.questions[0];
       if (options.questions[0]) form.elements.sweep_questions.value = options.questions[0];
-      if (options.csv.includes("data/cpv_ted_train_catalog.csv")) form.elements.cpv_catalog.value = "data/cpv_ted_train_catalog.csv";
-      if (options.csv.includes("data/cpv_ted_train_catalog.csv")) form.elements.prepared_cpv_catalog.value = "data/cpv_ted_train_catalog.csv";
+      if (options.csv.includes("data/teddata_corpus_export.csv")) form.elements.cpv_catalog.value = "data/teddata_corpus_export.csv";
+      if (options.csv.includes("data/teddata_corpus_export.csv")) form.elements.prepared_cpv_catalog.value = "data/teddata_corpus_export.csv";
       if (options.json.includes("data/cpv_ted_test_queries.json")) form.elements.cpv_queries.value = "data/cpv_ted_test_queries.json";
       if (options.xlsx && options.xlsx.includes("data/eval_dataset.xlsx")) form.elements.prepared_results.value = "data/eval_dataset.xlsx";
     });

@@ -116,6 +116,44 @@ def _truthy_flag(value: object) -> bool:
     return bool(value)
 
 
+def _unique_chunk_counts_by_k(
+    retrieved_rows: Sequence[Dict],
+    *,
+    top_k: int,
+) -> tuple[List[int], List[int], List[int]]:
+    rows_by_rank: Dict[int, List[Dict]] = {}
+    for row in retrieved_rows:
+        rank = row.get("rank")
+        if rank is None:
+            continue
+        try:
+            rank_int = int(rank)
+        except (TypeError, ValueError):
+            continue
+        if rank_int <= 0 or rank_int > top_k:
+            continue
+        rows_by_rank.setdefault(rank_int, []).append(dict(row))
+
+    seen_all: set[str] = set()
+    seen_relevant: set[str] = set()
+    ranks: List[int] = []
+    unique_counts: List[int] = []
+    unique_relevant_counts: List[int] = []
+
+    for rank in range(1, top_k + 1):
+        for row in rows_by_rank.get(rank, []):
+            identity = _relevance_identity(row)
+            seen_all.add(identity)
+            relevance_grade = _safe_float(row.get("relevance_grade"))
+            is_relevant = _truthy_flag(row.get("is_relevant")) or is_relevant_grade(relevance_grade)
+            if is_relevant:
+                seen_relevant.add(identity)
+        ranks.append(rank)
+        unique_counts.append(len(seen_all))
+        unique_relevant_counts.append(len(seen_relevant))
+    return ranks, unique_counts, unique_relevant_counts
+
+
 def write_strategy_score_profile_svg(
     retrieved_rows: Sequence[Dict],
     output_path: str,
@@ -195,6 +233,88 @@ def write_chunk_relevance_comparison_svg(
     chart_label: str,
     unique_relevance: bool = False,
 ) -> str | None:
+    if unique_relevance:
+        ranks, unique_counts, unique_relevant_counts = _unique_chunk_counts_by_k(
+            retrieved_rows,
+            top_k=top_k,
+        )
+        if not ranks:
+            return None
+
+        width = 1120
+        height = 660
+        margin_left = 110
+        margin_right = 70
+        margin_top = 110
+        margin_bottom = 120
+        plot_width = width - margin_left - margin_right
+        plot_height = height - margin_top - margin_bottom
+        max_count = max(max(unique_counts), max(unique_relevant_counts), 1)
+
+        def x_for_rank(rank: int) -> float:
+            if len(ranks) == 1:
+                return margin_left + plot_width / 2
+            return margin_left + ((rank - 1) / max(len(ranks) - 1, 1)) * plot_width
+
+        def y_for_count(value: int) -> float:
+            return margin_top + (1.0 - (value / max_count)) * plot_height
+
+        blue_points = " ".join(
+            f"{x_for_rank(rank):.1f},{y_for_count(value):.1f}"
+            for rank, value in zip(ranks, unique_counts)
+        )
+        green_points = " ".join(
+            f"{x_for_rank(rank):.1f},{y_for_count(value):.1f}"
+            for rank, value in zip(ranks, unique_relevant_counts)
+        )
+
+        point_marks: List[str] = []
+        x_labels: List[str] = []
+        for rank, unique_value, relevant_value in zip(ranks, unique_counts, unique_relevant_counts):
+            blue_x = x_for_rank(rank)
+            blue_y = y_for_count(unique_value)
+            green_y = y_for_count(relevant_value)
+            point_marks.append(f'<circle cx="{blue_x:.1f}" cy="{blue_y:.1f}" r="5.5" fill="#68a8ff" />')
+            point_marks.append(f'<circle cx="{blue_x:.1f}" cy="{green_y:.1f}" r="5.5" fill="#58c28c" />')
+            x_labels.append(
+                f'<text x="{blue_x:.1f}" y="{margin_top + plot_height + 34:.1f}" text-anchor="middle" font-size="20" fill="#5d6270">#{rank}</text>'
+            )
+
+        y_ticks: List[str] = []
+        for ratio in [0.0, 0.25, 0.5, 0.75, 1.0]:
+            value = int(round(max_count * ratio))
+            y = margin_top + (1.0 - ratio) * plot_height
+            y_ticks.append(f'<line x1="{margin_left}" y1="{y:.1f}" x2="{width - margin_right}" y2="{y:.1f}" stroke="#ebe4d6" stroke-width="1.5" />')
+            y_ticks.append(
+                f'<text x="{margin_left - 16}" y="{y + 6:.1f}" text-anchor="end" font-size="18" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">{value}</text>'
+            )
+
+        legend_x = width - 355
+        legend_y = 42
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Unique chunk alignment for {html.escape(chart_label)}">
+  <rect width="{width}" height="{height}" fill="#fffdf8" />
+  {''.join(y_ticks)}
+  <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{width - margin_right}" y2="{margin_top + plot_height}" stroke="#8d8d8d" stroke-width="3" />
+  <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{margin_left}" y2="{margin_top}" stroke="#8d8d8d" stroke-width="3" />
+  <text x="28" y="42" font-size="28" fill="#444b57" font-family="Helvetica, Arial, sans-serif">Unique Chunk Alignment</text>
+  <text x="28" y="74" font-size="18" fill="#7b808a" font-family="Helvetica, Arial, sans-serif">{html.escape(chart_label)}</text>
+  <polyline points="{blue_points}" fill="none" stroke="#68a8ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  <polyline points="{green_points}" fill="none" stroke="#58c28c" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+  {''.join(point_marks)}
+  {''.join(x_labels)}
+  <rect x="{legend_x}" y="{legend_y}" width="20" height="20" rx="5" fill="#68a8ff" />
+  <text x="{legend_x + 30}" y="{legend_y + 16}" font-size="18" fill="#4f5665" font-family="Helvetica, Arial, sans-serif">unique chunks at k</text>
+  <rect x="{legend_x}" y="{legend_y + 30}" width="20" height="20" rx="5" fill="#58c28c" />
+  <text x="{legend_x + 30}" y="{legend_y + 46}" font-size="18" fill="#4f5665" font-family="Helvetica, Arial, sans-serif">unique correct chunks at k</text>
+  <text x="{width - margin_right - 20}" y="{margin_top + plot_height + 60}" font-size="24" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">k</text>
+  <text x="36" y="{margin_top + 52}" transform="rotate(-90 36 {margin_top + 52})" font-size="24" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">Unique chunk count</text>
+</svg>
+"""
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(svg)
+        return output_path
+
     ranks, avg_scores, relevant_rates, relevant_counts, total_counts = _rank_profile(
         retrieved_rows, top_k=top_k, unique_relevance=unique_relevance
     )

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from rag_eval.data.ted_data import (
+    TED_DEFAULT_CORPUS_EXPORT_PATH,
     TED_DEFAULT_QUERY,
     fetch_ted_notice_pages,
+    load_ted_corpus_export_notices,
     transform_ted_notices_to_cpv_split_dataset,
     write_cpv_catalog_csv,
     write_queries_json,
@@ -16,7 +19,18 @@ from rag_eval.data.ted_data import (
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Prepare a real CPV/TED baseline dataset from the official TED Search API."
+        description="Prepare a real CPV/TED baseline dataset from teddata corpus export or the official TED Search API."
+    )
+    parser.add_argument(
+        "--source",
+        choices=["auto", "file", "api"],
+        default="auto",
+        help="Where TED notices should come from. 'auto' prefers the local teddata corpus export if present, otherwise falls back to the API.",
+    )
+    parser.add_argument(
+        "--corpus-export-path",
+        default=TED_DEFAULT_CORPUS_EXPORT_PATH,
+        help="Path to teddata_corpus_export CSV used when --source=file or when --source=auto finds the file.",
     )
     parser.add_argument(
         "--query",
@@ -29,8 +43,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-ratio", type=float, default=0.8, help="Stable notice-level split ratio used for catalog training examples.")
     parser.add_argument(
         "--catalog-out",
-        default="data/cpv_ted_train_catalog.csv",
-        help="Output CSV for the generated CPV catalog.",
+        default="data/ted_cpv_candidates_from_corpus.csv",
+        help="Output CSV snapshot for the generated CPV candidates.",
     )
     parser.add_argument(
         "--queries-out",
@@ -47,12 +61,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    notices = fetch_ted_notice_pages(
-        query=args.query,
-        limit=args.limit,
-        start_page=args.start_page,
-        pages=args.pages,
-    )
+    corpus_exists = bool(args.corpus_export_path) and os.path.exists(args.corpus_export_path)
+    if args.source == "file":
+        notices = load_ted_corpus_export_notices(args.corpus_export_path)
+        source_used = f"file:{args.corpus_export_path}"
+    elif args.source == "auto" and corpus_exists:
+        notices = load_ted_corpus_export_notices(args.corpus_export_path)
+        source_used = f"file:{args.corpus_export_path}"
+    else:
+        notices = fetch_ted_notice_pages(
+            query=args.query,
+            limit=args.limit,
+            start_page=args.start_page,
+            pages=args.pages,
+        )
+        source_used = "api"
     catalog, queries, split_summary = transform_ted_notices_to_cpv_split_dataset(
         notices,
         train_ratio=args.train_ratio,
@@ -66,6 +89,7 @@ def main() -> None:
         json.dumps(
             {
                 "n_notices_fetched": len(notices),
+                "source_used": source_used,
                 "pages": args.pages,
                 "start_page": args.start_page,
                 "n_cpv_entries": len(catalog),

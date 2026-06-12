@@ -371,7 +371,7 @@ def _normalize_trace_row(row: Dict[str, object], config: Dict[str, object]) -> D
 
 def _estimate_llm_calls(row: Dict[str, object]) -> int:
     calls = 0
-    if _safe_str(row.get("query_augmentation")) in {"llm", "hyde"}:
+    if _safe_str(row.get("query_augmentation")) in {"llm", "hyde", "translate_en"}:
         calls += 1
     if row.get("answer_generation_enabled") in {True, "True", "true", "1"}:
         calls += 1
