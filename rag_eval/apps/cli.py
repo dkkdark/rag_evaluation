@@ -13,7 +13,13 @@ from rag_eval.classifiers.evaluation import (
     evaluate_prepared_rag_results_classifier,
 )
 from rag_eval.data.ted_data import TED_DEFAULT_CORPUS_EXPORT_PATH
-from rag_eval.retrieval.experiment import build_run_dir, ensure_dir, parse_csv_list, run_single_experiment
+from rag_eval.retrieval.experiment import (
+    build_run_dir,
+    ensure_dir,
+    parse_csv_list,
+    prepare_experiment_resources,
+    run_single_experiment,
+)
 from rag_eval.data.io import extract_paragraphs, load_questions, parse_pdf_sections, resolve_doc_paths
 from rag_eval.evaluation.design_attribution import write_design_attribution_artifacts
 from rag_eval.evaluation.metrics import build_recommendation, rank_experiments, score_experiment
@@ -56,7 +62,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cpv-catalog",
         default=TED_DEFAULT_CORPUS_EXPORT_PATH,
-        help="Deprecated name: path to teddata corpus export CSV used to build CPV candidates for TED/CPV evaluation.",
+        help="teddata corpus export CSV used to rebuild CPV profiles on the fly for TED/CPV evaluation.",
     )
     parser.add_argument(
         "--cpv-queries",
@@ -67,11 +73,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--prepared-results",
         default="data/eval_dataset.xlsx",
         help="Excel file with already prepared RAG/classifier results used when --classifier-type=prepared_rag_results.",
-    )
-    parser.add_argument(
-        "--cpv-use-examples",
-        action="store_true",
-        help="Append real TED examples to CPV label entries before ranking.",
     )
     parser.add_argument(
         "--api-eval-case",
@@ -179,6 +180,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Rerank top CPV candidates with a cross-encoder after retrieval and optional KG.",
     )
     parser.add_argument(
+        "--cpv-notice-examples-channel",
+        action="store_true",
+        help="Retrieve over cpv_notice_examples instead of only cpv_profiles for TED/CPV classification.",
+    )
+    parser.add_argument(
+        "--disable-self-exclusion",
+        action="store_true",
+        help="Allow TED/CPV notice-example retrieval to use examples from the query notice itself.",
+    )
+    parser.add_argument(
         "--cross-encoder-model",
         default=None,
         help="Cross-encoder model id (default: Alibaba-NLP/gte-multilingual-reranker-base).",
@@ -274,13 +285,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--answer-mode",
         choices=["extractive", "grounded_llm", "cite_first", "claim_checklist"],
-        default="cite_first",
+        default="grounded_llm",
         help="Answer synthesis mode for document QA.",
     )
     parser.add_argument(
         "--context-mode",
         choices=["ranked", "kg_first", "kg_organized", "group_by_doc", "dedupe_section"],
-        default="dedupe_section",
+        default="ranked",
         help="Context assembly mode for document QA.",
     )
     parser.add_argument("--max-context-chunks", type=int, default=None, help="Limit chunks passed to answer/evaluation.")
@@ -290,8 +301,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["none", "llm", "hyde", "translate_en"],
         default="none",
         help=(
-            "Expand retrieval queries before retrieval. Use translate_en for English translation plus "
-            "procurement terms, llm for LLM keyword expansion, or hyde for a hypothetical source passage."
+            "Expand retrieval queries before retrieval. Use translate_en for structured procurement "
+            "query enrichment with multi-channel RRF retrieval, llm for LLM keyword expansion, "
+            "or hyde for a hypothetical source passage."
         ),
     )
     parser.add_argument(
@@ -342,9 +354,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--kg-profile",
-        choices=["conservative", "balanced", "exploratory", "ppr_only", "direct_only", "selection"],
-        default="exploratory",
-        help="KG retrieval preset for research comparisons.",
+        choices=["safe_branch", "conservative", "balanced", "exploratory", "ppr_only", "direct_only", "selection"],
+        default="safe_branch",
+        help="KG retrieval preset. safe_branch is the safest TED/CPV option and only expands locally when retrieval already shows branch support.",
     )
     parser.add_argument(
         "--kg-profiles",
@@ -391,6 +403,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--kg-ablation-edge-dropouts",
         default="",
         help="Comma-separated edge dropout rates for KG incompleteness testing, e.g. 0.1,0.3,0.5.",
+    )
+    parser.add_argument(
+        "--export-kg-for-neo4j",
+        action="store_true",
+        help="Export the CPV knowledge graph as Neo4j-friendly CSV files plus an import.cypher script.",
     )
     return parser
 
@@ -618,6 +635,21 @@ def build_retriever_types(args, resolved_retriever: str) -> List[str]:
     return [resolved_retriever]
 
 
+def parse_optional_bool(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return default
+
+
 def build_sweep_configs(args, resolved_retriever: str) -> List[Dict]:
     valid_chunking = {"fixed_words", "fixed_tokens", "by_section", "by_paragraph"}
     valid_retrievers = {"tfidf", "bm25", "dense", "hybrid"}
@@ -642,6 +674,16 @@ def build_sweep_configs(args, resolved_retriever: str) -> List[Dict]:
             else:
                 chunk_size = 0
                 overlap = 0
+            answer_mode = (
+                str(raw_config.get("answer_mode") or "")
+                if "answer_mode" in raw_config
+                else str(args.answer_mode or "")
+            )
+            context_mode = (
+                str(raw_config.get("context_mode") or "")
+                if "context_mode" in raw_config
+                else str(args.context_mode or "")
+            )
             configs.append(
                 {
                     "order": index,
@@ -653,6 +695,22 @@ def build_sweep_configs(args, resolved_retriever: str) -> List[Dict]:
                     "hybrid_alpha": float(raw_config.get("hybrid_alpha", args.hybrid_alpha)),
                     "kg_profile": str(raw_config.get("kg_profile") or args.kg_profile),
                     "kg_algorithm": raw_config.get("kg_algorithm", args.kg_algorithm),
+                    "kg_enabled": parse_optional_bool(raw_config.get("kg_enabled"), args.kg_enable),
+                    "judge_enable": parse_optional_bool(raw_config.get("judge_enable"), args.judge_enable),
+                    "answer_mode": answer_mode,
+                    "context_mode": context_mode,
+                    "abstain_on_weak_evidence": parse_optional_bool(
+                        raw_config.get("abstain_on_weak_evidence"),
+                        args.abstain_on_weak_evidence,
+                    ),
+                    "self_rag_retry_on_weak_evidence": parse_optional_bool(
+                        raw_config.get("self_rag_retry_on_weak_evidence"),
+                        args.self_rag_retry_on_weak_evidence,
+                    ),
+                    "self_rag_critique": parse_optional_bool(
+                        raw_config.get("self_rag_critique"),
+                        args.self_rag_critique,
+                    ),
                 }
             )
         return configs
@@ -709,7 +767,6 @@ def run_classifier_mode(args) -> Dict:
             retriever=resolved_retriever if resolved_retriever != "auto" else "tfidf",
             embedding_model=args.embedding_model,
             top_k=args.top_k,
-            use_examples=args.cpv_use_examples,
             classifier_label=args.classifier_type,
             run_dir=run_dir,
             create_visualization=args.create_strategy_visualization,
@@ -729,8 +786,11 @@ def run_classifier_mode(args) -> Dict:
             llm_config=build_llm_config_from_args(args),
             query_augmentation=args.query_augmentation,
             query_augmentation_max_terms=args.query_augmentation_max_terms,
+            cpv_notice_examples_channel=args.cpv_notice_examples_channel,
+            self_exclusion=not args.disable_self_exclusion,
             search_backend_config=search_backend_config,
             search_index_name=None,
+            export_kg_for_neo4j=args.export_kg_for_neo4j,
         )
         if not args.kg_enable:
             summary = strip_disabled_kg_from_summary(summary)
@@ -938,8 +998,8 @@ def run_classifier_mode(args) -> Dict:
             "weight": args.rerank_weight,
         },
         "judge": {
-            "enabled": judge_config.enabled,
-            "model": judge_config.model if judge_config.enabled else None,
+            "enabled": args.judge_enable,
+            "model": (args.judge_model or args.llm_model) if args.judge_enable else None,
         },
         "runtime_retrieval_evaluator": {
             "enabled": not args.disable_runtime_retrieval_evaluator,
@@ -981,12 +1041,46 @@ def main() -> None:
     corpus = load_document_corpus(args, run_dir)
     resolved_retriever = resolve_retriever_mode(args)
     llm_config = build_llm_config_from_args(args)
-    judge_config = build_judge_config_from_args(args)
     search_backend_config = build_search_backend_config_from_args(args)
     sweep_configs = build_sweep_configs(args, resolved_retriever)
 
     experiment_summaries: List[Dict] = []
+    prepared_resource_cache: Dict[tuple, Dict[str, object]] = {}
     for config in sweep_configs:
+        resource_key = (
+            config["strategy"],
+            config["chunk_size"],
+            config["overlap"],
+            config["retriever"],
+            args.embedding_model,
+            bool(config.get("kg_enabled", args.kg_enable)),
+            config.get("kg_profile", args.kg_profile),
+            config.get("kg_algorithm", args.kg_algorithm),
+            json.dumps(search_backend_config, sort_keys=True, ensure_ascii=False),
+        )
+        prepared_resources = prepared_resource_cache.get(resource_key)
+        if prepared_resources is None:
+            prepared_resources = prepare_experiment_resources(
+                sections=corpus["sections"],
+                paragraphs=corpus["paragraphs"],
+                questions=corpus["questions"],
+                strategy=config["strategy"],
+                chunk_size=config["chunk_size"],
+                chunk_overlap=config["overlap"],
+                retriever_type=config["retriever"],
+                embedding_model=args.embedding_model,
+                kg_enabled=bool(config.get("kg_enabled", args.kg_enable)),
+                search_backend_config=search_backend_config,
+                search_index_name=None,
+            )
+            prepared_resource_cache[resource_key] = prepared_resources
+        config_judge_enabled = bool(config.get("judge_enable", args.judge_enable))
+        config_judge_config = LLMConfig(
+            enabled=config_judge_enabled,
+            model=args.judge_model or args.llm_model,
+            api_key_env=args.openai_api_key_env,
+            temperature=args.judge_temperature,
+        )
         experiment_summaries.append(
             run_single_experiment(
                 sections=corpus["sections"],
@@ -1001,10 +1095,10 @@ def main() -> None:
                 embedding_model=args.embedding_model,
                 hybrid_alpha=config["hybrid_alpha"],
                 llm_config=llm_config,
-                judge_config=judge_config,
+                judge_config=config_judge_config,
                 create_strategy_visualization=args.create_strategy_visualization,
                 create_strategy_showcase=args.create_strategy_showcase,
-                kg_enabled=args.kg_enable,
+                kg_enabled=bool(config.get("kg_enabled", args.kg_enable)),
                 kg_graph_weight=args.kg_graph_weight,
                 kg_profile=config.get("kg_profile", args.kg_profile),
                 kg_algorithm=config.get("kg_algorithm", args.kg_algorithm),
@@ -1014,8 +1108,16 @@ def main() -> None:
                 kg_quality_threshold=args.kg_quality_threshold,
                 kg_intent_weight=args.kg_intent_weight,
                 kg_ablation_edge_dropouts=args.kg_ablation_edge_dropouts,
-                answer_mode=args.answer_mode,
-                context_mode=args.context_mode,
+                answer_mode=(
+                    str(config.get("answer_mode") or "")
+                    if "answer_mode" in config
+                    else str(args.answer_mode or "")
+                ),
+                context_mode=(
+                    str(config.get("context_mode") or "")
+                    if "context_mode" in config
+                    else str(args.context_mode or "")
+                ),
                 max_context_chunks=args.max_context_chunks,
                 max_context_chars=args.max_context_chars,
                 query_augmentation=args.query_augmentation,
@@ -1024,14 +1126,22 @@ def main() -> None:
                 decision_min_context_claim_recall=args.decision_min_context_claim_recall,
                 decision_min_grounded_claim_ratio=args.decision_min_grounded_claim_ratio,
                 runtime_retrieval_evaluator_enabled=not args.disable_runtime_retrieval_evaluator,
-                abstain_on_weak_evidence=args.abstain_on_weak_evidence,
-                self_rag_retry_on_weak_evidence=args.self_rag_retry_on_weak_evidence,
+                abstain_on_weak_evidence=bool(
+                    config.get("abstain_on_weak_evidence", args.abstain_on_weak_evidence)
+                ),
+                self_rag_retry_on_weak_evidence=bool(
+                    config.get(
+                        "self_rag_retry_on_weak_evidence",
+                        args.self_rag_retry_on_weak_evidence,
+                    )
+                ),
                 self_rag_retry_max_attempts=args.self_rag_retry_max_attempts,
-                self_rag_critique=args.self_rag_critique,
+                self_rag_critique=bool(config.get("self_rag_critique", args.self_rag_critique)),
                 rerank_top_n=args.rerank_top_n,
                 rerank_weight=args.rerank_weight,
                 search_backend_config=search_backend_config,
                 search_index_name=None,
+                prepared_resources=prepared_resources,
             )
         )
 
@@ -1125,8 +1235,8 @@ def main() -> None:
             "weight": args.rerank_weight,
         },
         "judge": {
-            "enabled": judge_config.enabled,
-            "model": judge_config.model if judge_config.enabled else None,
+            "enabled": args.judge_enable,
+            "model": (args.judge_model or args.llm_model) if args.judge_enable else None,
         },
         "runtime_retrieval_evaluator": {
             "enabled": not args.disable_runtime_retrieval_evaluator,

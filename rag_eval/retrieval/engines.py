@@ -6,6 +6,7 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 
 from rag_eval.core.text_utils import metadata_value_matches
+from rag_eval.retrieval.query_enrichment import procurement_type_bias
 from rag_eval.retrieval.local_search import (
     build_local_index_name,
     chunk_fingerprint as local_chunk_fingerprint,
@@ -117,6 +118,19 @@ def chunk_matches_filter(chunk: Dict, metadata_filter: Dict[str, object] | None)
         return True
     for key, expected in metadata_filter.items():
         if expected is None or expected == "" or expected == []:
+            continue
+        if isinstance(expected, dict):
+            excluded = expected.get("exclude")
+            if excluded is not None and excluded != "" and excluded != []:
+                excluded_values = excluded if isinstance(excluded, (list, tuple, set)) else [excluded]
+                if any(metadata_value_matches(chunk.get(key, ""), value) for value in excluded_values):
+                    return False
+            required = expected.get("include")
+            if required is None or required == "" or required == []:
+                continue
+            values = required if isinstance(required, (list, tuple, set)) else [required]
+            if not any(metadata_value_matches(chunk.get(key, ""), value) for value in values):
+                return False
             continue
         values = expected if isinstance(expected, (list, tuple, set)) else [expected]
         if not any(metadata_value_matches(chunk.get(key, ""), value) for value in values):
@@ -595,6 +609,49 @@ def _retrieve_top_k_from_single_state(
     raise ValueError(f"Unsupported single-state backend: {retriever_state['backend']}")
 
 
+def _build_cpv_search_channel_specs(
+    *,
+    query_original: str,
+    query_translated_to_en: str,
+    query_object: str,
+    query_object_translated: str,
+    search_channels: Sequence[Dict[str, object]] | None,
+) -> List[tuple[str, str, float, str, List[str]]]:
+    if search_channels:
+        specs: List[tuple[str, str, float, str, List[str]]] = []
+        for channel in search_channels:
+            query_text = str(channel.get("query") or "").strip()
+            if not query_text:
+                continue
+            channel_name = str(channel.get("name") or "channel")
+            weight = float(channel.get("weight") or 1.0)
+            kind = str(channel.get("kind") or "both")
+            fields_en = [str(field) for field in channel.get("fields_en", ["search_text_en"]) if str(field).strip()]
+            fields_multilingual = [
+                str(field) for field in channel.get("fields_multilingual", ["search_text_multilingual"]) if str(field).strip()
+            ]
+            if kind in {"both", "vector"}:
+                specs.append((f"dense_{channel_name}", "vector", weight, query_text, fields_multilingual))
+            if kind in {"both", "lexical"}:
+                specs.append((f"bm25_{channel_name}", "lexical", weight, query_text, fields_en or fields_multilingual))
+        return specs
+
+    query_source_original = query_original
+    query_source_translated = query_translated_to_en or query_original
+    object_query = (query_object or query_original or "").strip()
+    object_query_translated = (query_object_translated or query_translated_to_en or object_query).strip()
+    return [
+        ("dense_object_multilingual", "vector", 1.25, object_query, ["search_text_multilingual"]),
+        ("dense_multilingual", "vector", 1.0, query_source_original, ["search_text_multilingual"]),
+        ("dense_object_english", "vector", 1.15, object_query_translated, ["search_text_en"]),
+        ("dense_english", "vector", 0.95, query_source_translated, ["search_text_en"]),
+        ("bm25_object_english", "lexical", 1.2, object_query_translated, ["search_text_en"]),
+        ("bm25_english", "lexical", 0.9, query_source_translated, ["search_text_en"]),
+        ("bm25_object_aliases", "lexical", 1.05, object_query, ["search_text_multilingual"]),
+        ("bm25_aliases", "lexical", 0.75, query_source_original, ["search_text_multilingual"]),
+    ]
+
+
 def retrieve_top_k_cpv_multi(
     *,
     query_original: str,
@@ -604,6 +661,9 @@ def retrieve_top_k_cpv_multi(
     procurement_action: str = "",
     secondary_context: str = "",
     exclude_as_primary: Sequence[str] | None = None,
+    search_channels: Sequence[Dict[str, object]] | None = None,
+    primary_selection_bias: str = "",
+    service_component: bool = False,
     retriever_state: Dict,
     chunks: Sequence[Dict],
     k: int,
@@ -631,7 +691,7 @@ def retrieve_top_k_cpv_multi(
             dense_rows = []
             for score, chunk_id in zip(scores[0], candidate_ids):
                 row = dict(row_lookup.get(chunk_id) or {})
-                if not row:
+                if not row or not chunk_matches_filter(row, metadata_filter):
                     continue
                 row["score"] = float(score)
                 dense_rows.append(row)
@@ -652,20 +712,14 @@ def retrieve_top_k_cpv_multi(
         fused_rows: Dict[str, Dict] = {}
         rrf_k = float(retriever_state.get("rrf_k") or 60.0)
         per_index_depth = max(k, 500)
-        query_source_original = query_original
-        query_source_translated = query_translated_to_en or query_original
         object_query = (query_object or query_original or "").strip()
-        object_query_translated = (query_object_translated or query_translated_to_en or object_query).strip()
-        index_specs = [
-            ("dense_object_multilingual", "vector", 1.25, object_query, ["search_text_multilingual"]),
-            ("dense_multilingual", "vector", 1.0, query_source_original, ["search_text_multilingual"]),
-            ("dense_object_english", "vector", 1.15, object_query_translated, ["search_text_en"]),
-            ("dense_english", "vector", 0.95, query_source_translated, ["search_text_en"]),
-            ("bm25_object_english", "lexical", 1.2, object_query_translated, ["search_text_en"]),
-            ("bm25_english", "lexical", 0.9, query_source_translated, ["search_text_en"]),
-            ("bm25_object_aliases", "lexical", 1.05, object_query, ["search_text_multilingual"]),
-            ("bm25_aliases", "lexical", 0.75, query_source_original, ["search_text_multilingual"]),
-        ]
+        index_specs = _build_cpv_search_channel_specs(
+            query_original=query_original,
+            query_translated_to_en=query_translated_to_en,
+            query_object=object_query,
+            query_object_translated=(query_object_translated or query_translated_to_en or object_query).strip(),
+            search_channels=search_channels,
+        )
         model = retriever_state["model"]
         for index_name, kind, weight, query_text, lexical_fields in index_specs:
             if not str(query_text or "").strip():
@@ -682,7 +736,7 @@ def retrieve_top_k_cpv_multi(
                 rows = []
                 for score, chunk_id in zip(scores[0], candidate_ids):
                     row = dict(row_lookup.get(chunk_id) or {})
-                    if not row:
+                    if not row or not chunk_matches_filter(row, metadata_filter):
                         continue
                     row["score"] = float(score)
                     rows.append(row)
@@ -722,11 +776,17 @@ def retrieve_top_k_cpv_multi(
             focus_bonus = (0.14 * object_overlap) + (0.05 * action_overlap) + (0.02 * secondary_overlap)
             if exclusion_overlap > object_overlap:
                 focus_bonus -= 0.08 * exclusion_overlap
+            type_bonus = procurement_type_bias(
+                primary_selection_bias=primary_selection_bias,
+                service_component=service_component,
+                candidate_procurement_type=str(row.get("procurement_type") or ""),
+            )
             row["object_overlap_score"] = object_overlap
             row["procurement_action_overlap_score"] = action_overlap
             row["secondary_context_overlap_score"] = secondary_overlap
             row["exclude_overlap_score"] = exclusion_overlap
-            row["score"] = float(score + focus_bonus)
+            row["procurement_type_bias"] = type_bonus
+            row["score"] = float(score + focus_bonus + type_bonus)
             row["retriever"] = f"{retriever_state.get('profile', 'hybrid')}_rrf"
             row["rrf_source_count"] = len(row.get("rrf_sources") or [])
             ranked.append(row)

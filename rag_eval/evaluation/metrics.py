@@ -70,6 +70,7 @@ def fallback_german_lemma(token: str) -> str:
         "punkte": "punkt",
         "punkten": "punkt",
         "semester": "semester",
+        "semestern": "semester",
     }
     if token in irregular:
         return irregular[token]
@@ -161,11 +162,26 @@ REFUSAL_PATTERNS = [
     r"\bcan't (?:answer|determine|infer)\b",
     r"\bno (?:relevant )?(?:information|evidence)\b",
     r"\bnot provided\b",
+    r"\bnot explicitly mentioned\b",
+    r"\bnot explicitly specified\b",
+    r"\bnot explicitly stated\b",
+    r"\bno explicit(?:ly)? (?:information|indication|answer|mention|specification|duration)\b",
+    r"\bnot indicated\b",
+    r"\bnot given\b",
+    r"\bnot answered\b",
+    r"\bcannot be answered\b",
     r"\bnicht genug\b",
     r"\bkeine ausreichenden\b",
+    r"\bkeine explizite angabe\b",
+    r"\bkeine angabe(?:n)?\b",
     r"\bkeine information(?:en)?\b",
     r"\bnicht (?:aus dem|im) kontext\b",
     r"\baus dem kontext (?:geht|ergibt) .* nicht\b",
+    r"\bnicht explizit genannt\b",
+    r"\bnicht explizit angegeben\b",
+    r"\bnicht angegeben\b",
+    r"\bnicht beantwortet werden\b",
+    r"\bgenaue .* nicht genannt\b",
 ]
 
 MIN_RELEVANT_GRADE = 2
@@ -661,37 +677,373 @@ def evaluate_claim_metrics(
 
 
 # Combine coverage and grounding signals into one practical label for evaluation.
+_NUMBER_WORD_MARKERS = {
+    "null",
+    "ein",
+    "eins",
+    "eine",
+    "einer",
+    "einem",
+    "eines",
+    "zwei",
+    "zweimal",
+    "drei",
+    "dreimal",
+    "vier",
+    "viermal",
+    "fünf",
+    "fuenf",
+    "fünfmal",
+    "fuenfmal",
+    "sechs",
+    "sechsmal",
+    "sieben",
+    "siebenmal",
+    "acht",
+    "achtmal",
+    "neun",
+    "neunmal",
+    "zehn",
+    "elf",
+    "zwölf",
+    "zwoelf",
+    "dreizehn",
+    "vierzehn",
+    "fünfzehn",
+    "fuenfzehn",
+    "sechzehn",
+    "siebzehn",
+    "achtzehn",
+    "neunzehn",
+    "zwanzig",
+    "dreißig",
+    "dreissig",
+    "vierzig",
+    "fünfzig",
+    "fuenfzig",
+    "sechzig",
+    "siebzig",
+    "achtzig",
+    "neunzig",
+    "hundert",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+    "thirty",
+    "forty",
+    "fifty",
+    "sixty",
+    "seventy",
+    "eighty",
+    "ninety",
+    "hundred",
+}
+
+_NUMBER_WORD_TO_DIGIT = {
+    "null": "0",
+    "zwei": "2",
+    "zweimal": "2",
+    "drei": "3",
+    "dreimal": "3",
+    "vier": "4",
+    "viermal": "4",
+    "fünf": "5",
+    "fuenf": "5",
+    "fünfmal": "5",
+    "fuenfmal": "5",
+    "sechs": "6",
+    "sechsmal": "6",
+    "sieben": "7",
+    "siebenmal": "7",
+    "acht": "8",
+    "achtmal": "8",
+    "neun": "9",
+    "neunmal": "9",
+    "zehn": "10",
+    "elf": "11",
+    "zwölf": "12",
+    "zwoelf": "12",
+    "dreizehn": "13",
+    "vierzehn": "14",
+    "fünfzehn": "15",
+    "fuenfzehn": "15",
+    "sechzehn": "16",
+    "siebzehn": "17",
+    "achtzehn": "18",
+    "neunzehn": "19",
+    "zwanzig": "20",
+    "dreißig": "30",
+    "dreissig": "30",
+    "vierzig": "40",
+    "fünfzig": "50",
+    "fuenfzig": "50",
+    "sechzig": "60",
+    "siebzig": "70",
+    "achtzig": "80",
+    "neunzig": "90",
+    "hundert": "100",
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+    "hundred": "100",
+}
+
+_GENERIC_ANCHOR_STOPWORDS = {
+    "the", "and", "or", "of", "for", "with", "from", "after", "before", "in", "on", "at",
+    "der", "die", "das", "den", "dem", "des", "und", "oder", "von", "vom", "mit", "nach",
+    "vor", "für", "im", "in", "am", "an", "zu", "zur", "zum", "bei", "auf",
+}
+
+
+def _canonical_number_token(token: str) -> str | None:
+    normalized = normalize_text(token).replace(",", ".")
+    if re.fullmatch(r"\d+(?:\.\d+)?", normalized):
+        return normalized.rstrip("0").rstrip(".") if "." in normalized else normalized
+    return _NUMBER_WORD_TO_DIGIT.get(normalized)
+
+
+def _extract_number_spans(text: str) -> List[tuple[str, int, int]]:
+    normalized = normalize_text(text)
+    spans: List[tuple[str, int, int]] = []
+    weak_one_forms = {"ein", "eins", "eine", "einer", "einem", "eines", "one"}
+    pattern = r"\b\d+(?:[.,]\d+)?\b|\b[a-zäöüß]+\b"
+    for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+        raw = match.group(0).casefold()
+        if raw in weak_one_forms:
+            continue
+        number = _canonical_number_token(raw)
+        if number is not None:
+            spans.append((number, match.start(), match.end()))
+    return spans
+
+
+def _contentish_token(token: str) -> str:
+    normalized = normalize_for_matching(token)
+    parts = [part for part in normalized.split() if part and part not in _GENERIC_ANCHOR_STOPWORDS]
+    return " ".join(parts)
+
+
+def _nearby_unit_tokens(text: str, end: int, *, window: int = 48) -> List[str]:
+    tail = text[end : end + window]
+    units: List[str] = []
+    for token in re.findall(r"\b[\wäöüÄÖÜß.-]{2,}\b", tail, flags=re.UNICODE)[:3]:
+        normalized = lemmatize_text(token)
+        if normalized and normalized not in _GENERIC_ANCHOR_STOPWORDS and not _canonical_number_token(normalized):
+            units.append(normalized)
+    return units
+
+
+def _extract_code_markers(text: str) -> set[str]:
+    normalized = normalize_text(text)
+    markers: set[str] = set()
+    for match in re.finditer(r"\b[a-z]{1,4}\d{1,4}[a-z]?\b|\b\d+[a-z]{1,4}\b", normalized, flags=re.IGNORECASE):
+        token = match.group(0).casefold()
+        if not re.fullmatch(r"\d+", token):
+            markers.add(f"code:{token}")
+    return markers
+
+
+def _extract_named_phrase_markers(text: str) -> set[str]:
+    markers: set[str] = set()
+    proper = r"(?:[A-ZÄÖÜ][\w.-]{2,}|[A-Z]{2,})"
+    phrase_pattern = rf"\b{proper}(?:\s+(?:of|and|und|&)\s+{proper}|\s+{proper}){{1,5}}\b"
+    for match in re.finditer(phrase_pattern, text, flags=re.UNICODE):
+        phrase_tokens = [
+            _contentish_token(token)
+            for token in re.findall(r"\b[\wäöüÄÖÜß.-]{2,}\b", match.group(0), flags=re.UNICODE)
+        ]
+        tokens = [token for token in phrase_tokens if token and token not in _GENERIC_ANCHOR_STOPWORDS]
+        for start in range(len(tokens)):
+            for end in range(start + 2, min(len(tokens), start + 4) + 1):
+                markers.add(f"phrase:{' '.join(tokens[start:end])}")
+
+    for token in re.findall(r"\b[A-ZÄÖÜ][\w.-]{3,}\b", text, flags=re.UNICODE):
+        normalized = _contentish_token(token)
+        if re.search(r"(semester|semestre|trimester|quarter|monat|month|jahr|year)$", normalized):
+            markers.add(f"period:{normalized}")
+    return markers
+
+
+def _extract_decisive_answer_markers(text: str) -> set[str]:
+    if not text.strip():
+        return set()
+
+    normalized = normalize_text(text)
+    markers: set[str] = set()
+    for number, _start, end in _extract_number_spans(normalized):
+        markers.add(f"number:{number}")
+        for unit in _nearby_unit_tokens(normalized, end):
+            markers.add(f"quantity:{number}:{unit}")
+            break
+
+    markers.update(_extract_code_markers(text))
+    markers.update(_extract_named_phrase_markers(text))
+    return markers
+
+
+def _marker_coverage(gold_markers: set[str], answer_markers: set[str]) -> float | None:
+    if not gold_markers:
+        return None
+    return len(gold_markers.intersection(answer_markers)) / len(gold_markers)
+
+
+def _critical_markers(markers: set[str]) -> set[str]:
+    return {
+        marker
+        for marker in markers
+        if marker.startswith(("number:", "code:"))
+    }
+
+
+def _markers_decisively_covered(gold_answer: str, answer: str) -> bool:
+    gold_markers = _extract_decisive_answer_markers(gold_answer)
+    if not gold_markers:
+        return False
+    answer_markers = _extract_decisive_answer_markers(answer)
+    if gold_markers.issubset(answer_markers):
+        return True
+
+    gold_critical_markers = _critical_markers(gold_markers)
+    if gold_critical_markers and not gold_critical_markers.issubset(answer_markers):
+        return False
+
+    marker_coverage = _marker_coverage(gold_markers, answer_markers)
+    return marker_coverage is not None and marker_coverage >= 0.60
+
+
+def _extract_polarity(text: str) -> Optional[str]:
+    normalized = normalize_text(text)
+    if re.match(r"^(ja|yes)\b", normalized):
+        return "yes"
+    if re.match(r"^(nein|no)\b", normalized):
+        return "no"
+    return None
+
+
 def classify_answer(
     *,
+    gold_answer: str,
+    answer: str,
     gold_answer_overlap: Optional[float],
     answer_gold_support: Optional[float],
     answer_has_gold_substring: Optional[bool],
     faithfulness: Optional[float],
+    claim_diagnostic: str | None = None,
 ) -> str:
     supported = faithfulness is None or faithfulness >= 0.45
     clearly_unsupported = faithfulness is not None and faithfulness < 0.35
+    refusal = answer_is_refusal(answer)
+    gold_overlap = gold_answer_overlap or 0.0
+    gold_support = answer_gold_support or 0.0
 
     if answer_has_gold_substring and supported:
         return "correct"
 
-    strong_signal = False
-    partial_signal = False
+    if refusal:
+        if clearly_unsupported:
+            return "unsupported"
+        return "incorrect"
 
-    if gold_answer_overlap is not None:
-        strong_signal = strong_signal or gold_answer_overlap >= 0.55
-        partial_signal = partial_signal or gold_answer_overlap >= 0.35
-    if answer_gold_support is not None:
-        strong_signal = strong_signal or answer_gold_support >= 0.7
-        partial_signal = partial_signal or answer_gold_support >= 0.55
+    gold_polarity = _extract_polarity(gold_answer)
+    answer_polarity = _extract_polarity(answer)
+    if gold_polarity and answer_polarity and gold_polarity != answer_polarity:
+        return "incorrect"
 
-    if clearly_unsupported and (strong_signal or partial_signal):
-        return "unsupported"
-    if strong_signal and supported:
+    decisive_markers_covered = _markers_decisively_covered(gold_answer, answer)
+
+    # Correct answers often include citations, program names, or harmless
+    # explanatory context that claim splitting treats as extra claims. If the
+    # answer is grounded and covers the decisive value(s) or almost all gold
+    # information, prefer the answer-level correctness signal.
+    if supported and (
+        gold_support >= 0.75
+        or (decisive_markers_covered and gold_overlap >= 0.25)
+        or (
+            decisive_markers_covered
+            and claim_diagnostic in {"answer_contains_extra_claims", "claim_contradiction", "unsupported_generated_claims"}
+        )
+    ):
         return "correct"
-    if partial_signal and supported:
+
+    if claim_diagnostic in {"unsupported_generated_claims", "claim_contradiction"}:
+        return "unsupported" if clearly_unsupported else "incorrect"
+
+    if claim_diagnostic == "answer_incomplete_from_available_context":
+        if supported and gold_overlap >= 0.20:
+            return "correct"
+        if supported and gold_overlap >= 0.12:
+            return "partially_correct"
+        if gold_overlap >= 0.12 or gold_support >= 0.04:
+            return "partially_correct"
+        return "incorrect"
+
+    if claim_diagnostic == "retrieval_claim_miss":
+        if gold_support < 0.05:
+            return "unsupported" if clearly_unsupported else "incorrect"
+        if supported and gold_overlap >= 0.25:
+            return "correct"
+        if supported and gold_overlap >= 0.20:
+            return "partially_correct"
+        if gold_overlap >= 0.20:
+            return "partially_correct"
+        return "incorrect"
+
+    if supported and gold_overlap >= 0.25 and gold_support >= 0.05:
+        return "correct"
+    if supported and gold_overlap >= 0.20 and gold_support >= 0.03:
         return "partially_correct"
-    if strong_signal or partial_signal:
+    if supported and gold_overlap >= 0.15:
+        return "partially_correct"
+    if supported and gold_support >= 0.06:
+        return "partially_correct"
+
+    if clearly_unsupported:
         return "unsupported"
+    if gold_overlap >= 0.20 or gold_support >= 0.05:
+        return "partially_correct"
     return "incorrect"
 
 
@@ -742,12 +1094,6 @@ def evaluate_answer_metrics(
         abstention_correct = abstained
         over_answered = not abstained
 
-    final_label = classify_answer(
-        gold_answer_overlap=gold_answer_overlap,
-        answer_gold_support=answer_gold_support,
-        answer_has_gold_substring=answer_has_gold_substring,
-        faithfulness=faithfulness,
-    )
     fallback_claim_metrics = evaluate_claim_metrics(item, answer, context_text, retrieved)
     if (
         claim_judge_result is not None
@@ -757,6 +1103,15 @@ def evaluate_answer_metrics(
         claim_metrics = {**fallback_claim_metrics, **claim_judge_result.metrics}
     else:
         claim_metrics = fallback_claim_metrics
+    final_label = classify_answer(
+        gold_answer=gold_answer,
+        answer=answer,
+        gold_answer_overlap=gold_answer_overlap,
+        answer_gold_support=answer_gold_support,
+        answer_has_gold_substring=answer_has_gold_substring,
+        faithfulness=faithfulness,
+        claim_diagnostic=claim_metrics["claim_diagnostic"],
+    )
     entity_metrics = compute_entity_metrics(
         item=item,
         answer=answer,
@@ -768,23 +1123,39 @@ def evaluate_answer_metrics(
         unsupported_claim_count=int(claim_metrics["unsupported_claim_count"]),
         contradicted_claim_count=int(claim_metrics["contradicted_claim_count"]),
     )
+    claim_level_correct = (
+        claim_metrics["answer_claim_f1"] is not None
+        and claim_metrics["answer_claim_f1"] >= 0.8
+        and (claim_metrics["grounded_claim_ratio"] is None or claim_metrics["grounded_claim_ratio"] >= 0.75)
+    )
+    gold_polarity = _extract_polarity(gold_answer)
+    answer_polarity = _extract_polarity(answer)
+    polarity_matches = bool(gold_polarity and answer_polarity and gold_polarity == answer_polarity)
+    decisive_markers_covered = _markers_decisively_covered(gold_answer, answer)
+    answer_level_correct = final_label == "correct" and (
+        bool(answer_has_gold_substring)
+        or (answer_gold_support is not None and answer_gold_support >= 0.75)
+        or (
+            (gold_answer_overlap or 0.0) >= 0.50
+            and (answer_gold_support or 0.0) >= 0.35
+        )
+        or decisive_markers_covered
+        or (polarity_matches and (gold_answer_overlap or 0.0) >= 0.35)
+    )
     if claim_metrics["claim_diagnostic"] in {
         "claim_contradiction",
         "unsupported_generated_claims",
-    } and final_label in {"correct", "partially_correct"}:
+    } and final_label == "partially_correct":
         final_label = "unsupported"
     elif (
         claim_metrics["claim_diagnostic"]
         in {"answer_incomplete", "answer_incomplete_from_available_context"}
         and final_label == "correct"
+        and not claim_level_correct
+        and not answer_level_correct
     ):
         final_label = "partially_correct"
-    elif (
-        claim_metrics["answer_claim_f1"] is not None
-        and claim_metrics["answer_claim_f1"] >= 0.8
-        and (claim_metrics["grounded_claim_ratio"] is None or claim_metrics["grounded_claim_ratio"] >= 0.75)
-        and final_label == "incorrect"
-    ):
+    elif claim_level_correct and final_label in {"incorrect", "partially_correct"}:
         final_label = "correct"
     if not is_answerable:
         final_label = "correct" if abstained else "unsupported"

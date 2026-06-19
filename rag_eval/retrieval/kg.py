@@ -1002,6 +1002,14 @@ def kg_chunk_quality_factor(query: str, chunk: Dict) -> float:
 
 def kg_profile_settings(profile: str) -> Dict[str, object]:
     profiles = {
+        "safe_branch": {
+            "algorithm": "direct",
+            "max_added_chunks": 1,
+            "quality_threshold": 0.80,
+            "ppr_iterations": 2,
+            "ppr_damping": 0.60,
+            "intent_weight": 0.0,
+        },
         "conservative": {
             "algorithm": "direct",
             "max_added_chunks": 1,

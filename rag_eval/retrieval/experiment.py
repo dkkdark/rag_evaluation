@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
+from rag_eval.evaluation.evidence_graph import build_document_evidence_graph_summary
 from rag_eval.retrieval.chunking import build_chunks
 from rag_eval.retrieval.kg import (
     ablate_kg_graph_edges,
@@ -121,19 +124,259 @@ def list_field(value: object) -> List[str]:
     return [str(value)]
 
 
-def question_metadata_filter(item: Dict, *, include_document: bool) -> Dict[str, object]:
+def infer_program_names_from_doc_paths(paths: Sequence[str]) -> List[str]:
+    program_names: List[str] = []
+    for path in paths:
+        normalized = str(path or "").replace("\\", "/").strip("/")
+        if not normalized:
+            continue
+        program_name = normalized.split("/", 1)[0].strip()
+        if program_name and program_name not in program_names:
+            program_names.append(program_name)
+    return program_names
+
+
+def _normalized_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").strip()
+
+
+def _doc_type(doc_path: str) -> str:
+    filename = Path(_normalized_path(doc_path)).name.casefold()
+    if "berichtigung" in filename:
+        return "correction"
+    if "auslauf" in filename:
+        return "phase_out"
+    if any(token in filename for token in ["aenderung", "änderung", "nachtrag", "supplement"]):
+        return "amendment"
+    return "base"
+
+
+def _question_prefers_special_regulation(question: str) -> str | None:
+    normalized = str(question or "").casefold()
+    if any(token in normalized for token in ["berichtigung", "corrected", "correction", "erratum"]):
+        return "correction"
+    if any(token in normalized for token in ["auslauf", "übergang", "uebergang", "transition", "phasing out"]):
+        return "phase_out"
+    if any(token in normalized for token in ["änderung", "aenderung", "amendment", "change order", "supplement"]):
+        return "amendment"
+    return None
+
+
+def _doc_type_priority(doc_path: str, question: str) -> int:
+    preferred_type = _question_prefers_special_regulation(question)
+    doc_type = _doc_type(doc_path)
+    if preferred_type is not None:
+        return 0 if doc_type == preferred_type else 1
+    priority = {"base": 0, "amendment": 1, "correction": 2, "phase_out": 3}
+    return priority.get(doc_type, 4)
+
+
+def _preferred_doc_paths(doc_paths: Sequence[str], question: str) -> List[str]:
+    normalized_paths = sorted({_normalized_path(path) for path in doc_paths if _normalized_path(path)})
+    if not normalized_paths:
+        return []
+    best_priority = min(_doc_type_priority(path, question) for path in normalized_paths)
+    return [path for path in normalized_paths if _doc_type_priority(path, question) == best_priority]
+
+
+def _question_year(item: Dict) -> int | None:
+    raw_year = item.get("year")
+    if raw_year is None or raw_year == "":
+        return None
+    try:
+        year = int(raw_year)
+    except (TypeError, ValueError):
+        return None
+    return year if 1900 <= year <= 2100 else None
+
+
+def _doc_year(doc_path: str) -> int | None:
+    filename = Path(str(doc_path or "")).name
+    matches = re.findall(r"20\d{2}", filename)
+    if not matches:
+        return None
+    try:
+        return int(matches[0])
+    except ValueError:
+        return None
+
+
+def _valid_year(value: str) -> int | None:
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    return year if 1900 <= year <= 2100 else None
+
+
+def _doc_text_year(text: str) -> int | None:
+    normalized = re.sub(r"\s+", " ", str(text or ""))
+    if not normalized:
+        return None
+
+    primary_patterns = [
+        r"\b(?:vom|from|dated|as of)\s+\d{1,2}\.?\s+[A-Za-zÄÖÜäöüß]+\s+(20\d{2})\b",
+        r"\b(?:herausgegeben|published|issued)\s+(?:am|on)\s+\d{1,2}\.?\s+[A-Za-zÄÖÜäöüß]+\s+(20\d{2})\b",
+        r"\b(?:amtliche\s+mitteilung|official\s+notice)\s+(?:nr\.?|no\.?)\s+\d+\s*/\s*(20\d{2})\b",
+        r"\b(?:ordnung|satzung|regulation|statute)\b.{0,120}\b(?:vom|from|dated)\s+\d{1,2}\.?\s+[A-Za-zÄÖÜäöüß]+\s+(20\d{2})\b",
+    ]
+    for pattern in primary_patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            year = _valid_year(match.group(1))
+            if year is not None:
+                return year
+
+    first_page_like_text = normalized[:2500]
+    first_years = [
+        year
+        for year in (_valid_year(match.group(0)) for match in re.finditer(r"\b20\d{2}\b", first_page_like_text))
+        if year is not None
+    ]
+    if first_years:
+        return first_years[0]
+
+    return None
+
+
+def _chunk_sort_key(chunk: Dict) -> tuple[int, int, str]:
+    section_id = str(chunk.get("section_id", ""))
+    source_id = str(chunk.get("source_id", ""))
+    chunk_id = str(chunk.get("chunk_id", ""))
+    preamble_rank = 0 if section_id == "PREAMBLE" or "PREAMBLE" in chunk_id else 1
+    section_match = re.search(r"\|s(\d+)\|", source_id) or re.search(r"\|s(\d+)\|", chunk_id)
+    section_pos = int(section_match.group(1)) if section_match else 9999
+    return (preamble_rank, section_pos, chunk_id)
+
+
+def _doc_year_from_chunks(doc_path: str, chunks: Sequence[Dict]) -> int | None:
+    doc_chunks = [
+        chunk
+        for chunk in chunks
+        if str(chunk.get("doc_path", "")).strip() == doc_path
+    ]
+    if not doc_chunks:
+        return _doc_year(doc_path)
+
+    ordered_chunks = sorted(doc_chunks, key=_chunk_sort_key)
+    head_text = "\n\n".join(
+        "\n".join(
+            part
+            for part in [
+                str(chunk.get("section_id", "")),
+                str(chunk.get("title", "")),
+                str(chunk.get("text", "")),
+            ]
+            if part.strip()
+        )
+        for chunk in ordered_chunks[:3]
+    )
+    return _doc_text_year(head_text) or _doc_year(doc_path)
+
+
+def _select_doc_paths_for_year(
+    *,
+    item: Dict,
+    chunks: Sequence[Dict],
+) -> List[str]:
+    explicit_doc_paths = list_field(item.get("doc_path")) + list_field(item.get("doc_paths"))
+    question = str(item.get("question", ""))
+    year = _question_year(item)
+
+    if year is None:
+        return _preferred_doc_paths(explicit_doc_paths, question)
+
+    program_names = list_field(item.get("program_name")) + list_field(item.get("program_names"))
+    if not program_names:
+        program_names = infer_program_names_from_doc_paths(explicit_doc_paths)
+
+    program_chunks = [
+        chunk
+        for chunk in chunks
+        if not program_names
+        or any(metadata_value_matches(chunk.get("program_name", ""), program_name) for program_name in program_names)
+    ]
+    doc_years: Dict[str, int | None] = {}
+    for chunk in program_chunks:
+        doc_path = str(chunk.get("doc_path", "")).strip()
+        if not doc_path or doc_path in doc_years:
+            continue
+        doc_years[doc_path] = _doc_year_from_chunks(doc_path, program_chunks)
+
+    if not doc_years:
+        return _preferred_doc_paths(explicit_doc_paths, question)
+
+    # Students stay on the base MPO/BPO version that was in force at the
+    # time of enrollment. Earlier amendments that were already in force by
+    # that enrollment year remain relevant to the cohort, while later ones
+    # should not override it unless the question explicitly asks about a
+    # special regulation.
+    eligible_base_docs = {
+        doc_path: doc_year
+        for doc_path, doc_year in doc_years.items()
+        if _doc_type(doc_path) == "base" and doc_year is not None and doc_year <= year
+    }
+    if eligible_base_docs:
+        target_base_year = max(eligible_base_docs.values())
+        selected_base_docs = {
+            doc_path
+            for doc_path, doc_year in eligible_base_docs.items()
+            if doc_year == target_base_year
+        }
+        if selected_base_docs:
+            selected_doc_paths = set(selected_base_docs)
+            for doc_path, doc_year in doc_years.items():
+                doc_type = _doc_type(doc_path)
+                if doc_type not in {"amendment", "correction"}:
+                    continue
+                if doc_year is None or doc_year > year:
+                    continue
+                if doc_year < target_base_year:
+                    continue
+                selected_doc_paths.add(doc_path)
+            return sorted(selected_doc_paths)
+
+    eligible = {
+        doc_path: doc_year
+        for doc_path, doc_year in doc_years.items()
+        if doc_year is not None and doc_year <= year
+    }
+    selected_pool = eligible if eligible else {doc_path: doc_year for doc_path, doc_year in doc_years.items() if doc_year is not None}
+    if not selected_pool:
+        return _preferred_doc_paths(explicit_doc_paths, question)
+
+    if eligible:
+        target_year = max(selected_pool.values())
+    else:
+        target_year = min(selected_pool.values())
+
+    selected_doc_paths = [doc_path for doc_path, doc_year in selected_pool.items() if doc_year == target_year]
+    if selected_doc_paths:
+        preferred_doc_paths = _preferred_doc_paths(selected_doc_paths, question)
+        return preferred_doc_paths or selected_doc_paths
+
+    return _preferred_doc_paths(explicit_doc_paths, question)
+
+
+def question_metadata_filter(item: Dict, *, chunks: Sequence[Dict], include_document: bool) -> Dict[str, object]:
     metadata_filter: Dict[str, object] = {}
+    doc_paths = list_field(item.get("doc_path")) + list_field(item.get("doc_paths"))
+    program_names = list_field(item.get("program_name")) + list_field(item.get("program_names"))
+    if not program_names:
+        # Fall back to the document folder so retrieval stays inside the
+        # program directory even when a question row omitted program_name.
+        program_names = infer_program_names_from_doc_paths(doc_paths)
+
     fields = [
         ("program_id", "program_ids"),
-        ("program_name", "program_names"),
     ]
-    if include_document:
-        fields.extend(
-            [
-                ("doc_id", "doc_ids"),
-                ("doc_path", "doc_paths"),
-            ]
-        )
+    if program_names:
+        metadata_filter["program_name"] = program_names
+    selected_doc_paths = _select_doc_paths_for_year(item=item, chunks=chunks)
+    if not selected_doc_paths:
+        selected_doc_paths = doc_paths
+    if selected_doc_paths:
+        metadata_filter["doc_path"] = selected_doc_paths
     for singular, plural in fields:
         values = list_field(item.get(singular)) + list_field(item.get(plural))
         if values:
@@ -306,6 +549,54 @@ def build_run_dir(base_output_dir: str, run_name: Optional[str]) -> str:
     return run_dir
 
 
+def _truncate_text(value: object, max_chars: int) -> str:
+    text = str(value or "")
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def prepare_experiment_resources(
+    *,
+    sections: Sequence[Section],
+    paragraphs: Sequence[Paragraph],
+    strategy: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    retriever_type: str,
+    embedding_model: str,
+    kg_enabled: bool,
+    questions: Sequence[Dict],
+    search_backend_config: Dict[str, object] | None = None,
+    search_index_name: str | None = None,
+) -> Dict[str, object]:
+    chunks = build_chunks(sections, paragraphs, strategy, chunk_size, chunk_overlap)
+    if not chunks:
+        raise ValueError(f"No chunks generated for strategy '{strategy}'.")
+
+    kg_supervision_terms = build_kg_supervision_terms(questions) if kg_enabled else {}
+    kg_graph = (
+        build_knowledge_graph(chunks, extra_entity_terms=kg_supervision_terms)
+        if kg_enabled
+        else {"entities": [], "relations": []}
+    )
+    kg_graph_quality = graph_quality_diagnostics(kg_graph, chunks) if kg_enabled else {}
+    retriever_state = build_retriever_with_backend(
+        chunks,
+        retriever_type,
+        embedding_model,
+        search_backend_config=search_backend_config,
+        index_name=search_index_name,
+    )
+    return {
+        "chunks": chunks,
+        "kg_supervision_terms": kg_supervision_terms,
+        "kg_graph": kg_graph,
+        "kg_graph_quality": kg_graph_quality,
+        "retriever_state": retriever_state,
+    }
+
+
 def run_single_experiment(
     *,
     sections: Sequence[Section],
@@ -333,8 +624,8 @@ def run_single_experiment(
     kg_quality_threshold: float | None = None,
     kg_intent_weight: float | None = None,
     kg_ablation_edge_dropouts: str | Sequence[float] | None = None,
-    answer_mode: str = "cite_first",
-    context_mode: str = "dedupe_section",
+    answer_mode: str = "grounded_llm",
+    context_mode: str = "ranked",
     max_context_chunks: int | None = None,
     max_context_chars: int | None = None,
     query_augmentation: str = "none",
@@ -351,11 +642,15 @@ def run_single_experiment(
     rerank_weight: float = 0.25,
     search_backend_config: Dict[str, object] | None = None,
     search_index_name: str | None = None,
+    prepared_resources: Dict[str, object] | None = None,
 ) -> Dict:
     import pandas as pd
 
-    resolved_answer_mode = answer_mode or "cite_first"
-    resolved_context_mode = context_mode or "dedupe_section"
+    judge_config = judge_config or LLMConfig(False, "", llm_config.api_key_env, 0.0)
+    resolved_answer_mode = answer_mode or "grounded_llm"
+    resolved_context_mode = context_mode or "ranked"
+    requested_answer_mode = answer_mode
+    requested_context_mode = context_mode
     resolved_max_context_chunks = max_context_chunks
     resolved_max_context_chars = max_context_chars
     resolved_query_augmentation = query_augmentation or "none"
@@ -364,6 +659,15 @@ def run_single_experiment(
     resolved_kg_ablation_edge_dropouts = parse_float_csv_list(kg_ablation_edge_dropouts)
 
     experiment_slug = f"{strategy}_{retriever_type}_size{chunk_size}_overlap{chunk_overlap}"
+    experiment_slug = f"{experiment_slug}_ans_{resolved_answer_mode}_ctx_{resolved_context_mode}"
+    if abstain_on_weak_evidence:
+        experiment_slug = f"{experiment_slug}_abstain"
+    if self_rag_retry_on_weak_evidence:
+        experiment_slug = f"{experiment_slug}_retry{self_rag_retry_max_attempts}"
+    if self_rag_critique:
+        experiment_slug = f"{experiment_slug}_critique"
+    if judge_config.enabled:
+        experiment_slug = f"{experiment_slug}_judge"
     if kg_enabled:
         kg_slug = str(kg_profile or "kg").replace("/", "_").replace(" ", "_")
         algorithm_slug = str(kg_algorithm or "").replace("/", "_").replace(" ", "_")
@@ -373,21 +677,28 @@ def run_single_experiment(
     experiment_dir = os.path.join(run_dir, experiment_slug)
     ensure_dir(experiment_dir)
 
-    chunks = build_chunks(sections, paragraphs, strategy, chunk_size, chunk_overlap)
-    if not chunks:
-        raise ValueError(f"No chunks generated for strategy '{strategy}'.")
+    resource_state = prepared_resources or prepare_experiment_resources(
+        sections=sections,
+        paragraphs=paragraphs,
+        strategy=strategy,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        retriever_type=retriever_type,
+        embedding_model=embedding_model,
+        kg_enabled=kg_enabled,
+        questions=questions,
+        search_backend_config=search_backend_config,
+        search_index_name=search_index_name,
+    )
+    chunks = list(resource_state["chunks"])
 
     chunks_df = pd.DataFrame(chunks)
     chunks_csv = os.path.join(experiment_dir, "chunks.csv")
     chunks_df.to_csv(chunks_csv, index=False)
 
-    kg_supervision_terms = build_kg_supervision_terms(questions) if kg_enabled else {}
-    kg_graph = (
-        build_knowledge_graph(chunks, extra_entity_terms=kg_supervision_terms)
-        if kg_enabled
-        else {"entities": [], "relations": []}
-    )
-    kg_graph_quality = graph_quality_diagnostics(kg_graph, chunks) if kg_enabled else {}
+    kg_supervision_terms = dict(resource_state.get("kg_supervision_terms") or {})
+    kg_graph = dict(resource_state.get("kg_graph") or {"entities": [], "relations": []})
+    kg_graph_quality = dict(resource_state.get("kg_graph_quality") or {})
     kg_entities_csv: Optional[str] = None
     kg_relations_csv: Optional[str] = None
     kg_metrics_csv: Optional[str] = None
@@ -400,13 +711,7 @@ def run_single_experiment(
         pd.DataFrame(kg_graph["entities"]).to_csv(kg_entities_csv, index=False)
         pd.DataFrame(kg_graph["relations"]).to_csv(kg_relations_csv, index=False)
 
-    retriever_state = build_retriever_with_backend(
-        chunks,
-        retriever_type,
-        embedding_model,
-        search_backend_config=search_backend_config,
-        index_name=search_index_name,
-    )
+    retriever_state = resource_state["retriever_state"]
     faiss_path: Optional[str] = None
     if retriever_state.get("backend") == "dense":
         import faiss
@@ -442,8 +747,8 @@ def run_single_experiment(
             max_terms=query_augmentation_max_terms,
         )
         retrieval_query = query_augmentation_result.answer or item["question"]
-        answer_metadata_filter = question_metadata_filter(item, include_document=False)
-        evaluation_metadata_filter = question_metadata_filter(item, include_document=True)
+        answer_metadata_filter = question_metadata_filter(item, chunks=chunks, include_document=False)
+        evaluation_metadata_filter = question_metadata_filter(item, chunks=chunks, include_document=True)
         candidate_chunks = filter_chunks_by_metadata(chunks, evaluation_metadata_filter)
         if evaluation_metadata_filter and not candidate_chunks:
             raise ValueError(
@@ -627,7 +932,7 @@ def run_single_experiment(
             item=item,
             answer=answer,
             retrieved=retrieved,
-            config=judge_config or LLMConfig(False, "", llm_config.api_key_env, 0.0),
+            config=judge_config,
         )
         answer_metrics = evaluate_answer_metrics(
             item,
@@ -993,7 +1298,7 @@ def run_single_experiment(
                             "section_id": row.get("section_id", ""),
                             "title": row.get("title", ""),
                             "retrieval_source": row.get("retrieval_source", "vector"),
-                            "text": row.get("text", ""),
+                            "text_preview": _truncate_text(row.get("text", ""), 800),
                         }
                         for rank, row in enumerate(retrieved, start=1)
                     ],
@@ -1114,7 +1419,7 @@ def run_single_experiment(
                     "error": claim_judge_result.error,
                     "model": claim_judge_result.model,
                     "metrics": claim_judge_result.metrics,
-                    "raw_response": claim_judge_result.raw_response,
+                    "raw_response": _truncate_text(claim_judge_result.raw_response, 12000),
                 }
             )
         for claim_index, claim_row in enumerate(answer_metrics.claim_evidence_map, start=1):
@@ -1287,6 +1592,13 @@ def run_single_experiment(
     diagnostics_json = os.path.join(experiment_dir, "diagnostics_summary.json")
     with open(diagnostics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_diagnostics, f, ensure_ascii=False, indent=2)
+    evidence_graph_summary = build_document_evidence_graph_summary(
+        result_rows=results,
+        ranking_rows=retrieved_rows,
+    )
+    evidence_graph_json = os.path.join(experiment_dir, "evidence_graph_summary.json")
+    with open(evidence_graph_json, "w", encoding="utf-8") as f:
+        json.dump(evidence_graph_summary, f, ensure_ascii=False, indent=2)
 
     claim_judge_jsonl: Optional[str] = None
     if judge_rows:
@@ -1321,6 +1633,8 @@ def run_single_experiment(
             "weight": rerank_weight,
         },
         "evaluation_settings": {
+            "requested_answer_mode": requested_answer_mode,
+            "requested_context_mode": requested_context_mode,
             "answer_mode": resolved_answer_mode,
             "context_mode": resolved_context_mode,
             "max_context_chunks": resolved_max_context_chunks,
@@ -1357,6 +1671,7 @@ def run_single_experiment(
             "metrics_by_question_type": kg_metrics_by_question_type,
             "incompleteness_ablation": kg_ablation_summary,
         },
+        "evidence_graph": evidence_graph_summary,
         "diagnostics": aggregate_diagnostics,
         "llm": {
             "enabled": (
@@ -1431,6 +1746,7 @@ def run_single_experiment(
             "kg_incompleteness_ablation_summary_json": kg_ablation_summary_json,
             "diagnostics_csv": diagnostics_csv,
             "diagnostics_summary_json": diagnostics_json,
+            "evidence_graph_summary_json": evidence_graph_json,
             "claim_judge_results_jsonl": claim_judge_jsonl,
             "error_report_md": error_report_md,
             "strategy_score_profile_svg": None,

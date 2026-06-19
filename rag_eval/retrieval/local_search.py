@@ -8,6 +8,11 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+from rag_eval.core.text_utils import metadata_value_matches
+
+
+LOCAL_INDEX_SCHEMA_VERSION = 2
+
 
 def local_db_backend_enabled(config: Dict[str, object] | None) -> bool:
     if not config:
@@ -103,6 +108,7 @@ def ensure_local_index(
                 and int(manifest.get("count") or 0) == len(documents)
                 and str(manifest.get("model_name") or "") == str(manifest_payload.get("model_name") or "")
                 and bool(manifest.get("has_faiss")) == bool(requires_faiss)
+                and int(manifest.get("schema_version") or 0) == LOCAL_INDEX_SCHEMA_VERSION
             ):
                 return {**paths, "index_name": index_name}
         except Exception:
@@ -130,6 +136,7 @@ def ensure_local_index(
               generated_keywords_en TEXT,
               generated_synonyms_en TEXT,
               doc_id TEXT,
+              doc_path TEXT,
               section_id TEXT,
               program_id TEXT,
               program_name TEXT,
@@ -154,8 +161,8 @@ def ensure_local_index(
             INSERT INTO docs (
               chunk_id, vector_position, payload_json, title, text, search_text, search_text_en,
               search_text_multilingual, description_en, generated_keywords_en, generated_synonyms_en,
-              doc_id, section_id, program_id, program_name, cpv_code, code
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              doc_id, doc_path, section_id, program_id, program_name, cpv_code, code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         insert_fts = """
             INSERT INTO docs_fts (
@@ -178,6 +185,7 @@ def ensure_local_index(
                 str(document.get("generated_keywords_en") or ""),
                 str(document.get("generated_synonyms_en") or ""),
                 str(document.get("doc_id") or ""),
+                str(document.get("doc_path") or ""),
                 str(document.get("section_id") or ""),
                 str(document.get("program_id") or ""),
                 str(document.get("program_name") or ""),
@@ -213,6 +221,7 @@ def ensure_local_index(
     manifest_payload = dict(manifest_payload)
     manifest_payload["count"] = len(documents)
     manifest_payload["has_faiss"] = bool(embeddings is not None)
+    manifest_payload["schema_version"] = LOCAL_INDEX_SCHEMA_VERSION
     manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return {**paths, "index_name": index_name}
 
@@ -242,6 +251,8 @@ def _metadata_sql(metadata_filter: Dict[str, object] | None) -> tuple[str, List[
     for key, expected in metadata_filter.items():
         if expected is None or expected == "" or expected == []:
             continue
+        if isinstance(expected, dict):
+            continue
         values = expected if isinstance(expected, (list, tuple, set)) else [expected]
         values = [str(value) for value in values if str(value).strip()]
         if not values:
@@ -252,6 +263,32 @@ def _metadata_sql(metadata_filter: Dict[str, object] | None) -> tuple[str, List[
     if not clauses:
         return "", []
     return " AND " + " AND ".join(clauses), params
+
+
+def _payload_matches_metadata_filter(payload: Dict[str, object], metadata_filter: Dict[str, object] | None) -> bool:
+    if not metadata_filter:
+        return True
+    for key, expected in metadata_filter.items():
+        if expected is None or expected == "" or expected == []:
+            continue
+        actual = payload.get(key, "")
+        if isinstance(expected, dict):
+            excluded = expected.get("exclude")
+            if excluded is not None and excluded != "" and excluded != []:
+                excluded_values = excluded if isinstance(excluded, (list, tuple, set)) else [excluded]
+                if any(metadata_value_matches(actual, value) for value in excluded_values):
+                    return False
+            required = expected.get("include")
+            if required is None or required == "" or required == []:
+                continue
+            values = required if isinstance(required, (list, tuple, set)) else [required]
+            if not any(metadata_value_matches(actual, value) for value in values):
+                return False
+            continue
+        values = expected if isinstance(expected, (list, tuple, set)) else [expected]
+        if not any(metadata_value_matches(actual, value) for value in values):
+            return False
+    return True
 
 
 def lexical_search(
@@ -299,8 +336,12 @@ def lexical_search(
     out: List[Dict[str, object]] = []
     for row in rows:
         payload = json.loads(str(row["payload_json"]))
+        if not _payload_matches_metadata_filter(payload, metadata_filter):
+            continue
         payload["score"] = float(row["score"] or 0.0)
         out.append(payload)
+        if len(out) >= int(k):
+            break
     return out
 
 

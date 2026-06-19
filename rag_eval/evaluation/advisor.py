@@ -37,6 +37,7 @@ def recommendation(
     next_experiment: str,
     implementation_hint: str = "",
     success_signal: str = "",
+    source: str = "Advisor",
 ) -> Dict[str, str]:
     return {
         "component": component,
@@ -47,6 +48,7 @@ def recommendation(
         "next_experiment": next_experiment,
         "implementation_hint": implementation_hint,
         "success_signal": success_signal,
+        "recommendation_source": source,
     }
 
 
@@ -588,6 +590,12 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
         if isinstance(classifier.get("cpv_diagnostics"), dict)
         else {}
     )
+    evidence_graph = summary.get("evidence_graph", {}) if isinstance(summary.get("evidence_graph"), dict) else {}
+    evidence_rates = evidence_graph.get("rates", {}) if isinstance(evidence_graph.get("rates"), dict) else {}
+    evidence_patterns = evidence_graph.get("error_patterns", {}) if isinstance(evidence_graph.get("error_patterns"), dict) else {}
+    component_signals = evidence_graph.get("component_signals", {}) if isinstance(evidence_graph.get("component_signals"), dict) else {}
+    top_confusion_pairs = evidence_graph.get("top_confusion_pairs", []) if isinstance(evidence_graph.get("top_confusion_pairs"), list) else []
+    top_wrong_predicted_codes = evidence_graph.get("top_wrong_predicted_codes", []) if isinstance(evidence_graph.get("top_wrong_predicted_codes"), list) else []
 
     top1 = as_float(ranking.get("exact_top1_accuracy"))
     hit_at_k = as_float(ranking.get("hit_at_k"))
@@ -858,6 +866,119 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
             )
         )
 
+    parent_child_error_rate = as_float(evidence_rates.get("parent_child_error_rate"))
+    sibling_error_rate = as_float(evidence_rates.get("sibling_error_rate"))
+    low_margin_same_branch_error_rate = as_float(evidence_rates.get("low_margin_same_branch_error_rate"))
+    short_query_gold_missing_rate = as_float(evidence_rates.get("short_query_gold_missing_rate"))
+    low_diversity_gold_missing_rate = as_float(evidence_rates.get("low_diversity_gold_missing_rate"))
+    duplicate_pressure_error_rate = as_float(evidence_rates.get("duplicate_pressure_error_rate"))
+    notice_example_supported_error_rate = as_float(evidence_rates.get("notice_example_supported_error_rate"))
+    hierarchy_signal = as_float(component_signals.get("hierarchy"))
+    selection_signal = as_float(component_signals.get("selection"))
+    retriever_signal = as_float(component_signals.get("retriever"))
+    query_enrichment_signal = as_float(component_signals.get("query_enrichment"))
+    examples_signal = as_float(component_signals.get("examples"))
+
+    if hierarchy_signal is not None and hierarchy_signal >= 0.18:
+        recs.append(
+            recommendation(
+                component="hierarchy",
+                priority="P1",
+                issue="Evidence graph shows repeated parent-child or sibling confusions",
+                evidence=(
+                    f"parent_child_error_rate={parent_child_error_rate}, "
+                    f"sibling_error_rate={sibling_error_rate}, "
+                    f"parent_child_errors={evidence_patterns.get('parent_child_errors')}"
+                ),
+                recommendation_text="Strengthen hierarchy-aware disambiguation before changing broad retrieval.",
+                next_experiment="Compare the current selector against a branch-only or parent-vs-child disambiguation layer on the same candidate pool.",
+                implementation_hint="This pattern means the system already reaches the correct taxonomy neighborhood but still resolves the final node incorrectly.",
+                success_signal="Parent-child and sibling confusions shrink while hit@k stays roughly stable.",
+                source="Graph-aware",
+            )
+        )
+
+    if selection_signal is not None and selection_signal >= 0.20:
+        recs.append(
+            recommendation(
+                component="selection",
+                priority="P1",
+                issue="Evidence graph shows many low-margin same-branch failures",
+                evidence=f"low_margin_same_branch_error_rate={low_margin_same_branch_error_rate}",
+                recommendation_text="Improve the final decision layer on close candidates rather than adding more retrieval breadth first.",
+                next_experiment="Run a selective final judge or contrastive reranker only on low-margin or same-branch cases.",
+                implementation_hint="These are the cases where the gold code is nearby, but the top candidate wins by an insufficiently discriminative score.",
+                success_signal="First ranked candidate correct rises without reducing candidate coverage.",
+                source="Graph-aware",
+            )
+        )
+
+    if retriever_signal is not None and retriever_signal >= 0.12:
+        recs.append(
+            recommendation(
+                component="retriever",
+                priority="P2",
+                issue="Evidence graph shows gold missing together with low candidate diversity",
+                evidence=f"low_diversity_gold_missing_rate={low_diversity_gold_missing_rate}",
+                recommendation_text="Tune candidate generation and branch diversity before adding more ranking complexity.",
+                next_experiment="Compare current retrieval against a diversity-aware or larger top-k pool, then rerank both with the same selector.",
+                implementation_hint="The retriever appears to over-commit to one branch early, so the correct branch may never enter the shortlist.",
+                success_signal="Gold-missing cases fall and unique branch coverage improves.",
+                source="Graph-aware",
+            )
+        )
+
+    if query_enrichment_signal is not None and query_enrichment_signal >= 0.10:
+        recs.append(
+            recommendation(
+                component="query_enrichment",
+                priority="P2",
+                issue="Evidence graph shows many short-query misses where the gold code never enters top-k",
+                evidence=f"short_query_gold_missing_rate={short_query_gold_missing_rate}",
+                recommendation_text="Apply selective object-focused query enrichment only to short or ambiguous queries.",
+                next_experiment="Enrich only short queries with object terms and close product-family synonyms, then compare against the unchanged baseline.",
+                implementation_hint="Do not rewrite all queries globally; target only the weak lexical cases where retrieval evidence is too sparse.",
+                success_signal="Short-query misses decrease without broad noise increase on well-specified queries.",
+                source="Graph-aware",
+            )
+        )
+
+    if examples_signal is not None and examples_signal >= 0.30:
+        top_pair = top_confusion_pairs[0] if top_confusion_pairs else {}
+        top_wrong = top_wrong_predicted_codes[0] if top_wrong_predicted_codes else {}
+        recs.append(
+            recommendation(
+                component="examples",
+                priority="P2",
+                issue="Evidence graph suggests example quality or profile evidence may bias specific wrong codes",
+                evidence=(
+                    f"notice_example_supported_error_rate={notice_example_supported_error_rate}, "
+                    f"top_wrong_predicted_code={top_wrong.get('cpv_code', '')}, "
+                    f"top_confusion_pair={top_pair.get('predicted_code', '')}->{top_pair.get('gold_code', '')}"
+                ),
+                recommendation_text="Inspect and clean the notice examples and profile evidence for the most frequent wrong-vs-gold confusion pairs.",
+                next_experiment="Take the top confusion pairs and compare their notice examples side by side before changing global retrieval settings.",
+                implementation_hint="If one wrong code repeatedly wins with strong evidence support, its examples or profile text may be too generic or overly attractive.",
+                success_signal="The same wrong code stops dominating across repeated related queries.",
+                source="Graph-aware",
+            )
+        )
+
+    if duplicate_pressure_error_rate is not None and duplicate_pressure_error_rate >= 0.15:
+        recs.append(
+            recommendation(
+                component="deduplication",
+                priority="P3",
+                issue="Evidence graph shows repeated duplicate-candidate pressure in failures",
+                evidence=f"duplicate_pressure_error_rate={duplicate_pressure_error_rate}",
+                recommendation_text="Collapse near-duplicate candidates before final selection so the shortlist contains more true alternatives.",
+                next_experiment="Compare raw top-k against a deduplicated code-level shortlist while keeping the same retrieval scores.",
+                implementation_hint="Duplicate pressure is not always the main bottleneck, but when it appears in many errors it can suppress useful alternatives.",
+                success_signal="Unique candidate coverage rises and some same-branch misses turn into exact matches.",
+                source="Graph-aware",
+            )
+        )
+
     return sorted(recs, key=lambda row: (priority_rank(row["priority"]), row["component"], row["issue"]))
 
 
@@ -951,6 +1072,8 @@ def build_run_advisor(summary: Dict[str, object], rows: Sequence[Dict[str, objec
         if isinstance(classifier.get("cpv_diagnostics"), dict)
         else {}
     )
+    evidence_graph = summary.get("evidence_graph", {}) if isinstance(summary.get("evidence_graph"), dict) else {}
+    evidence_rates = evidence_graph.get("rates", {}) if isinstance(evidence_graph.get("rates"), dict) else {}
     warnings = [] if is_cpv_classifier else benchmark_warnings(rows)
     health = {
         "correct": summary.get("n_correct"),
@@ -981,6 +1104,10 @@ def build_run_advisor(summary: Dict[str, object], rows: Sequence[Dict[str, objec
                 "low_margin_decision_rate": cpv_diagnostics.get("low_margin_decision_rate"),
                 "mean_unique_answers_at_k": cpv_diagnostics.get("mean_unique_cpv_at_k"),
                 "dominant_bottleneck": cpv_diagnostics.get("dominant_bottleneck"),
+                "evidence_graph_parent_child_error_rate": evidence_rates.get("parent_child_error_rate"),
+                "evidence_graph_sibling_error_rate": evidence_rates.get("sibling_error_rate"),
+                "evidence_graph_low_margin_same_branch_error_rate": evidence_rates.get("low_margin_same_branch_error_rate"),
+                "evidence_graph_short_query_gold_missing_rate": evidence_rates.get("short_query_gold_missing_rate"),
             }
         )
     return {
@@ -992,6 +1119,7 @@ def build_run_advisor(summary: Dict[str, object], rows: Sequence[Dict[str, objec
         "summary_recommendations": summary_recommendations,
         "benchmark_warnings": warnings,
         "health": health,
+        "evidence_graph": evidence_graph,
     }
 
 

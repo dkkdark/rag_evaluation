@@ -92,6 +92,16 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def read_json_any(path: Path) -> Any:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def safe_run_name(raw_name: str | None) -> str:
     if raw_name:
         cleaned = RUN_NAME_RE.sub("_", raw_name.strip()).strip("._-")
@@ -115,6 +125,71 @@ def safe_upload_name(raw_name: str) -> str:
 
 def default_run_name() -> str:
     return "web_eval_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def default_question_pdf_paths(questions_path: Path | None = None) -> list[str]:
+    path = questions_path or (PROJECT_ROOT / "data" / "questions_by_file.json")
+    payload = read_json_any(path)
+    if isinstance(payload, dict) and isinstance(payload.get("questions"), list):
+        items = payload["questions"]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return []
+
+    program_names: list[str] = []
+    explicit_doc_paths: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        raw_programs = item.get("program_names")
+        if raw_programs is None:
+            raw_programs = item.get("program_name")
+        if isinstance(raw_programs, (list, tuple, set)):
+            candidate_programs = [str(value).strip() for value in raw_programs]
+        else:
+            candidate_programs = [str(raw_programs or "").strip()]
+        for program_name in candidate_programs:
+            if program_name and program_name not in program_names:
+                program_names.append(program_name)
+
+        raw_doc_paths = item.get("doc_paths")
+        if raw_doc_paths is None:
+            raw_doc_paths = item.get("doc_path") or item.get("doc_id")
+        if isinstance(raw_doc_paths, (list, tuple, set)):
+            candidate_doc_paths = [str(value).strip() for value in raw_doc_paths]
+        else:
+            candidate_doc_paths = [str(raw_doc_paths or "").strip()]
+        for doc_path in candidate_doc_paths:
+            if not doc_path:
+                continue
+            normalized = doc_path.replace("\\", "/").lstrip("/")
+            if normalized.startswith("data/files/"):
+                normalized = normalized[len("data/files/") :]
+            explicit_doc_paths.append(normalized)
+            program_name = normalized.split("/", 1)[0].strip()
+            if program_name and program_name not in program_names:
+                program_names.append(program_name)
+
+    defaults: list[str] = []
+    for program_name in program_names:
+        program_dir = DATA_FILES_DIR / program_name
+        if not program_dir.is_dir():
+            continue
+        for pdf_path in sorted(program_dir.glob("*.pdf*")):
+            if not pdf_path.is_file():
+                continue
+            normalized = str(pdf_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+            if normalized not in defaults:
+                defaults.append(normalized)
+
+    for doc_path in explicit_doc_paths:
+        normalized = doc_path if doc_path.startswith("data/files/") else f"data/files/{doc_path}"
+        candidate = PROJECT_ROOT / normalized
+        if candidate.is_file() and normalized not in defaults:
+            defaults.append(normalized)
+    return defaults
 
 
 def evaluation_python() -> str:
@@ -159,7 +234,6 @@ def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not bool_flag(active, "llm_rerank"):
         active.pop("llm_rerank_top_n", None)
         active.pop("llm_rerank_weight", None)
-
     chunking = str(active.get("chunking") or "")
     if chunking != "auto":
         active.pop("auto_chunk_sizes", None)
@@ -193,7 +267,14 @@ def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
         or bool_flag(active, "self_rag_retry_on_weak_evidence")
         or bool_flag(active, "self_rag_critique")
     )
-    if not (bool_flag(active, "llm_enable") or bool_flag(active, "llm_rerank") or query_augmentation in {"llm", "hyde", "translate_en"} or bool_flag(active, "self_rag_retry_on_weak_evidence") or bool_flag(active, "self_rag_critique")):
+    if not (
+        bool_flag(active, "llm_enable")
+        or bool_flag(active, "llm_rerank")
+        or bool_flag(active, "judge_enable")
+        or query_augmentation in {"llm", "hyde", "translate_en"}
+        or bool_flag(active, "self_rag_retry_on_weak_evidence")
+        or bool_flag(active, "self_rag_critique")
+    ):
         active.pop("llm_model", None)
         active.pop("llm_temperature", None)
     if not bool_flag(active, "judge_enable"):
@@ -304,7 +385,6 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
 
     command.append("--create-strategy-showcase")
     flags = {
-        "--cpv-use-examples": "cpv_use_examples",
         "--llm-enable": "llm_enable",
         "--judge-enable": "judge_enable",
         "--disable-runtime-retrieval-evaluator": "disable_runtime_retrieval_evaluator",
@@ -312,8 +392,11 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--self-rag-retry-on-weak-evidence": "self_rag_retry_on_weak_evidence",
         "--self-rag-critique": "self_rag_critique",
         "--kg-enable": "kg_enable",
+        "--export-kg-for-neo4j": "export_kg_for_neo4j",
         "--cross-encoder-rerank": "cross_encoder_rerank",
         "--llm-rerank": "llm_rerank",
+        "--cpv-notice-examples-channel": "cpv_notice_examples_channel",
+        "--disable-self-exclusion": "disable_self_exclusion",
     }
     for flag, key in flags.items():
         if bool_flag(payload, key):
@@ -383,12 +466,14 @@ def stop_job(run_name: str) -> dict[str, Any]:
 
 
 def list_data_files() -> dict[str, list[str]]:
+    default_selected_pdfs = default_question_pdf_paths()
     return {
         "pdfs": sorted(
             str(path.relative_to(PROJECT_ROOT))
             for path in (PROJECT_ROOT / "data" / "files").glob("**/*.pdf*")
             if path.is_file()
         ),
+        "default_selected_pdfs": default_selected_pdfs,
         "questions": sorted(
             str(path.relative_to(PROJECT_ROOT))
             for path in (PROJECT_ROOT / "data").glob("**/*questions*.json")
@@ -1363,6 +1448,18 @@ INDEX_HTML = r"""<!doctype html>
       padding: 10px 12px;
     }
     .recommendation strong { color: var(--ink); }
+    .recommendation .source-badge {
+      display: inline-block;
+      margin-bottom: 6px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #e7ece7;
+      color: #415241;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
     .chat-shell {
       min-height: calc(100vh - 70px);
       background: #f2f6f6;
@@ -1599,6 +1696,42 @@ INDEX_HTML = r"""<!doctype html>
                     <label class="chip-check"><input type="checkbox" data-sweep-overlap value="120" /> 120</label>
                   </div>
                 </div>
+                <div class="option-panel">
+                  <div class="toolbar" style="justify-content:space-between"><strong>Answer mode</strong><button type="button" data-select-sweep="answer-mode">All</button></div>
+                  <div class="chip-grid">
+                    <label class="chip-check"><input type="checkbox" data-sweep-answer-mode value="" checked /> profile default</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-answer-mode value="extractive" /> extractive</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-answer-mode value="grounded_llm" /> grounded_llm</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-answer-mode value="cite_first" /> cite_first</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-answer-mode value="claim_checklist" /> claim_checklist</label>
+                  </div>
+                </div>
+                <div class="option-panel">
+                  <div class="toolbar" style="justify-content:space-between"><strong>Context mode</strong><button type="button" data-select-sweep="context-mode">All</button></div>
+                  <div class="chip-grid">
+                    <label class="chip-check"><input type="checkbox" data-sweep-context-mode value="" checked /> profile default</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-context-mode value="ranked" /> ranked</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-context-mode value="kg_first" /> kg_first</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-context-mode value="kg_organized" /> kg_organized</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-context-mode value="group_by_doc" /> group_by_doc</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-context-mode value="dedupe_section" /> dedupe_section</label>
+                  </div>
+                </div>
+                <div class="option-panel">
+                  <div class="toolbar" style="justify-content:space-between"><strong>Feature toggles</strong><span class="meta">document QA only</span></div>
+                  <div class="chip-grid">
+                    <label class="chip-check"><input type="checkbox" data-sweep-kg-enabled value="true" /> KG on</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-kg-enabled value="false" checked /> KG off</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-judge-enable value="true" /> Judge on</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-judge-enable value="false" checked /> Judge off</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-abstain value="true" /> Abstain on</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-abstain value="false" checked /> Abstain off</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-retry value="true" /> Retry on</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-retry value="false" checked /> Retry off</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-critique value="true" /> Critique on</label>
+                    <label class="chip-check"><input type="checkbox" data-sweep-critique value="false" checked /> Critique off</label>
+                  </div>
+                </div>
               </div>
               <div class="ordered-sweep-controls hidden">
                 <div class="grid">
@@ -1606,6 +1739,13 @@ INDEX_HTML = r"""<!doctype html>
                   <label>Retriever<select id="customSweepRetriever"><option>tfidf</option><option>bm25</option><option>dense</option><option>hybrid</option></select></label>
                   <label>Chunk size<input id="customSweepSize" type="number" value="450" min="0" /></label>
                   <label>Overlap<input id="customSweepOverlap" type="number" value="60" min="0" /></label>
+                  <label>Answer mode<select id="customSweepAnswerMode"><option value="" selected>profile default</option><option>extractive</option><option>grounded_llm</option><option>cite_first</option><option>claim_checklist</option></select></label>
+                  <label>Context mode<select id="customSweepContextMode"><option value="" selected>profile default</option><option>ranked</option><option>kg_first</option><option>kg_organized</option><option>group_by_doc</option><option>dedupe_section</option></select></label>
+                  <label>KG<select id="customSweepKgEnabled"><option value="true">on</option><option value="false">off</option></select></label>
+                  <label>Judge<select id="customSweepJudgeEnable"><option value="false" selected>off</option><option value="true">on</option></select></label>
+                  <label>Abstain<select id="customSweepAbstain"><option value="false" selected>off</option><option value="true">on</option></select></label>
+                  <label>Retry<select id="customSweepRetry"><option value="false" selected>off</option><option value="true">on</option></select></label>
+                  <label>Critique<select id="customSweepCritique"><option value="false" selected>off</option><option value="true">on</option></select></label>
                 </div>
                 <div class="toolbar" style="margin-top:8px">
                   <button type="button" id="addSweepComboBtn">Add combination</button>
@@ -1619,10 +1759,14 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="grid setting-group" data-show-for="ted_cpv api_classifier" style="margin-top:10px">
-            <label><span class="label-row">TED corpus export <span class="hint" title="teddata corpus export CSV used to build CPV candidates directly from TED notices.">i</span></span><input name="cpv_catalog" value="data/teddata_corpus_export.csv" /></label>
+            <label><span class="label-row">TED corpus export <span class="hint" title="teddata corpus export CSV used to rebuild CPV profiles on the fly. Notice examples are always taken from the local SQLite database.">i</span></span><input name="cpv_catalog" value="data/teddata_corpus_export.csv" /></label>
             <label><span class="label-row">CPV queries <span class="hint" title="TED/CPV test queries JSON used for classifier evaluation.">i</span></span><input name="cpv_queries" value="data/cpv_ted_test_queries.json" /></label>
             <label><span class="label-row">Retriever <span class="hint" title="Retriever used by the local CPV classifier. API classifier ignores this.">i</span></span><select name="cpv_retriever"><option>tfidf</option><option>bm25</option><option>dense</option><option>hybrid</option></select></label>
-            <label class="check"><input type="checkbox" name="cpv_use_examples" /> Use examples <span class="hint" title="Append real TED examples to CPV labels before ranking.">i</span></label>
+          </div>
+
+          <div class="grid setting-group" data-show-for="ted_cpv" style="margin-top:10px">
+            <label class="check" style="grid-column:1/-1"><input type="checkbox" name="cpv_notice_examples_channel" /> Notice examples retrieval channel <span class="hint" title="Retrieve over cpv_notice_examples as a separate TED/CPV channel instead of relying only on cpv_profiles.">i</span></label>
+            <label class="check" style="grid-column:1/-1"><input type="checkbox" name="disable_self_exclusion" /> Disable self-exclusion for notice examples <span class="hint" title="Leave this unchecked for honest evaluation. When unchecked, the current query notice is excluded from notice-example retrieval by publication_number.">i</span></label>
           </div>
 
           <div class="grid setting-group" data-show-for="api_classifier" style="margin-top:10px">
@@ -1645,7 +1789,7 @@ INDEX_HTML = r"""<!doctype html>
 
           <div class="grid setting-group" data-show-for="ted_cpv" style="margin-top:10px">
             <label class="check" style="grid-column:1/-1"><input type="checkbox" name="cross_encoder_rerank" /> Cross-encoder rerank <span class="hint" title="Rerank the top-N CPV candidates with a cross-encoder after retrieval and KG.">i</span></label>
-            <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder top N <span class="hint" title="How many top candidates to rerank with the cross-encoder (typically 10).">i</span></span><input name="cross_encoder_top_n" type="number" min="1" value="10" /></label>
+            <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder top N <span class="hint" title="How many top candidates the cross-encoder may inspect.">i</span></span><input name="cross_encoder_top_n" type="number" min="1" value="10" /></label>
             <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder model <span class="hint" title="HuggingFace cross-encoder model. Leave empty for the default multilingual model.">i</span></span><input name="cross_encoder_model" placeholder="Alibaba-NLP/gte-multilingual-reranker-base" /></label>
             <label class="check" style="grid-column:1/-1"><input type="checkbox" name="llm_rerank" /> LLM rerank <span class="hint" title="Rerank top CPV candidates with the configured OpenAI model after retrieval and optional cross-encoder.">i</span></label>
             <label data-show-if="llm_rerank" class="inactive-field"><span class="label-row">LLM rerank top N <span class="hint" title="How many top candidates to pass to the LLM reranker. Shortlists around 5-8 are usually safer than 30.">i</span></span><input name="llm_rerank_top_n" type="number" min="1" value="8" /></label>
@@ -1653,17 +1797,17 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
-            <label data-show-if="llm_enable|llm_rerank|judge_enable|query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">LLM model <span class="hint" title="OpenAI model used for LLM answer generation, LLM reranking, judging, query augmentation, HyDE, or Self-RAG steps.">i</span></span><input name="llm_model" value="gpt-5.4" /></label>
-            <label data-show-if="llm_enable|llm_rerank|judge_enable|query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">API key env <span class="hint" title="Environment variable containing the OpenAI API key. Required for LLM, LLM reranking, HyDE, or Self-RAG steps.">i</span></span><input name="openai_api_key_env" value="OPENAI_API_KEY" /></label>
+            <label data-show-if="llm_enable|llm_rerank|judge_enable|query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">LLM model <span class="hint" title="OpenAI model used for LLM answer generation, LLM reranking, query augmentation, HyDE, or Self-RAG steps.">i</span></span><input name="llm_model" value="gpt-5.4" /></label>
+            <label data-show-if="llm_enable|llm_rerank|judge_enable|query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en|self_rag_retry_on_weak_evidence|self_rag_critique" class="inactive-field"><span class="label-row">API key env <span class="hint" title="Environment variable containing the OpenAI API key. Required for LLM, reranking, HyDE, or Self-RAG steps.">i</span></span><input name="openai_api_key_env" value="OPENAI_API_KEY" /></label>
             <label data-show-if="judge_enable" class="inactive-field"><span class="label-row">Judge model <span class="hint" title="Optional separate OpenAI model for claim-level judging.">i</span></span><input name="judge_model" placeholder="defaults to LLM model" /></label>
           </div>
           <div class="grid setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep" style="margin-top:10px">
-            <label><span class="label-row">Query augmentation <span class="hint" title="Use English translation plus procurement terms, LLM expansion, or HyDE before CPV or document search.">i</span></span><select name="query_augmentation"><option value="">profile/default none</option><option>none</option><option>translate_en</option><option>llm</option><option>hyde</option></select></label>
-            <label data-show-if="query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en" class="inactive-field"><span class="label-row">Augment terms <span class="hint" title="Maximum English terms for translate_en or LLM expansion. HyDE ignores this and generates one hypothetical passage.">i</span></span><input name="query_augmentation_max_terms" type="number" min="1" value="8" /></label>
+            <label><span class="label-row">Query augmentation <span class="hint" title="Use structured procurement query enrichment (translate_en), LLM expansion, or HyDE before CPV or document search.">i</span></span><select name="query_augmentation"><option value="">profile/default none</option><option>none</option><option>translate_en</option><option>llm</option><option>hyde</option></select></label>
+            <label data-show-if="query_augmentation:llm|query_augmentation:hyde|query_augmentation:translate_en" class="inactive-field"><span class="label-row">Augment terms <span class="hint" title="Maximum English terms for LLM expansion. translate_en and HyDE ignore this.">i</span></span><input name="query_augmentation_max_terms" type="number" min="1" value="8" /></label>
           </div>
           <div class="grid setting-group" data-show-for="document_qa examination_regulations sweep" style="margin-top:10px">
-            <label><span class="label-row">Answer mode <span class="hint" title="Optional answer synthesis override.">i</span></span><select name="answer_mode"><option value="">profile default</option><option>extractive</option><option>grounded_llm</option><option selected>cite_first</option><option>claim_checklist</option></select></label>
-            <label><span class="label-row">Context mode <span class="hint" title="Optional context assembly override. kg_organized orders context by KG evidence paths.">i</span></span><select name="context_mode"><option value="">profile default</option><option>ranked</option><option>kg_first</option><option>kg_organized</option><option>group_by_doc</option><option selected>dedupe_section</option></select></label>
+            <label><span class="label-row">Answer mode <span class="hint" title="Optional answer synthesis override.">i</span></span><select name="answer_mode"><option value="" selected>profile default</option><option>extractive</option><option>grounded_llm</option><option>cite_first</option><option>claim_checklist</option></select></label>
+            <label><span class="label-row">Context mode <span class="hint" title="Optional context assembly override. kg_organized orders context by KG evidence paths.">i</span></span><select name="context_mode"><option value="" selected>profile default</option><option>ranked</option><option>kg_first</option><option>kg_organized</option><option>group_by_doc</option><option>dedupe_section</option></select></label>
             <label><span class="label-row">Max context chunks <span class="hint" title="Optional limit on chunks passed to answer and metrics.">i</span></span><input name="max_context_chunks" type="number" min="1" placeholder="profile default" /></label>
             <label><span class="label-row">Max context chars <span class="hint" title="Optional total character budget for assembled context.">i</span></span><input name="max_context_chars" type="number" min="1" placeholder="profile default" /></label>
             <label><span class="label-row">Min confidence <span class="hint" title="Decision policy threshold for auto-accept.">i</span></span><input name="decision_min_confidence" type="number" step="0.05" min="0" max="1" placeholder="profile default" /></label>
@@ -1672,10 +1816,11 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="checks setting-group" data-show-for="document_qa examination_regulations ted_cpv sweep">
             <label class="check"><input type="checkbox" name="kg_enable" /> KG retrieval <span class="hint" title="Build and use a lightweight knowledge graph for graph-augmented retrieval.">i</span></label>
+            <label class="check"><input type="checkbox" name="export_kg_for_neo4j" /> Export KG for Neo4j <span class="hint" title="Write CPV KG nodes/edges CSV plus an import.cypher script into the run outputs.">i</span></label>
           </div>
           <div class="grid setting-group inactive-field" data-show-for="document_qa examination_regulations ted_cpv sweep" data-show-if="kg_enable" style="margin-top:10px">
             <label><span class="label-row">KG weight <span class="hint" title="Weight of graph signals when KG retrieval is enabled.">i</span></span><input type="number" step="0.05" min="0" max="1" name="kg_graph_weight" value="0.35" /></label>
-            <label><span class="label-row">KG profile <span class="hint" title="Preset for KG pool expansion. selection currently uses the balanced graph-expansion preset.">i</span></span><select name="kg_profile"><option>selection</option><option>balanced</option><option>conservative</option><option>exploratory</option><option>ppr_only</option><option>direct_only</option></select></label>
+            <label><span class="label-row">KG profile <span class="hint" title="Preset for KG pool expansion. safe_branch only expands locally when the retrieved pool already shows branch support and is the safest TED/CPV option.">i</span></span><select name="kg_profile"><option>safe_branch</option><option>selection</option><option>balanced</option><option>conservative</option><option>exploratory</option><option>ppr_only</option><option>direct_only</option></select></label>
             <label><span class="label-row">KG algorithm <span class="hint" title="Optional override for the graph traversal algorithm.">i</span></span><select name="kg_algorithm"><option value="">profile default</option><option>direct</option><option>ppr</option><option>ppr_direct</option></select></label>
             <label><span class="label-row">KG max added <span class="hint" title="Optional max graph-only chunks or candidates added by KG.">i</span></span><input name="kg_max_added_chunks" type="number" min="0" placeholder="profile default" /></label>
             <label><span class="label-row">PPR iterations <span class="hint" title="Optional Personalized PageRank-style propagation iterations for PDF KG.">i</span></span><input name="kg_ppr_iterations" type="number" min="0" placeholder="profile default" /></label>
@@ -1839,7 +1984,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!["llm", "hyde", "translate_en"].includes(queryAug)) delete payload.query_augmentation_max_terms;
       if (!queryAug || queryAug === "none") delete payload.query_augmentation;
       const llmNeeded = payload.llm_enable || payload.llm_rerank || payload.judge_enable || ["llm", "hyde", "translate_en"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique;
-      if (!(payload.llm_enable || payload.llm_rerank || ["llm", "hyde", "translate_en"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique)) {
+      if (!(payload.llm_enable || payload.llm_rerank || payload.judge_enable || ["llm", "hyde", "translate_en"].includes(queryAug) || payload.self_rag_retry_on_weak_evidence || payload.self_rag_critique)) {
         delete payload.llm_model;
         delete payload.llm_temperature;
       }
@@ -1921,17 +2066,49 @@ INDEX_HTML = r"""<!doctype html>
       const retrievers = selectedSweepValues("retriever");
       const sizes = selectedSweepValues("size").map(Number);
       const overlaps = selectedSweepValues("overlap").map(Number);
+      const answerModes = selectedSweepValues("answer-mode");
+      const contextModes = selectedSweepValues("context-mode");
+      const kgEnabledValues = selectedSweepValues("kg-enabled");
+      const judgeEnabledValues = selectedSweepValues("judge-enable");
+      const abstainValues = selectedSweepValues("abstain");
+      const retryValues = selectedSweepValues("retry");
+      const critiqueValues = selectedSweepValues("critique");
       const configs = [];
       for (const strategy of chunking) {
         for (const retriever of retrievers) {
-          if (["fixed_words", "fixed_tokens"].includes(strategy)) {
-            for (const chunkSize of (sizes.length ? sizes : [450])) {
-              for (const overlap of (overlaps.length ? overlaps : [60])) {
-                configs.push({ chunking: strategy, retriever, chunk_size: chunkSize, overlap });
+          for (const answer_mode of (answerModes.length ? answerModes : ["cite_first"])) {
+            for (const context_mode of (contextModes.length ? contextModes : ["dedupe_section"])) {
+              for (const kg_enabled of (kgEnabledValues.length ? kgEnabledValues : ["false"])) {
+                for (const judge_enable of (judgeEnabledValues.length ? judgeEnabledValues : ["false"])) {
+                  for (const abstain_on_weak_evidence of (abstainValues.length ? abstainValues : ["false"])) {
+                    for (const self_rag_retry_on_weak_evidence of (retryValues.length ? retryValues : ["false"])) {
+                      for (const self_rag_critique of (critiqueValues.length ? critiqueValues : ["false"])) {
+                        const baseConfig = {
+                          chunking: strategy,
+                          retriever,
+                          answer_mode,
+                          context_mode,
+                          kg_enabled: kg_enabled === "true",
+                          judge_enable: judge_enable === "true",
+                          abstain_on_weak_evidence: abstain_on_weak_evidence === "true",
+                          self_rag_retry_on_weak_evidence: self_rag_retry_on_weak_evidence === "true",
+                          self_rag_critique: self_rag_critique === "true",
+                        };
+                        if (["fixed_words", "fixed_tokens"].includes(strategy)) {
+                          for (const chunkSize of (sizes.length ? sizes : [450])) {
+                            for (const overlap of (overlaps.length ? overlaps : [60])) {
+                              configs.push({ ...baseConfig, chunk_size: chunkSize, overlap });
+                            }
+                          }
+                        } else {
+                          configs.push({ ...baseConfig, chunk_size: 0, overlap: 0 });
+                        }
+                      }
+                    }
+                  }
+                }
               }
             }
-          } else {
-            configs.push({ chunking: strategy, retriever, chunk_size: 0, overlap: 0 });
           }
         }
       }
@@ -1941,7 +2118,16 @@ INDEX_HTML = r"""<!doctype html>
     function comboLabel(config, index) {
       const fixed = ["fixed_words", "fixed_tokens"].includes(config.chunking);
       const size = fixed ? ` · size ${config.chunk_size} · overlap ${config.overlap}` : "";
-      return `${index + 1}. ${config.chunking}${size} · ${config.retriever}`;
+      const extras = [
+        `ans ${config.answer_mode || "profile_default"}`,
+        `ctx ${config.context_mode || "profile_default"}`,
+        `kg ${config.kg_enabled ? "on" : "off"}`,
+        `judge ${config.judge_enable ? "on" : "off"}`,
+        `abstain ${config.abstain_on_weak_evidence ? "on" : "off"}`,
+        `retry ${config.self_rag_retry_on_weak_evidence ? "on" : "off"}`,
+        `critique ${config.self_rag_critique ? "on" : "off"}`,
+      ];
+      return `${index + 1}. ${config.chunking}${size} · ${config.retriever} · ${extras.join(" · ")}`;
     }
 
     function renderCustomSweepList() {
@@ -1974,11 +2160,18 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    function renderPdfPicker(pdfs, targetId="pdfPicker", inputName="selected_docs") {
+    function renderPdfPicker(pdfs, targetId="pdfPicker", inputName="selected_docs", selectedPaths=null) {
       const picker = document.getElementById(targetId);
       if (!picker) return;
+      const selected = new Set(
+        Array.isArray(selectedPaths) && selectedPaths.length
+          ? selectedPaths
+          : (Array.isArray(state.options?.default_selected_pdfs) && state.options.default_selected_pdfs.length
+              ? state.options.default_selected_pdfs
+              : (pdfs || []))
+      );
       picker.innerHTML = (pdfs || []).map(path => `
-        <label><input type="checkbox" name="${inputName}" value="${htmlEscape(path)}" checked /> <span>${htmlEscape(path.replace(/^data\/files\//, ""))}</span></label>
+        <label><input type="checkbox" name="${inputName}" value="${htmlEscape(path)}" ${selected.has(path) ? "checked" : ""} /> <span>${htmlEscape(path.replace(/^data\/files\//, ""))}</span></label>
       `).join("") || '<div class="empty">No PDFs found in data/files/.</div>';
     }
 
@@ -2020,33 +2213,65 @@ INDEX_HTML = r"""<!doctype html>
     function collectRecommendations(summary) {
       const design = summary.design_attribution || (summary.classifier_summary && summary.classifier_summary.design_attribution) || {};
       const rootCauses = design.root_cause_recommendations || [];
-      if (rootCauses.length) {
-        return rootCauses.slice(0, 4);
-      }
       const advisor = (summary.classifier_summary && summary.classifier_summary.advisor) || {};
+      const classifierSummary = summary.classifier_summary || {};
+      const evidenceGraph = classifierSummary.evidence_graph || {};
+      const evidenceRates = evidenceGraph.rates || {};
+      const componentSignals = evidenceGraph.component_signals || {};
       const experiments = summary.experiments || [];
+      function inferRecommendationSource(item) {
+        if (item.recommendation_source) return item.recommendation_source;
+        const component = String(item.component || "");
+        const sameDivisionRate = Number(evidenceRates.same_division_error_rate || 0);
+        const hierarchySignal = Number(componentSignals.hierarchy || 0);
+        const selectionSignal = Number(componentSignals.selection || 0);
+        const querySignal = Number(componentSignals.query_enrichment || 0);
+        if (component === "query_enrichment" && querySignal > 0) return "Graph-aware";
+        if (component === "hierarchy" && (hierarchySignal > 0 || sameDivisionRate >= 0.2)) return "Graph-aware";
+        if ((component === "selection" || component === "reranking") && (selectionSignal > 0 || sameDivisionRate >= 0.2)) return "Graph-aware";
+        if (component === "retriever" && Number(componentSignals.retriever || 0) > 0) return "Graph-aware";
+        if (component === "examples" && Number(componentSignals.examples || 0) > 0) return "Graph-aware";
+        if (component === "deduplication" && Number(componentSignals.deduplication || 0) > 0) return "Graph-aware";
+        const text = [
+          item.issue || "",
+          item.recommendation || "",
+          item.evidence || "",
+          item.implementation_hint || "",
+          item.next_experiment || "",
+        ].join(" ").toLowerCase();
+        if (text.includes("evidence graph")) return "Graph-aware";
+        return "Advisor";
+      }
       let items = [];
+      if (rootCauses.length) {
+        items = items.concat(rootCauses.map(item => Object.assign({ recommendation_source: "Design attribution" }, item)));
+      }
       const bestName = summary.best_experiment && summary.best_experiment.experiment;
       if (bestName && experiments.length) {
         const bestExperiment = experiments.find(experiment => experiment.experiment === bestName);
         const bestAdvisor = (bestExperiment && bestExperiment.advisor) || {};
-        items = []
-          .concat(bestAdvisor.summary_recommendations || [])
-          .concat(bestAdvisor.top_recommendations || [])
-          .map(item => Object.assign({ experiment: bestName }, item));
+        items = items
+          .concat((bestAdvisor.summary_recommendations || []).map(item => Object.assign({ experiment: bestName }, item)))
+          .concat((bestAdvisor.top_recommendations || []).map(item => Object.assign({ experiment: bestName }, item)));
       }
       if (!items.length) {
         items = []
           .concat(advisor.summary_recommendations || [])
           .concat(advisor.top_recommendations || []);
+      } else {
+        items = items
+          .concat(advisor.summary_recommendations || [])
+          .concat(advisor.top_recommendations || []);
       }
       const seen = new Set();
       return items.filter(item => {
+        const source = inferRecommendationSource(item);
+        if (!["Graph-aware", "Design attribution"].includes(source)) return false;
         const key = `${item.priority}|${item.component}|${item.issue}|${item.recommendation}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
-      }).slice(0, 12);
+      }).map(item => Object.assign({ recommendation_source: inferRecommendationSource(item) }, item)).slice(0, 14);
     }
 
     function artifactKind(path) {
@@ -2072,6 +2297,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!recommendations.length) return '<div class="empty">No recommendations were generated for this run.</div>';
       return `<div class="recommendations">${recommendations.map(item => `
         <div class="recommendation">
+          <div class="source-badge">${htmlEscape(item.recommendation_source || "Advisor")}</div>
           <strong>${htmlEscape(item.priority || "P?")} · ${htmlEscape(item.component || "general")} · ${htmlEscape(item.issue || "Recommendation")}</strong>
           ${item.experiment ? `<div class="meta">Best config: ${htmlEscape(item.experiment)}</div>` : ""}
           ${item.n_cases ? `<div class="meta">Errors in category: ${fmt(item.n_cases)}</div>` : ""}
@@ -2503,6 +2729,13 @@ INDEX_HTML = r"""<!doctype html>
         retriever: document.getElementById("customSweepRetriever").value,
         chunk_size: fixed ? Number(document.getElementById("customSweepSize").value || 450) : 0,
         overlap: fixed ? Number(document.getElementById("customSweepOverlap").value || 60) : 0,
+        answer_mode: document.getElementById("customSweepAnswerMode").value,
+        context_mode: document.getElementById("customSweepContextMode").value,
+        kg_enabled: document.getElementById("customSweepKgEnabled").value === "true",
+        judge_enable: document.getElementById("customSweepJudgeEnable").value === "true",
+        abstain_on_weak_evidence: document.getElementById("customSweepAbstain").value === "true",
+        self_rag_retry_on_weak_evidence: document.getElementById("customSweepRetry").value === "true",
+        self_rag_critique: document.getElementById("customSweepCritique").value === "true",
       });
       updateSweepBuilder();
     });

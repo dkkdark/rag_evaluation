@@ -11,6 +11,7 @@ from typing import Dict, List, Sequence
 from rag_eval.data.ted_notice_store import (
     load_cpv_profiles,
     load_notice_examples_by_cpv,
+    load_notice_examples_by_cpv_detailed,
     open_ted_notice_db,
     upsert_cpv_profiles,
 )
@@ -65,6 +66,99 @@ _PROCUREMENT_TYPE_PATTERNS = {
     "database_information_service": ["database", "information service", "electronic journals", "digital library"],
     "goods_supply": ["supply", "delivery", "equipment", "machine", "device", "materials", "furnishing"],
     "works_construction": ["construction", "building", "road works", "engineering works", "infrastructure"],
+}
+
+_CANONICAL_PROFILE_OVERRIDES: Dict[str, Dict[str, str]] = {
+    "72000000": {
+        "description_en": (
+            "IT services: consulting, software development, internet and support services. "
+            "Use for broad information-technology service contracts when the tender is about software development, "
+            "application services, cloud, hosting, digital systems, network services, support, maintenance, or managed IT operations."
+        ),
+        "keywords_en": (
+            "it services software development application services cloud hosting digital systems "
+            "network services support maintenance managed services"
+        ),
+        "use_when_text": (
+            "Use when the main contract is for broad IT or software-related services, such as application development, "
+            "system evolution, cloud or hosting services, network services, IT support, or managed digital operations."
+        ),
+        "do_not_use_when_text": (
+            "Do not use when the procurement is mainly for buying hardware, communications equipment, packaged office software, "
+            "or a more specific child IT service code clearly matches the service being bought."
+        ),
+        "common_tender_phrases": (
+            "software development services | application maintenance and support | cloud and hosting services | "
+            "digital platform services | network and infrastructure services | managed IT services"
+        ),
+    },
+    "50000000": {
+        "description_en": (
+            "Repair and maintenance services. Use for broad service contracts whose main scope is repair, upkeep, servicing, "
+            "preventive or corrective maintenance of equipment, systems, or infrastructure."
+        ),
+        "keywords_en": (
+            "repair maintenance servicing upkeep preventive maintenance corrective maintenance maintenance contract "
+            "service contract technical support"
+        ),
+        "use_when_text": (
+            "Use when the main contract is a repair or maintenance service, especially when the tender is framed around servicing, "
+            "upkeep, operational support, or maintenance of existing assets rather than buying new goods."
+        ),
+        "do_not_use_when_text": (
+            "Do not use when the buyer mainly procures new equipment, installation works, or a more specific child maintenance-service code "
+            "clearly describes the maintained asset type."
+        ),
+        "common_tender_phrases": (
+            "repair and maintenance services | maintenance contract | servicing of existing equipment | technical maintenance support | "
+            "preventive and corrective maintenance"
+        ),
+    },
+    "51500000": {
+        "description_en": (
+            "Installation services of machinery and equipment. Use for service contracts where the main scope is installing, commissioning, "
+            "assembling, fitting, integrating, or putting equipment into operation."
+        ),
+        "keywords_en": (
+            "installation services commissioning assembly fitting integration equipment installation machine installation "
+            "put into operation"
+        ),
+        "use_when_text": (
+            "Use when the main contract is an installation or commissioning service for machinery, equipment, technical systems, or devices, "
+            "including integration into an operational environment."
+        ),
+        "do_not_use_when_text": (
+            "Do not use when the main scope is the purchase of equipment only, ongoing maintenance after installation, construction works, "
+            "or a more specific child installation-service code clearly matches the equipment type."
+        ),
+        "common_tender_phrases": (
+            "installation and commissioning services | equipment installation | machine assembly and fitting | "
+            "system installation services | putting equipment into operation"
+        ),
+    },
+    "79000000": {
+        "description_en": (
+            "Business services: law, marketing, consulting, recruitment, printing and security. "
+            "Use for broad business-support service contracts, especially consultancy, communication, marketing, recruitment, "
+            "administrative support, and similar professional services."
+        ),
+        "keywords_en": (
+            "business services consultancy consulting communication marketing recruitment administrative support "
+            "professional services printing legal services"
+        ),
+        "use_when_text": (
+            "Use when the main contract is for broad business or professional support services, such as consultancy, project communication, "
+            "marketing, recruitment, administrative support, or related business-service activities."
+        ),
+        "do_not_use_when_text": (
+            "Do not use when the tender is mainly for IT development, construction works, equipment supply, or when a more specific child code "
+            "for advertising, market research, recruitment, legal, printing, or security services clearly fits."
+        ),
+        "common_tender_phrases": (
+            "business support services | consultancy services | project communication services | marketing services | "
+            "professional advisory services | administrative support services"
+        ),
+    },
 }
 
 
@@ -251,9 +345,9 @@ def load_queries(path: str) -> List[MaterialQuery]:
 DEFAULT_TED_NOTICE_DB_PATH = ".rag_eval_indices/ted_notices.sqlite"
 
 
-def _catalog_fingerprint(records: Sequence[CPVRecord], *, use_examples: bool) -> str:
+def _catalog_fingerprint(records: Sequence[CPVRecord]) -> str:
     digest = hashlib.sha1()
-    digest.update(f"use_examples={int(bool(use_examples))}".encode("utf-8"))
+    digest.update(b"use_examples=always_on")
     for record in records:
         digest.update(record.code.encode("utf-8"))
         digest.update(b"\x1f")
@@ -265,8 +359,7 @@ def _catalog_fingerprint(records: Sequence[CPVRecord], *, use_examples: bool) ->
         digest.update(b"\x1f")
         digest.update(" || ".join(record.multilingual_labels).encode("utf-8"))
         digest.update(b"\x1f")
-        if use_examples:
-            digest.update(" || ".join(record.examples).encode("utf-8"))
+        digest.update(" || ".join(record.examples).encode("utf-8"))
         digest.update(b"\x1e")
     return digest.hexdigest()
 
@@ -274,9 +367,8 @@ def _catalog_fingerprint(records: Sequence[CPVRecord], *, use_examples: bool) ->
 def _build_cpv_profiles(
     records: Sequence[CPVRecord],
     *,
-    use_examples: bool,
     ted_notice_db_path: str | None = DEFAULT_TED_NOTICE_DB_PATH,
-    ted_notice_examples_limit: int = 8,
+    ted_notice_examples_limit: int = 12,
 ) -> List[Dict[str, object]]:
     label_by_code = {record.code: record.label for record in records}
     children_by_parent: Dict[str, List[CPVRecord]] = {}
@@ -293,27 +385,23 @@ def _build_cpv_profiles(
         parent_label = label_by_code.get(record.parent_code, "")
         children = children_by_parent.get(record.code, [])
         siblings = [child for child in children_by_parent.get(record.parent_code, []) if child.code != record.code]
-        notice_examples = (
-            ted_examples_by_cpv.get(record.code, [])
-            if use_examples
-            else []
-        )
+        notice_examples = ted_examples_by_cpv.get(record.code, [])
         merged_examples = _unique_texts(
             list(record.examples) + notice_examples,
             limit=ted_notice_examples_limit,
-        ) if use_examples else []
+        )
         keywords_en = _extract_keywords_en(
             record.label,
             record.description,
             " ".join(record.multilingual_labels[:8]),
-            " ".join(merged_examples[:3]),
-            " ".join(child.label for child in children[:3]),
+            " ".join(merged_examples[:5]),
+            " ".join(child.label for child in children[:4]),
         )
         multilingual_aliases = _multilingual_aliases(record.label, record.description, keywords_en)
         procurement_type = _infer_procurement_type(record.label, record.description, keywords_en, parent_label)
         use_when = _use_when_text(record, parent_label=parent_label, procurement_type=procurement_type, keywords_en=keywords_en)
         do_not_use_when = _do_not_use_when_text(record, procurement_type=procurement_type)
-        common_phrases = _unique_texts(merged_examples[:5], limit=5)
+        common_phrases = _unique_texts(merged_examples[:8], limit=8)
         children_labels = [child.label for child in children[:8]]
         children_codes = [child.code for child in children[:8]]
         sibling_labels = [sibling.label for sibling in siblings[:8]]
@@ -329,8 +417,8 @@ def _build_cpv_profiles(
             do_not_use_when,
             f"Common tender phrases: {' | '.join(common_phrases)}" if common_phrases else "",
             f"Related terms: {keywords_en}" if keywords_en else "",
-            f"Sibling distinctions: {' | '.join(sibling_labels[:5])}" if sibling_labels else "",
-            f"Children: {' | '.join(children_labels[:5])}" if children_labels else "",
+            f"Sibling distinctions: {' | '.join(sibling_labels[:8])}" if sibling_labels else "",
+            f"Children: {' | '.join(children_labels[:8])}" if children_labels else "",
         ]
         search_text_en = "\n".join(
             part for part in [
@@ -344,8 +432,8 @@ def _build_cpv_profiles(
                 use_when,
                 do_not_use_when,
                 " ".join(common_phrases),
-                " ".join(children_labels[:5]),
-                " ".join(sibling_labels[:5]),
+                " ".join(children_labels[:8]),
+                " ".join(sibling_labels[:8]),
             ] if str(part).strip()
         )
         search_text_multilingual = "\n".join(
@@ -353,14 +441,64 @@ def _build_cpv_profiles(
                 search_text_en,
                 " | ".join(record.multilingual_labels),
                 multilingual_aliases,
-                " | ".join(notice_examples[:4]) if use_examples else "",
+                " | ".join(notice_examples[:8]),
             ] if str(part).strip()
         )
+        override = _CANONICAL_PROFILE_OVERRIDES.get(record.code)
+        if override:
+            description_en = str(override.get("description_en") or record.description)
+            keywords_en = str(override.get("keywords_en") or keywords_en)
+            use_when = str(override.get("use_when_text") or use_when)
+            do_not_use_when = str(override.get("do_not_use_when_text") or do_not_use_when)
+            common_phrases = _unique_texts(
+                str(override.get("common_tender_phrases") or "").split(" | "),
+                limit=8,
+            ) or common_phrases
+            text_parts = [
+                f"Code: {record.code}",
+                f"Label: {record.label}",
+                f"Description: {description_en}" if description_en else "",
+                f"Multilingual labels: {' | '.join(record.multilingual_labels[:8])}" if record.multilingual_labels else "",
+                f"Parent: {parent_label}" if parent_label else "",
+                f"Procurement type: {procurement_type}",
+                use_when,
+                do_not_use_when,
+                f"Common tender phrases: {' | '.join(common_phrases)}" if common_phrases else "",
+                f"Related terms: {keywords_en}" if keywords_en else "",
+                f"Sibling distinctions: {' | '.join(sibling_labels[:8])}" if sibling_labels else "",
+                f"Children: {' | '.join(children_labels[:8])}" if children_labels else "",
+            ]
+            search_text_en = "\n".join(
+                part for part in [
+                    record.code,
+                    record.label,
+                    description_en,
+                    " | ".join(record.multilingual_labels),
+                    parent_label,
+                    procurement_type,
+                    keywords_en,
+                    use_when,
+                    do_not_use_when,
+                    " ".join(common_phrases),
+                    " ".join(children_labels[:8]),
+                    " ".join(sibling_labels[:8]),
+                ] if str(part).strip()
+            )
+            search_text_multilingual = "\n".join(
+                part for part in [
+                    search_text_en,
+                    " | ".join(record.multilingual_labels),
+                    multilingual_aliases,
+                    " | ".join(notice_examples[:8]),
+                ] if str(part).strip()
+            )
+        else:
+            description_en = record.description
         profiles.append(
             {
                 "code": record.code,
                 "label": record.label,
-                "description_en": record.description,
+                "description_en": description_en,
                 "parent_code": record.parent_code,
                 "parent_label": parent_label,
                 "procurement_type": procurement_type,
@@ -374,7 +512,7 @@ def _build_cpv_profiles(
                 "sibling_codes": sibling_codes,
                 "sibling_labels": sibling_labels,
                 "examples": merged_examples,
-                "notice_examples": notice_examples[:ted_notice_examples_limit] if use_examples else [],
+                "notice_examples": notice_examples[:ted_notice_examples_limit],
                 "text": "\n".join(part for part in text_parts if part.strip()),
                 "search_text_en": search_text_en,
                 "search_text_multilingual": search_text_multilingual,
@@ -386,20 +524,22 @@ def _build_cpv_profiles(
 def sync_cpv_profiles_to_db(
     records: Sequence[CPVRecord],
     *,
-    use_examples: bool,
     ted_notice_db_path: str = DEFAULT_TED_NOTICE_DB_PATH,
-    ted_notice_examples_limit: int = 8,
+    ted_notice_examples_limit: int = 12,
 ) -> Dict[str, object]:
     profiles = _build_cpv_profiles(
         records,
-        use_examples=use_examples,
         ted_notice_db_path=ted_notice_db_path,
         ted_notice_examples_limit=ted_notice_examples_limit,
     )
-    fingerprint = _catalog_fingerprint(records, use_examples=use_examples)
+    fingerprint = _catalog_fingerprint(records)
     conn = open_ted_notice_db(ted_notice_db_path)
     try:
-        result = upsert_cpv_profiles(conn, profiles, source_fingerprint=fingerprint)
+        result = upsert_cpv_profiles(
+            conn,
+            profiles,
+            source_fingerprint=fingerprint,
+        )
     finally:
         conn.close()
     return {"source_fingerprint": fingerprint, **result}
@@ -425,7 +565,7 @@ def load_cpv_catalog_from_db(path: str) -> List[CPVRecord]:
 def load_cpv_catalog_from_ted_corpus_export(
     path: str,
     *,
-    max_examples_per_cpv: int = 8,
+    max_examples_per_cpv: int = 12,
 ) -> List[CPVRecord]:
     rows = build_cpv_catalog_rows_from_corpus_export(
         path,
@@ -476,17 +616,94 @@ def build_cpv_chunks_from_db(path: str) -> List[Dict]:
     return chunks
 
 
+def build_cpv_notice_example_chunks_from_db(
+    path: str,
+    *,
+    max_examples_per_cpv: int = 12,
+) -> List[Dict]:
+    profiles = load_cpv_profiles(path)
+    notice_examples_by_cpv = load_notice_examples_by_cpv_detailed(path, max_examples_per_cpv=max_examples_per_cpv)
+    chunks: List[Dict] = []
+    for profile_index, profile in enumerate(profiles):
+        cpv_code = str(profile.get("code") or "").strip()
+        if not cpv_code:
+            continue
+        example_rows = notice_examples_by_cpv.get(cpv_code, [])
+        examples = [str(item.get("example_text") or "").strip() for item in example_rows if str(item.get("example_text") or "").strip()]
+        publication_numbers = [str(item.get("publication_number") or "").strip() for item in example_rows]
+        if not examples:
+            continue
+        for example_index, example_text in enumerate(examples):
+            chunks.append(
+                {
+                    "chunk_id": f"{cpv_code}::notice_example::{example_index + 1}",
+                    "chunk_index": len(chunks),
+                    "doc_id": cpv_code,
+                    "doc_path": "cpv_notice_examples_db",
+                    "publication_number": publication_numbers[example_index] if example_index < len(publication_numbers) else "",
+                    "program_id": "cpv",
+                    "program_name": "CPV",
+                    "section_id": cpv_code,
+                    "title": str(profile.get("label") or ""),
+                    "text": example_text,
+                    "chunking_strategy": "cpv_notice_example_db",
+                    "source_type": "cpv_notice_examples_db",
+                    "cpv_code": cpv_code,
+                    "cpv_label": str(profile.get("label") or ""),
+                    "cpv_parent_code": str(profile.get("parent_code") or ""),
+                    "cpv_parent_label": str(profile.get("parent_label") or ""),
+                    "description_en": str(profile.get("description_en") or ""),
+                    "description_multilingual_aliases": str(profile.get("generated_synonyms_en") or ""),
+                    "generated_synonyms_en": str(profile.get("generated_synonyms_en") or ""),
+                    "generated_keywords_en": str(profile.get("keywords_en") or ""),
+                    "keywords_en": str(profile.get("keywords_en") or ""),
+                    "procurement_type": str(profile.get("procurement_type") or ""),
+                    "use_when_text": str(profile.get("use_when_text") or ""),
+                    "do_not_use_when_text": str(profile.get("do_not_use_when_text") or ""),
+                    "common_tender_phrases": str(profile.get("common_tender_phrases") or ""),
+                    "children_labels": " | ".join(str(item) for item in profile.get("children_labels", []) if str(item).strip()),
+                    "sibling_labels": " | ".join(str(item) for item in profile.get("sibling_labels", []) if str(item).strip()),
+                    "examples_text": example_text,
+                    "notice_examples_count": len(examples),
+                    "notice_example_publication_numbers": publication_numbers,
+                    "search_text_en": "\n".join(
+                        part
+                        for part in [
+                            cpv_code,
+                            str(profile.get("label") or ""),
+                            example_text,
+                            str(profile.get("keywords_en") or ""),
+                            str(profile.get("use_when_text") or ""),
+                            str(profile.get("do_not_use_when_text") or ""),
+                        ]
+                        if str(part).strip()
+                    ),
+                    "search_text_multilingual": "\n".join(
+                        part
+                        for part in [
+                            cpv_code,
+                            str(profile.get("label") or ""),
+                            str(profile.get("search_text_multilingual") or ""),
+                            example_text,
+                        ]
+                        if str(part).strip()
+                    ),
+                    "profile_chunk_index": profile_index,
+                    "notice_example_index": example_index,
+                }
+            )
+    return chunks
+
+
 def build_cpv_chunks(
     records: Sequence[CPVRecord],
     *,
-    use_examples: bool,
     ted_notice_db_path: str | None = DEFAULT_TED_NOTICE_DB_PATH,
-    ted_notice_examples_limit: int = 8,
+    ted_notice_examples_limit: int = 12,
 ) -> List[Dict]:
     if ted_notice_db_path:
         sync_cpv_profiles_to_db(
             records,
-            use_examples=use_examples,
             ted_notice_db_path=ted_notice_db_path,
             ted_notice_examples_limit=ted_notice_examples_limit,
         )
@@ -495,7 +712,6 @@ def build_cpv_chunks(
             return db_chunks
     profiles = _build_cpv_profiles(
         records,
-        use_examples=use_examples,
         ted_notice_db_path=ted_notice_db_path,
         ted_notice_examples_limit=ted_notice_examples_limit,
     )

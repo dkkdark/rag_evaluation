@@ -58,11 +58,12 @@ def make_fixed_chunks(
 # Keep each structural section as one chunk when section boundaries matter most.
 def chunk_by_section(sections: Sequence[Section]) -> List[Dict]:
     chunks: List[Dict] = []
-    for section in sections:
+    for section_position, section in enumerate(sections):
         words = tokenize_words(section.text)
+        source_id = f"{section.doc_id}|s{section_position}|{section.section_id}"
         chunks.append(
             {
-                "chunk_id": f"{section.doc_id}|{section.section_id}|section",
+                "chunk_id": f"{source_id}|section",
                 "doc_id": section.doc_id,
                 "doc_path": section.doc_path,
                 "program_id": section.program_id,
@@ -74,7 +75,7 @@ def chunk_by_section(sections: Sequence[Section]) -> List[Dict]:
                 "chunk_index": 0,
                 "chunking_strategy": "by_section",
                 "source_type": "section",
-                "source_id": f"{section.doc_id}|{section.section_id}",
+                "source_id": source_id,
                 "start_word": 0,
                 "end_word": len(words),
             }
@@ -120,7 +121,7 @@ def build_chunks(
     if strategy == "fixed_words":
         source_rows = [
             {
-                "source_id": f"{section.doc_id}|{section.section_id}",
+                "source_id": f"{section.doc_id}|s{section_position}|{section.section_id}",
                 "doc_id": section.doc_id,
                 "doc_path": section.doc_path,
                 "program_id": section.program_id,
@@ -130,7 +131,7 @@ def build_chunks(
                 "text": section.text,
                 "source_type": "section",
             }
-            for section in sections
+            for section_position, section in enumerate(sections)
         ]
         return make_fixed_chunks(source_rows, chunk_size, chunk_overlap, strategy)
 

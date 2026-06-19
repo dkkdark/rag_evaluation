@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ CPV_SELECTION_WEIGHTS = {
 }
 CPV_REFINEMENT_BASE_WINDOW = 15
 CPV_REFINEMENT_SEED_WINDOW = 5
+SAFE_BRANCH_PREFIX_LEVELS = (6, 4)
 
 
 @dataclass
@@ -139,8 +142,165 @@ def cpv_path_text(node: CPVGraphNode) -> str:
     return "\n".join(part for part in parts if part.strip())
 
 
+def export_cpv_kg_for_neo4j(
+    graph: CPVKnowledgeGraph,
+    *,
+    out_dir: str,
+) -> Dict[str, object]:
+    os.makedirs(out_dir, exist_ok=True)
+    nodes_csv = os.path.join(out_dir, "cpv_kg_nodes.csv")
+    edges_csv = os.path.join(out_dir, "cpv_kg_edges.csv")
+    cypher_path = os.path.join(out_dir, "import_neo4j.cypher")
+    readme_path = os.path.join(out_dir, "README.md")
+
+    with open(nodes_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "code:ID(CPV)",
+                "label",
+                "description",
+                "parent_code",
+                "code_level:int",
+                "path_codes",
+                "path_labels",
+                "examples",
+                ":LABEL",
+            ],
+        )
+        writer.writeheader()
+        for code in sorted(graph.nodes.keys()):
+            node = graph.nodes[code]
+            writer.writerow(
+                {
+                    "code:ID(CPV)": node.code,
+                    "label": node.label,
+                    "description": node.description,
+                    "parent_code": node.parent_code,
+                    "code_level:int": code_level(node.code),
+                    "path_codes": " | ".join(node.path_codes),
+                    "path_labels": " | ".join(node.path_labels),
+                    "examples": " | ".join(node.examples[:12]),
+                    ":LABEL": "CPVCode",
+                }
+            )
+
+    edge_rows: List[Dict[str, str]] = []
+    for child, parent in sorted(graph.parent_lookup.items()):
+        if not child or not parent:
+            continue
+        edge_rows.append(
+            {
+                ":START_ID(CPV)": child,
+                ":END_ID(CPV)": parent,
+                ":TYPE": "CHILD_OF",
+                "relation": "child_of",
+            }
+        )
+        edge_rows.append(
+            {
+                ":START_ID(CPV)": parent,
+                ":END_ID(CPV)": child,
+                ":TYPE": "PARENT_OF",
+                "relation": "parent_of",
+            }
+        )
+    for code, siblings in sorted(graph.sibling_lookup.items()):
+        for sibling in siblings:
+            if code < sibling:
+                edge_rows.append(
+                    {
+                        ":START_ID(CPV)": code,
+                        ":END_ID(CPV)": sibling,
+                        ":TYPE": "SIBLING_OF",
+                        "relation": "sibling_of",
+                    }
+                )
+
+    with open(edges_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                ":START_ID(CPV)",
+                ":END_ID(CPV)",
+                ":TYPE",
+                "relation",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(edge_rows)
+
+    cypher = """// Copy cpv_kg_nodes.csv and cpv_kg_edges.csv into Neo4j's import directory.
+// Then run this script in Neo4j Browser.
+
+CREATE CONSTRAINT cpv_code_unique IF NOT EXISTS
+FOR (n:CPVCode)
+REQUIRE n.code IS UNIQUE;
+
+LOAD CSV WITH HEADERS FROM 'file:///cpv_kg_nodes.csv' AS row
+MERGE (n:CPVCode {code: row['code:ID(CPV)']})
+SET n.label = row.label,
+    n.description = row.description,
+    n.parent_code = row.parent_code,
+    n.code_level = toInteger(row['code_level:int']),
+    n.path_codes = split(COALESCE(row.path_codes, ''), ' | '),
+    n.path_labels = split(COALESCE(row.path_labels, ''), ' | '),
+    n.examples = split(COALESCE(row.examples, ''), ' | ');
+
+LOAD CSV WITH HEADERS FROM 'file:///cpv_kg_edges.csv' AS row
+MATCH (a:CPVCode {code: row[':START_ID(CPV)']})
+MATCH (b:CPVCode {code: row[':END_ID(CPV)']})
+CALL apoc.merge.relationship(a, row[':TYPE'], {}, {relation: row.relation}, b) YIELD rel
+RETURN count(rel);
+"""
+    with open(cypher_path, "w", encoding="utf-8") as f:
+        f.write(cypher)
+
+    readme = """# CPV KG for Neo4j
+
+Files:
+- `cpv_kg_nodes.csv`: CPV nodes with labels, descriptions, hierarchy path, and examples
+- `cpv_kg_edges.csv`: `CHILD_OF`, `PARENT_OF`, and `SIBLING_OF` relationships
+- `import_neo4j.cypher`: Neo4j Browser script for loading the graph
+
+Usage:
+1. Copy both CSV files into Neo4j's `import/` directory.
+2. Open Neo4j Browser.
+3. Run the commands from `import_neo4j.cypher`.
+
+Note:
+- The Cypher script uses `apoc.merge.relationship(...)`, so APOC should be available.
+- If APOC is unavailable, the CSV can still be imported with separate `LOAD CSV` statements per relation type.
+"""
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(readme)
+
+    return {
+        "enabled": True,
+        "out_dir": out_dir,
+        "nodes_csv": nodes_csv,
+        "edges_csv": edges_csv,
+        "import_cypher": cypher_path,
+        "readme_md": readme_path,
+        "n_nodes": len(graph.nodes),
+        "n_edges": len(edge_rows),
+    }
+
+
 def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
     profiles = {
+        "safe_branch": {
+            "algorithm": "hierarchy",
+            "max_siblings": 6,
+            "max_children": 8,
+            "max_seed_codes": 6,
+            "max_graph_candidates": 18,
+            "proximity_weight": 0.82,
+            "strict_branching": True,
+            "min_seed_norm": 0.12,
+            "min_branch_support": 2,
+            "allowed_relations": ["sibling", "child", "ancestor"],
+        },
         "conservative": {
             "algorithm": "hierarchy",
             "max_siblings": 4,
@@ -148,6 +308,7 @@ def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
             "max_seed_codes": 8,
             "max_graph_candidates": 35,
             "proximity_weight": 0.78,
+            "strict_branching": False,
         },
         "balanced": {
             "algorithm": "hierarchy",
@@ -156,6 +317,7 @@ def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
             "max_seed_codes": 12,
             "max_graph_candidates": 60,
             "proximity_weight": 0.70,
+            "strict_branching": False,
         },
         "exploratory": {
             "algorithm": "ppr",
@@ -164,6 +326,7 @@ def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
             "max_seed_codes": 18,
             "max_graph_candidates": 120,
             "proximity_weight": 0.62,
+            "strict_branching": False,
         },
         "ppr_only": {
             "algorithm": "ppr",
@@ -172,6 +335,7 @@ def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
             "max_seed_codes": 12,
             "max_graph_candidates": 80,
             "proximity_weight": 0.68,
+            "strict_branching": False,
         },
         "direct_only": {
             "algorithm": "hierarchy",
@@ -180,6 +344,7 @@ def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
             "max_seed_codes": 12,
             "max_graph_candidates": 60,
             "proximity_weight": 0.70,
+            "strict_branching": False,
         },
         "selection": {
             "algorithm": "ppr",
@@ -188,9 +353,46 @@ def cpv_kg_profile_settings(profile: str) -> Dict[str, object]:
             "max_seed_codes": 20,
             "max_graph_candidates": 160,
             "proximity_weight": 0.62,
+            "strict_branching": False,
         },
     }
     return dict(profiles.get(profile, profiles["balanced"]))
+
+
+def _supported_branch_prefixes(
+    *,
+    seed_codes: Sequence[str],
+    base_norm: Dict[str, float],
+    min_seed_norm: float,
+    min_branch_support: int,
+) -> Dict[int, set[str]]:
+    strong_codes = [
+        normalize_cpv_code(code)
+        for code in seed_codes
+        if normalize_cpv_code(code) and float(base_norm.get(code, 0.0)) >= min_seed_norm
+    ]
+    supported: Dict[int, set[str]] = {prefix_len: set() for prefix_len in SAFE_BRANCH_PREFIX_LEVELS}
+    for prefix_len in SAFE_BRANCH_PREFIX_LEVELS:
+        groups: Dict[str, List[str]] = defaultdict(list)
+        for code in strong_codes:
+            groups[code[:prefix_len]].append(code)
+        for prefix, members in groups.items():
+            if len(members) >= min_branch_support:
+                supported[prefix_len].add(prefix)
+    return supported
+
+
+def _belongs_to_supported_branch(
+    code: str,
+    supported_prefixes: Dict[int, set[str]],
+) -> bool:
+    normalized = normalize_cpv_code(code)
+    if not normalized:
+        return False
+    for prefix_len, prefixes in supported_prefixes.items():
+        if normalized[:prefix_len] in prefixes:
+            return True
+    return False
 
 
 def graph_neighbor_codes(
@@ -282,6 +484,13 @@ def _expand_cpv_candidate_pool(
     max_siblings = int(settings["max_siblings"])
     max_children = int(settings["max_children"])
     proximity_weight = float(settings["proximity_weight"])
+    strict_branching = bool(settings.get("strict_branching", False))
+    min_seed_norm = float(settings.get("min_seed_norm", 0.0))
+    min_branch_support = int(settings.get("min_branch_support", 2))
+    allowed_relations = {
+        str(item)
+        for item in settings.get("allowed_relations", ["ancestor", "sibling", "child"])
+    }
 
     base_codes = [
         str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
@@ -298,6 +507,13 @@ def _expand_cpv_candidate_pool(
     base_scores = [float(row.get("score") or 0.0) for row in base_rows]
     base_norm = dict(zip(base_codes, min_max_normalize(base_scores)))
     seed_codes = list(dict.fromkeys(base_codes[:resolved_max_seed_codes]))
+    supported_prefixes = _supported_branch_prefixes(
+        seed_codes=seed_codes,
+        base_norm=base_norm,
+        min_seed_norm=min_seed_norm,
+        min_branch_support=min_branch_support,
+    ) if strict_branching else {}
+    has_supported_branch = any(supported_prefixes.values()) if strict_branching else False
 
     candidate_reasons: Dict[str, str] = {code: "base" for code in base_codes}
     candidate_paths: Dict[str, str] = {}
@@ -305,6 +521,10 @@ def _expand_cpv_candidate_pool(
     for rank, seed_code in enumerate(seed_codes):
         seed_strength = max(base_norm.get(seed_code, 0.0), 1.0 / (rank + 1))
         proximity_scores[seed_code] = max(proximity_scores.get(seed_code, 0.0), seed_strength)
+        if strict_branching and not has_supported_branch:
+            continue
+        if strict_branching and seed_strength < min_seed_norm and not _belongs_to_supported_branch(seed_code, supported_prefixes):
+            continue
         for neighbor_code, relation_type in graph_neighbor_codes(
             seed_code,
             graph,
@@ -313,6 +533,14 @@ def _expand_cpv_candidate_pool(
         ).items():
             if neighbor_code not in chunks_by_code:
                 continue
+            if relation_type not in allowed_relations:
+                continue
+            if strict_branching and has_supported_branch:
+                if not (
+                    _belongs_to_supported_branch(seed_code, supported_prefixes)
+                    or _belongs_to_supported_branch(neighbor_code, supported_prefixes)
+                ):
+                    continue
             decay = {
                 "ancestor": 0.64,
                 "sibling": 0.52,
@@ -334,7 +562,7 @@ def _expand_cpv_candidate_pool(
             )
             if len(candidate_reasons) >= len(base_codes) + resolved_max_graph_candidates:
                 break
-    if resolved_algorithm == "ppr":
+    if resolved_algorithm == "ppr" and not strict_branching:
         frontier = {code: proximity_scores.get(code, 0.0) for code in seed_codes}
         for depth in range(3):
             next_frontier: Dict[str, float] = {}
@@ -391,6 +619,11 @@ def _expand_cpv_candidate_pool(
             "max_siblings": max_siblings,
             "max_children": max_children,
             "proximity_weight": proximity_weight,
+            "strict_branching": strict_branching,
+            "min_seed_norm": min_seed_norm,
+            "min_branch_support": min_branch_support,
+            "allowed_relations": sorted(allowed_relations),
+            "supported_prefixes": {str(k): sorted(v) for k, v in supported_prefixes.items() if v},
         },
     }
     return candidate_codes, base_norm, graph_norm, proximity_scores, candidate_reasons, candidate_paths, meta
@@ -964,6 +1197,16 @@ def cpv_kg_metrics(
         for match in [best_cpv_hierarchy_match(code, [gold])]
         if match is not None and float(match["score"]) > 0.0
     ]
+    branch_competition_codes = [
+        code
+        for code in final_top
+        for match in [best_cpv_hierarchy_match(code, [gold])]
+        if match is not None and float(match["score"]) >= 0.25
+    ]
+    sibling_disambiguation_success = bool(
+        top1_exact
+        and len(branch_competition_codes) >= 2
+    )
     return {
         "kg_enabled": True,
         "kg_candidate_pool_size": len(pool),
@@ -975,7 +1218,7 @@ def cpv_kg_metrics(
         "kg_strict_gold_delta": 1.0 if (not base_hit and final_hit) else 0.0,
         "branch_recall_at_k": bool(best_final_match >= 0.25),
         "class_recall_at_k": bool(best_final_match >= 0.75),
-        "sibling_disambiguation_success": bool(base_top1_close_wrong and top1_exact),
+        "sibling_disambiguation_success": sibling_disambiguation_success,
         "oracle_rerank_ceiling": bool(pool_hit),
         "path_explanation_coverage": 1.0 if (final_top and paths.get(final_top[0])) else 0.0,
         "kg_path_coverage_at_k": len(path_values) / len(final_top) if final_top else 0.0,

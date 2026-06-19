@@ -1166,12 +1166,14 @@ def _group_design_causes(
     insights: Sequence[Dict[str, object]],
 ) -> List[str]:
     causes: List[str] = []
+    primary_reason = _top_reason(row.get("primary_error_reason") for row in rows) or _safe_str(rows[0].get("primary_error_reason") if rows else "")
     mean_mrr = _safe_float(metrics.get("mean_mrr_at_k"))
     mean_recall = _safe_float(metrics.get("mean_recall_at_k"))
     mean_ndcg = _safe_float(metrics.get("mean_ndcg_at_k"))
     mean_context = _safe_float(metrics.get("mean_context_claim_recall"))
     mean_grounded = _safe_float(metrics.get("mean_grounded_claim_ratio"))
     mean_hallucinated = _safe_float(metrics.get("mean_hallucinated_claim_ratio"))
+    mean_attribution_f1 = _safe_float(metrics.get("mean_evidence_attribution_f1"))
     low_recall_rate = _safe_float(metrics.get("low_recall_rate"))
     low_mrr_rate = _safe_float(metrics.get("low_mrr_rate"))
     low_context_rate = _safe_float(metrics.get("low_context_claim_recall_rate"))
@@ -1191,10 +1193,20 @@ def _group_design_causes(
     kg_enabled_share = _truthy_share(rows, "kg_enabled")
     retry_enabled_share = _truthy_share(rows, "self_rag_retry_on_weak_evidence")
     critique_enabled_share = _truthy_share(rows, "self_rag_critique")
+    high_confidence_failure_share = (
+        sum(1 for row in rows if (_safe_float(row.get("prediction_confidence")) or 0.0) >= 0.8) / len(rows)
+        if rows else 0.0
+    )
+    mean_prediction_confidence = _mean_present(row.get("prediction_confidence") for row in rows)
     retrieval_looks_sufficient = (
         mean_context is not None and mean_context >= 0.85
         and mean_grounded is not None and mean_grounded >= 0.85
         and mean_hallucinated is not None and mean_hallucinated <= 0.1
+    )
+    suppress_retrieval_mismatch = (
+        primary_reason == "generation_hallucination"
+        and mean_context is not None and mean_context >= 0.8
+        and mean_mrr is not None and mean_mrr >= 0.7
     )
     retriever_insight = _insight_entry(insights, "retriever")
     better_retriever = _safe_str(retriever_insight.get("better_value"))
@@ -1211,8 +1223,19 @@ def _group_design_causes(
     better_kg_profile = _insight_value(insights, "kg_profile")
     better_kg_enabled = _insight_value(insights, "kg_enabled")
     better_kg_algorithm = _insight_value(insights, "kg_algorithm")
+    if primary_reason == "false_refusal":
+        if mean_context is not None and mean_context >= 0.6:
+            causes.append("The system is refusing or abstaining despite partially sufficient evidence, so the decision layer is likely too conservative for this case group.")
+        if mean_recall is not None and mean_recall < 0.35:
+            causes.append("Some refusals still coincide with incomplete evidence coverage, so retrieval depth and refusal thresholds should be tuned together rather than in isolation.")
+    if primary_reason == "answer_incomplete_from_good_context" and retrieval_looks_sufficient:
+        causes.append("The evidence is already present and mostly grounded, but the final answer is missing required conditions, numbers, or qualifiers; this is a completeness problem in answer synthesis.")
+    if primary_reason == "generation_hallucination" and suppress_retrieval_mismatch:
+        causes.append("Relevant evidence is being retrieved, but the final answer still introduces unsupported content; the main issue is grounding and output control rather than candidate generation.")
+        if mean_attribution_f1 is not None and mean_attribution_f1 < 0.3:
+            causes.append("Attribution to evidence is weak on this group, which suggests the model is not tightly binding claims to retrieved passages even when the right passage is available.")
     if component == "answer_generation" and retrieval_looks_sufficient:
-        if dominant_answer_mode in {"", "extractive", "extractive_answer"} or answer_generation_enabled_share == 0.0:
+        if dominant_answer_mode in {"", "extractive", "extractive_answer"}:
             causes.append("Retrieved evidence already looks sufficient, and answer generation is effectively disabled by design for this group; incomplete final answers are more likely caused by extractive output limits than by retrieval.")
         elif better_answer_mode:
             causes.append(f"Retrieved evidence already looks sufficient, and matched comparisons favor answer_mode={better_answer_mode}; this points to answer-side prompting/synthesis rather than retrieval.")
@@ -1222,18 +1245,18 @@ def _group_design_causes(
             causes.append("Retrieved evidence already looks sufficient, and answer generation appears expected, but the answer-side model/config is missing or not surfaced correctly; verify the LLM setup for this experiment.")
         else:
             causes.append("Retrieved evidence already looks sufficient, so the remaining bottleneck is more likely answer synthesis or prompt completeness than retrieval coverage.")
-    if better_retriever and better_retriever != dominant_retriever and not (component == "answer_generation" and retrieval_looks_sufficient):
+    if better_retriever and better_retriever != dominant_retriever and not (component == "answer_generation" and retrieval_looks_sufficient) and not suppress_retrieval_mismatch:
         current = f" over the current retriever={dominant_retriever}" if dominant_retriever and dominant_retriever != better_retriever else ""
         causes.append(f"Retriever type is a {retriever_confidence}-confidence mismatch hypothesis for this case group: matched comparisons favor retriever={better_retriever}{current}.")
     elif dominant_retriever in {"bm25", "tfidf"} and low_recall_rate is not None and low_recall_rate > 0.6 and question_type in {"multi_hop", "relation", "summary", "global"} and not (component == "answer_generation" and retrieval_looks_sufficient):
         causes.append(f"The current retriever={dominant_retriever} is purely lexical, while this group has widespread low recall on {question_type} questions; hybrid or dense retrieval is a plausible missing capability.")
     elif dominant_retriever == "dense" and component in {"taxonomy_disambiguation", "candidate_generation"} and low_recall_rate is not None and low_recall_rate > 0.5 and not (component == "answer_generation" and retrieval_looks_sufficient):
         causes.append("The current dense retriever may miss exact domain wording or labels; compare BM25/TF-IDF or hybrid retrieval before blaming the generator.")
-    if better_chunking and better_chunking != dominant_chunking and not (component == "answer_generation" and retrieval_looks_sufficient):
+    if better_chunking and better_chunking != dominant_chunking and not (component == "answer_generation" and retrieval_looks_sufficient) and not suppress_retrieval_mismatch:
         causes.append(f"Chunking/segmentation is implicated: chunking_strategy={better_chunking} improves related cases, so current chunks may split or dilute required evidence.")
     elif dominant_chunking in {"fixed_words", "fixed_tokens"} and component in {"candidate_generation", "context_selection"} and low_recall_rate is not None and low_recall_rate > 0.5 and not (component == "answer_generation" and retrieval_looks_sufficient):
         causes.append(f"Chunking is a plausible bottleneck: the current chunking_strategy={dominant_chunking} can separate headings from evidence, which often hurts retrieval coverage compared with document-aware chunking.")
-    if better_top_k and better_top_k != dominant_top_k and not (component == "answer_generation" and retrieval_looks_sufficient):
+    if better_top_k and better_top_k != dominant_top_k and not (component == "answer_generation" and retrieval_looks_sufficient) and not suppress_retrieval_mismatch:
         causes.append(f"Retrieval depth is likely too shallow: matched comparisons favor top_k={better_top_k} over the current top_k={dominant_top_k or 'unknown'}.")
     elif dominant_top_k and dominant_top_k.isdigit() and int(dominant_top_k) <= 5 and low_recall_rate is not None and low_recall_rate > 0.5 and not (component == "answer_generation" and retrieval_looks_sufficient):
         causes.append(f"The current top_k={dominant_top_k} is probably too small for this failure group; low recall persists before the answer stage even starts.")
@@ -1298,7 +1321,8 @@ def _group_design_causes(
     if component == "answer_generation" and (mean_recall is not None and mean_recall < 0.5) and (mean_context is None or mean_context < 0.8):
         causes.append("Although this group was labelled answer generation, retrieval/context coverage is still weak; do not claim prompt/model failure until retrieval is controlled.")
     if component == "calibration":
-        causes.append("Confidence is not trustworthy on this group; the system needs calibration or review thresholds, not just accuracy tuning.")
+        if high_confidence_failure_share >= 0.5 or (mean_prediction_confidence is not None and mean_prediction_confidence >= 0.75):
+            causes.append("Confidence is not trustworthy on this group; the system needs calibration or review thresholds, not just accuracy tuning.")
         if mean_ndcg is not None and mean_ndcg < 0.5:
             causes.append("Calibration is not the whole story here: ranking quality is also weak, so confidence should not hide a retrieval/selection problem.")
     if low_context_rate is not None and low_context_rate > 0.5 and component == "context_selection":
@@ -1731,8 +1755,23 @@ def _root_cause_items(
             for part in _safe_str(row.get("likely_design_causes")).split("|")
             if part.strip()
         ]
+        primary_reason = _safe_str(row.get("primary_error_reason"))
         recommendation = _safe_str(row.get("advisor_recommendation"))
-        if likely_causes:
+        if primary_reason == "false_refusal" and likely_causes:
+            recommendation = (
+                f"{likely_causes[0]} Focus first on refusal thresholds, abstention policy, or weak-evidence handling, "
+                "then compare BM25 and higher top-k on the same cases."
+            )
+        elif primary_reason == "answer_incomplete_from_good_context" and likely_causes:
+            recommendation = (
+                f"{likely_causes[0]} Keep retrieval fixed and test answer-side prompts, checklist-style generation, "
+                "or stricter completeness instructions."
+            )
+        elif primary_reason == "generation_hallucination" and likely_causes:
+            recommendation = (
+                f"{likely_causes[0]} Tighten grounding, citation requirements, or critique before changing retrieval."
+            )
+        elif likely_causes:
             recommendation = f"{likely_causes[0]} {recommendation}".strip()
         items.append(
             {

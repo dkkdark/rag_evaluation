@@ -43,7 +43,9 @@ def context_text_from_rows(retrieved: Sequence[Dict], *, style: str = "standard"
     return "\n\n".join(part for part in parts if part.strip())
 
 
-LLM_QUERY_AUGMENTATION_MODES = frozenset({"llm", "hyde", "translate_en"})
+LLM_QUERY_AUGMENTATION_MODES = frozenset({"llm", "hyde"})
+STRUCTURED_QUERY_AUGMENTATION_MODES = frozenset({"translate_en"})
+QUERY_AUGMENTATION_MODES = LLM_QUERY_AUGMENTATION_MODES | STRUCTURED_QUERY_AUGMENTATION_MODES
 
 
 def augment_query_with_llm(
@@ -60,6 +62,13 @@ def augment_query_with_llm(
         return LLMCallResult(answer=question, used=False, status="llm_disabled", error=None)
     if client is None:
         return LLMCallResult(answer=question, used=False, status="missing_api_key", error=None)
+    if mode == "translate_en":
+        return LLMCallResult(
+            answer=question,
+            used=False,
+            status="use_structured_enrichment",
+            error="translate_en is handled by structured query enrichment, not augment_query_with_llm.",
+        )
     if mode == "hyde":
         system_prompt = (
             "Generate a short hypothetical source passage for dense retrieval. "
@@ -72,23 +81,6 @@ def augment_query_with_llm(
         )
         success_status = "success"
         append_original = False
-    elif mode == "translate_en":
-        system_prompt = (
-            "Prepare multilingual public-procurement queries for retrieval against an English CPV catalog. "
-            "Focus on the main procured object first. Keep secondary context short. "
-            "Do not add broad keyword expansions, unsupported facts, or tangential domains."
-        )
-        user_prompt = (
-            f"Original query:\n{question}\n\n"
-            "Return one short English retrieval query that preserves:\n"
-            "1) the main procured object as the first phrase\n"
-            "2) the procurement action or contract type only if central\n"
-            "3) at most 2 short support terms when they are essential\n\n"
-            "Exclude optional, secondary, administrative, or side-context details unless they are the main object.\n"
-            "Return only the English retrieval query, without repeating the original query."
-        )
-        success_status = "translate_en"
-        append_original = True
     else:
         system_prompt = (
             "Expand the user's retrieval query for a RAG system. "
@@ -277,6 +269,137 @@ def rerank_candidates_with_llm(
         reranked_head.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
         combined = reranked_head + tail
         return combined[:top_k], LLMCallResult(answer=raw, used=True, status="success", error=None)
+    except Exception as exc:
+        return list(rows[:top_k]), LLMCallResult(answer=None, used=True, status="error", error=str(exc))
+
+
+def judge_cpv_candidates_with_llm(
+    *,
+    question: str,
+    rows: Sequence[Dict],
+    llm_config: LLMConfig,
+    top_k: int,
+    judge_top_n: int = 3,
+    judge_weight: float = 0.55,
+) -> tuple[List[Dict], LLMCallResult]:
+    client = get_openai_client(llm_config)
+    if not llm_config.enabled:
+        return list(rows[:top_k]), LLMCallResult(answer=None, used=False, status="llm_disabled", error=None)
+    if client is None:
+        return list(rows[:top_k]), LLMCallResult(answer=None, used=False, status="missing_api_key", error=None)
+    if top_k <= 0 or not rows:
+        return [], LLMCallResult(answer=None, used=False, status="no_candidates", error=None)
+
+    limited_top_n = min(len(rows), max(2, judge_top_n))
+    head = [dict(row) for row in rows[:limited_top_n]]
+    tail = [dict(row) for row in rows[limited_top_n:]]
+
+    candidate_lines = []
+    for index, row in enumerate(head, start=1):
+        candidate_lines.append(
+            (
+                f"{index}. code={row.get('cpv_code', '')}\n"
+                f"label={row.get('cpv_label', row.get('title', ''))}\n"
+                f"description={row.get('description_en', '')}\n"
+                f"procurement_type={row.get('procurement_type', '')}\n"
+                f"parent_label={row.get('cpv_parent_label', '')}\n"
+                f"children_labels={row.get('children_labels', '')}\n"
+                f"sibling_labels={row.get('sibling_labels', '')}\n"
+                f"use_when={row.get('use_when_text', '')}\n"
+                f"do_not_use_when={row.get('do_not_use_when_text', '')}\n"
+                f"common_tender_phrases={row.get('common_tender_phrases', '')}\n"
+                f"current_score={row.get('score', 0.0)}"
+            )
+        )
+    candidates_text = "\n\n".join(candidate_lines)
+
+    try:
+        response = client.responses.create(
+            model=llm_config.model,
+            temperature=0.0,
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a final CPV selection judge for public-procurement classification. "
+                        "Choose the single best CPV code from the provided shortlist only. "
+                        "Prefer the most specific valid code that still matches the query. "
+                        "Avoid broader parent-like codes when a more precise child candidate clearly fits. "
+                        "Pay attention to goods vs services vs installation vs maintenance distinctions. "
+                        "Compare the shortlist contrastively: explain why the selected code is better than the closest alternative in the same branch. "
+                        "Return JSON only with keys selected_code, ranking, and rationale. "
+                        "selected_code must be one of the provided codes. "
+                        "ranking should order only the provided codes from best to worst."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Procurement query:\n{question}\n\n"
+                        f"Candidate shortlist:\n{candidates_text}\n\n"
+                        "Return JSON only."
+                    ),
+                },
+            ],
+        )
+        raw = (getattr(response, "output_text", "") or "").strip()
+        if not raw:
+            return list(rows[:top_k]), LLMCallResult(answer=None, used=True, status="empty_response", error=None)
+        payload = extract_json_object(raw)
+        selected_code = str(payload.get("selected_code") or "").strip()
+        ranking_raw = payload.get("ranking")
+        ranking_list = ranking_raw if isinstance(ranking_raw, list) else []
+        requested_codes = [str(code).strip() for code in ranking_list if str(code).strip()]
+
+        by_code = {str(row.get("cpv_code", "")).strip(): dict(row) for row in head}
+        if not selected_code or selected_code not in by_code:
+            return list(rows[:top_k]), LLMCallResult(answer=raw, used=True, status="invalid_selected_code", error=raw[:500])
+
+        ordered_codes = []
+        seen = set()
+        if selected_code:
+            ordered_codes.append(selected_code)
+            seen.add(selected_code)
+        for code in requested_codes:
+            if code in by_code and code not in seen:
+                ordered_codes.append(code)
+                seen.add(code)
+        for row in head:
+            code = str(row.get("cpv_code", "")).strip()
+            if code and code not in seen:
+                ordered_codes.append(code)
+                seen.add(code)
+
+        base_scores = [float(row.get("score") or 0.0) for row in head]
+        low = min(base_scores) if base_scores else 0.0
+        high = max(base_scores) if base_scores else 0.0
+
+        def normalize_base_score(value: float) -> float:
+            if abs(high - low) < 1e-12:
+                return 1.0 if high > 0 else 0.0
+            return (value - low) / (high - low)
+
+        reranked_head: List[Dict] = []
+        for rank_index, code in enumerate(ordered_codes, start=1):
+            row = by_code[code]
+            base_score = float(row.get("score") or 0.0)
+            base_norm = normalize_base_score(base_score)
+            judge_rank_score = float(limited_top_n - rank_index) / float(max(limited_top_n - 1, 1))
+            final_score = (1.0 - judge_weight) * base_norm + judge_weight * judge_rank_score
+            row["base_score_before_llm_judge"] = base_score
+            row["base_score_before_llm_judge_normalized"] = base_norm
+            row["llm_judge_selected"] = 1 if code == selected_code else 0
+            row["llm_judge_rank"] = rank_index
+            row["llm_judge_score"] = judge_rank_score
+            row["score"] = final_score
+            row["reranked"] = True
+            row["reranker"] = "llm_judge"
+            reranked_head.append(row)
+
+        reranked_head.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        combined = reranked_head + tail
+        rationale = str(payload.get("rationale") or "").strip()
+        return combined[:top_k], LLMCallResult(answer=raw, used=True, status="success", error=rationale or None)
     except Exception as exc:
         return list(rows[:top_k]), LLMCallResult(answer=None, used=True, status="error", error=str(exc))
 

@@ -2,8 +2,144 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from typing import Dict, Iterable, List, Sequence
+
+
+_EXAMPLE_SOURCE_WEIGHTS = {
+    "title_plus_description_lead": 1.0,
+    "title_proc_clean": 0.97,
+    "description_proc_lead": 0.94,
+    "description_lot_lead": 0.9,
+    "title_proc": 0.88,
+    "notice_title": 0.82,
+    "description_proc": 0.72,
+    "description_lot": 0.68,
+}
+
+_EXAMPLE_GENERIC_PATTERNS = [
+    "framework agreement",
+    "contract notice",
+    "procurement of",
+    "supply and delivery of",
+    "invitation to tender",
+    "call for tenders",
+    "open procedure",
+    "negotiated procedure",
+]
+
+
+def _clean_example_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").replace("\n", " ")).strip()
+
+
+def _normalize_example_key(text: str) -> str:
+    cleaned = _clean_example_text(text).casefold()
+    cleaned = re.sub(r"\b[a-z]{1,4}\d{2,}[/_-]?\d+\b", " ", cleaned)
+    cleaned = re.sub(r"\b\d{4,}\b", " ", cleaned)
+    cleaned = re.sub(r"[^\w\s]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _strip_notice_prefix(text: str) -> str:
+    cleaned = _clean_example_text(text)
+    cleaned = re.sub(r"^[A-Z]{1,6}\d{0,4}(?:[/_-]\d{2,6})+(?:\s*[-:]\s*|\s+)", "", cleaned)
+    cleaned = re.sub(r"^\d{4,}(?:[/_-]\d{2,6})?(?:\s*[-:]\s*|\s+)", "", cleaned)
+    return cleaned.strip(" -:")
+
+
+def _sentences(text: str) -> List[str]:
+    cleaned = _clean_example_text(text)
+    if not cleaned:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _trim_example_length(text: str, *, max_chars: int = 320) -> str:
+    cleaned = _clean_example_text(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    trimmed = cleaned[:max_chars]
+    last_space = trimmed.rfind(" ")
+    if last_space >= 120:
+        trimmed = trimmed[:last_space]
+    return trimmed.rstrip(" ,;:-") + "..."
+
+
+def _collapse_repeated_lead(text: str) -> str:
+    cleaned = _clean_example_text(text)
+    match = re.match(r"^(.{8,160}?)(?:[.!?])\s+\1(?:[.!?])(\s+.*)?$", cleaned, flags=re.IGNORECASE)
+    if match:
+        tail = match.group(2) or ""
+        cleaned = f"{match.group(1)}.{tail}".strip()
+    return _clean_example_text(cleaned)
+
+
+def _looks_low_signal_example(text: str) -> bool:
+    cleaned = _clean_example_text(text)
+    if len(cleaned) < 10:
+        return True
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", cleaned)
+    return len(words) < 2
+
+
+def _build_notice_example_variants(record: Dict[str, object], field: str, text: str) -> List[tuple[str, str]]:
+    cleaned = _clean_example_text(text)
+    if not cleaned or _looks_low_signal_example(cleaned):
+        return []
+    variants: List[tuple[str, str]] = []
+    if field in {"notice_title", "title_proc"}:
+        stripped = _strip_notice_prefix(cleaned)
+        variants.append((field, _collapse_repeated_lead(_trim_example_length(cleaned, max_chars=220))))
+        if stripped and stripped != cleaned and not _looks_low_signal_example(stripped):
+            variants.append(("title_proc_clean", _collapse_repeated_lead(_trim_example_length(stripped, max_chars=220))))
+        lead_description = _clean_example_text(str(record.get("description_proc") or ""))
+        lead_sentences = _sentences(lead_description)
+        if lead_sentences:
+            title_base = _strip_notice_prefix(cleaned) or cleaned
+            lead = lead_sentences[0]
+            if _normalize_example_key(lead).startswith(_normalize_example_key(title_base)):
+                combined = lead
+            else:
+                combined = f"{title_base}. {lead}"
+            variants.append(("title_plus_description_lead", _collapse_repeated_lead(_trim_example_length(combined, max_chars=260))))
+    elif field in {"description_proc", "description_lot"}:
+        lead_sentences = _sentences(cleaned)[:2]
+        if lead_sentences:
+            lead = " ".join(lead_sentences)
+            source_name = "description_proc_lead" if field == "description_proc" else "description_lot_lead"
+            variants.append((source_name, _collapse_repeated_lead(_trim_example_length(lead, max_chars=260))))
+        variants.append((field, _collapse_repeated_lead(_trim_example_length(cleaned, max_chars=320))))
+    else:
+        variants.append((field, _trim_example_length(cleaned, max_chars=220)))
+    deduped: List[tuple[str, str]] = []
+    seen = set()
+    for source_field, variant_text in variants:
+        key = _normalize_example_key(variant_text)
+        if not key or key in seen or _looks_low_signal_example(variant_text):
+            continue
+        seen.add(key)
+        deduped.append((source_field, variant_text))
+    return deduped
+
+
+def _score_example_row(source_field: str, text: str) -> float:
+    cleaned = _clean_example_text(text)
+    source_weight = _EXAMPLE_SOURCE_WEIGHTS.get(source_field, 0.7)
+    token_count = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", cleaned))
+    token_bonus = min(token_count, 18) * 0.015
+    ideal_length_penalty = abs(min(len(cleaned), 220) - 140) / 700.0
+    generic_penalty = 0.0
+    lowered = cleaned.casefold()
+    for pattern in _EXAMPLE_GENERIC_PATTERNS:
+        if pattern in lowered:
+            generic_penalty += 0.035
+    if re.match(r"^[A-Z0-9/_ -]{8,}$", cleaned):
+        generic_penalty += 0.08
+    return source_weight + token_bonus - ideal_length_penalty - generic_penalty
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -58,6 +194,9 @@ def ensure_ted_notice_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_cpv_notice_examples_language
           ON cpv_notice_examples(language);
 
+        DROP TABLE IF EXISTS cpv_profiles_base;
+        DROP TABLE IF EXISTS cpv_profiles_examples;
+
         CREATE TABLE IF NOT EXISTS cpv_profiles (
           code TEXT PRIMARY KEY,
           label TEXT NOT NULL,
@@ -98,21 +237,33 @@ def _notice_examples_from_record(record: Dict[str, object]) -> List[Dict[str, st
     if not languages:
         languages = ["und"]
     examples: List[Dict[str, str]] = []
+    seen_rows = set()
     for field in ["notice_title", "title_proc", "description_proc", "description_lot"]:
-        text = str(record.get(field) or "").strip()
-        if len(text) < 10:
+        text = str(record.get(field) or "")
+        variants = _build_notice_example_variants(record, field, text)
+        if not variants:
             continue
         for cpv_code in cpv_codes:
             for language in languages:
-                examples.append(
-                    {
-                        "publication_number": publication_number,
-                        "cpv_code": cpv_code,
-                        "language": language,
-                        "source_field": field,
-                        "example_text": text,
-                    }
-                )
+                for source_field, example_text in variants:
+                    row_key = (
+                        publication_number,
+                        cpv_code,
+                        language,
+                        _normalize_example_key(example_text),
+                    )
+                    if row_key in seen_rows:
+                        continue
+                    seen_rows.add(row_key)
+                    examples.append(
+                        {
+                            "publication_number": publication_number,
+                            "cpv_code": cpv_code,
+                            "language": language,
+                            "source_field": source_field,
+                            "example_text": example_text,
+                        }
+                    )
     return examples
 
 
@@ -160,6 +311,10 @@ def upsert_ted_notices(conn: sqlite3.Connection, records: Sequence[Dict[str, obj
             ),
         )
         inserted += 1
+        conn.execute(
+            "DELETE FROM cpv_notice_examples WHERE publication_number = ?",
+            (publication_number,),
+        )
         for example in _notice_examples_from_record(record):
             conn.execute(
                 """
@@ -199,30 +354,75 @@ def top_languages(conn: sqlite3.Connection, *, limit: int = 25) -> List[Dict[str
     return [{"language": str(row["language"]), "count": int(row["n"])} for row in rows]
 
 
-def load_notice_examples_by_cpv(path: str, *, max_examples_per_cpv: int = 8) -> Dict[str, List[str]]:
+def load_notice_examples_by_cpv(path: str, *, max_examples_per_cpv: int = 12) -> Dict[str, List[str]]:
+    detailed = load_notice_examples_by_cpv_detailed(path, max_examples_per_cpv=max_examples_per_cpv)
+    return {
+        cpv_code: [str(item.get("example_text") or "").strip() for item in items if str(item.get("example_text") or "").strip()]
+        for cpv_code, items in detailed.items()
+    }
+
+
+def load_notice_examples_by_cpv_detailed(
+    path: str,
+    *,
+    max_examples_per_cpv: int = 12,
+) -> Dict[str, List[Dict[str, str]]]:
     if not os.path.exists(path):
         return {}
     conn = open_ted_notice_db(path)
     try:
         rows = conn.execute(
             """
-            SELECT cpv_code, example_text
+            SELECT cpv_code, publication_number, source_field, example_text
             FROM cpv_notice_examples
-            ORDER BY cpv_code ASC, publication_number ASC
+            ORDER BY cpv_code ASC, publication_number ASC, source_field ASC
             """
         ).fetchall()
     finally:
         conn.close()
-    examples_by_cpv: Dict[str, List[str]] = {}
+    examples_by_cpv: Dict[str, List[Dict[str, str]]] = {}
+    seen_keys_by_cpv: Dict[str, set[str]] = {}
+    rows_by_cpv: Dict[str, List[sqlite3.Row]] = {}
     for row in rows:
         cpv_code = str(row["cpv_code"]).strip()
-        text = str(row["example_text"]).strip()
-        if not cpv_code or not text:
+        text = _clean_example_text(str(row["example_text"] or ""))
+        if not cpv_code or not text or _looks_low_signal_example(text):
             continue
+        rows_by_cpv.setdefault(cpv_code, []).append(row)
+    for cpv_code, cpv_rows in rows_by_cpv.items():
+        ranked_rows = sorted(
+            cpv_rows,
+            key=lambda row: (
+                -_score_example_row(str(row["source_field"] or ""), str(row["example_text"] or "")),
+                len(_clean_example_text(str(row["example_text"] or ""))),
+                str(row["publication_number"] or ""),
+            ),
+        )
         bucket = examples_by_cpv.setdefault(cpv_code, [])
-        if text in bucket or len(bucket) >= max_examples_per_cpv:
+        seen_keys = seen_keys_by_cpv.setdefault(cpv_code, set())
+        per_publication_counts: Dict[str, int] = {}
+        for row in ranked_rows:
+            if len(bucket) >= max_examples_per_cpv:
+                break
+            text = _clean_example_text(str(row["example_text"] or ""))
+            normalized_key = _normalize_example_key(text)
+            if not normalized_key or normalized_key in seen_keys:
+                continue
+            publication_number = str(row["publication_number"] or "").strip()
+            if publication_number and per_publication_counts.get(publication_number, 0) >= 3:
+                continue
+            if publication_number:
+                per_publication_counts[publication_number] = per_publication_counts.get(publication_number, 0) + 1
+            seen_keys.add(normalized_key)
+            bucket.append(
+                {
+                    "publication_number": publication_number,
+                    "source_field": str(row["source_field"] or ""),
+                    "example_text": text,
+                }
+            )
+        if not bucket:
             continue
-        bucket.append(text)
     return examples_by_cpv
 
 

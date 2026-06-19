@@ -17,6 +17,7 @@ from rag_eval.evaluation.advisor import apply_question_recommendations, build_ru
 from rag_eval.classifiers.cpv_baseline import (
     build_cpv_chunks,
     build_cpv_chunks_from_db,
+    build_cpv_notice_example_chunks_from_db,
     build_parent_lookup,
     load_cpv_catalog_from_ted_corpus_export,
     load_cpv_catalog_from_db,
@@ -24,9 +25,13 @@ from rag_eval.classifiers.cpv_baseline import (
     sync_cpv_profiles_to_db,
 )
 from rag_eval.classifiers.cpv_kg import (
+    ancestor_codes,
     build_cpv_knowledge_graph,
+    code_level,
     cpv_kg_metrics,
+    export_cpv_kg_for_neo4j,
     graph_expand_and_rerank_cpv,
+    normalize_cpv_code,
 )
 from rag_eval.evaluation.adapters import build_items_from_cpv_queries
 from rag_eval.evaluation.core import (
@@ -50,11 +55,20 @@ from rag_eval.evaluation.metrics import (
     summarize_retrieval_metrics,
     summarize_confidence_calibration,
 )
-from rag_eval.evaluation.llm import LLM_QUERY_AUGMENTATION_MODES, augment_query_with_llm
-from rag_eval.evaluation.llm import rerank_candidates_with_llm
+from rag_eval.evaluation.evidence_graph import build_cpv_evidence_graph_summary
+from rag_eval.evaluation.llm import LLM_QUERY_AUGMENTATION_MODES, QUERY_AUGMENTATION_MODES, augment_query_with_llm
+from rag_eval.evaluation.llm import judge_cpv_candidates_with_llm
+from rag_eval.retrieval.query_enrichment import (
+    enrich_procurement_query,
+    extract_procurement_object,
+    procurement_type_bias,
+)
+from rag_eval.data.ted_data import load_ted_corpus_export_notices, normalize_ted_notice_record
+from rag_eval.data.ted_notice_store import open_ted_notice_db, upsert_ted_notices
 from rag_eval.retrieval.engines import (
     build_cpv_multi_retriever,
     lexical_overlap_score,
+    min_max_normalize,
     retrieve_top_k_cpv_multi,
     rerank_with_lexical_signal,
 )
@@ -111,7 +125,6 @@ DUPLICATE_METRIC_COLUMNS = [
     "n_retrieved_target_doc_chunks",
     "partial_correct",
 ]
-
 
 def _apply_showcase_bundle(summary: Dict[str, object], showcase_bundle: Dict[str, object]) -> None:
     summary["showcase"] = showcase_bundle
@@ -182,44 +195,10 @@ def _normalize_prediction_score(candidate: Dict[str, object], *, fallback: float
     return fallback
 
 
-_QUERY_NOISE_PATTERNS = [
-    r"\b(?:procedure|procedura|procedimiento|proc[ée]dure|verhandlungsverfahren|concurso|march[eé]|contrato|framework agreement|dynamic purchasing system|dps)\b",
-    r"\b(?:lot(?:s)?|n[. ]?[0-9]+/[0-9]+|nr[. ]?[0-9]+|no[. ]?[0-9]+|ref[. ]?[A-Z0-9/-]+)\b",
-    r"\b(?:relance|avviso di consultazione di mercato|consultation de march[eé]|public procurement|service procurement)\b",
-]
-
 _QUERY_SPLIT_RE = re.compile(r"\s*(?:[-:;|]|[\u2013\u2014])\s*")
 _QUERY_SPACE_RE = re.compile(r"\s+")
-_QUERY_NUMERIC_RE = re.compile(r"\b[0-9][0-9./%-]*\b")
 _QUERY_NONWORD_RE = re.compile(r"[^\w\s/&+]", flags=re.UNICODE)
-_QUERY_SECONDARY_SPLIT_RE = re.compile(
-    r"\b(?:with|including|plus|along with|associated with|optional|mit|avec|con|incl\.?|including|samt|und optional|et services associ[ée]s|servizi associati)\b",
-    flags=re.IGNORECASE,
-)
-_PROCUREMENT_ACTION_PATTERNS = [
-    "supply and installation",
-    "delivery and installation",
-    "operation and maintenance",
-    "repair and maintenance",
-    "maintenance service",
-    "installation",
-    "delivery",
-    "supply",
-    "operation",
-    "maintenance",
-    "repair",
-    "consultancy",
-    "service",
-    "lieferung",
-    "montage",
-    "wartung",
-    "suministro",
-    "instalacion",
-    "mantenimiento",
-    "fourniture",
-    "maintenance",
-    "entretien",
-]
+
 
 _CONTRACT_TYPE_PATTERNS = {
     "maintenance_repair": [
@@ -256,91 +235,37 @@ def _normalize_free_text(value: str) -> str:
     return _QUERY_SPACE_RE.sub(" ", _QUERY_NONWORD_RE.sub(" ", str(value or "").casefold())).strip()
 
 
+STRUCTURED_QUERY_AUGMENTATION_MODES = frozenset({"translate_en"})
+
+
 def _extract_procurement_object(query_text: str) -> Dict[str, object]:
-    original = str(query_text or "").strip()
-    lowered = original.casefold()
-    cleaned = lowered
-    removed_patterns: List[str] = []
-    for pattern in _QUERY_NOISE_PATTERNS:
-        updated = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
-        if updated != cleaned:
-            removed_patterns.append(pattern)
-        cleaned = updated
-    cleaned = _QUERY_NUMERIC_RE.sub(" ", cleaned)
-    full_query = _normalize_free_text(cleaned)
-    raw_segments = [segment.strip() for segment in _QUERY_SPLIT_RE.split(cleaned) if segment.strip()]
-    left_primary = raw_segments[0] if raw_segments else cleaned
-    secondary_parts = [segment for segment in raw_segments[1:] if segment]
+    return extract_procurement_object(query_text)
 
-    split_match = _QUERY_SECONDARY_SPLIT_RE.search(left_primary)
-    if split_match:
-        left_part = left_primary[: split_match.start()].strip()
-        right_part = left_primary[split_match.end() :].strip()
-        left_primary = left_part or left_primary
-        if right_part:
-            secondary_parts.insert(0, right_part)
 
-    action_terms = [term for term in _PROCUREMENT_ACTION_PATTERNS if term in full_query]
-    action_terms = sorted(set(action_terms), key=lambda term: (-len(term), term))
-    action_pattern = re.compile(
-        r"\b(?:"
-        + "|".join(re.escape(term) for term in action_terms[:8] if term)
-        + r"|and|und|et|y|e|de|des|del|di|of|for|a|an|the|eine?r?)\b",
-        flags=re.IGNORECASE,
-    ) if action_terms else None
-    left_primary_core = left_primary
-    if action_pattern is not None:
-        left_primary_core = _QUERY_SPACE_RE.sub(" ", action_pattern.sub(" ", left_primary)).strip()
-
-    object_candidates: List[str] = []
-    for connector in [" of ", " for ", " de ", " des ", " del ", " di ", " για ", " για την ", " για το "]:
-        if connector in left_primary:
-            object_candidates.append(left_primary.split(connector, 1)[1].strip())
-    if left_primary_core and left_primary_core != left_primary:
-        object_candidates.insert(0, left_primary_core)
-    object_candidates.append(left_primary)
-    object_candidates.extend(raw_segments)
-
-    contract_like_tokens = {
-        "maintenance", "repair", "service", "services", "installation", "operation", "delivery", "supply",
-        "lieferung", "montage", "wartung", "suministro", "instalacion", "mantenimiento", "fourniture", "entretien",
-    }
-    scored_candidates = []
-    for candidate in object_candidates:
-        normalized = _normalize_free_text(candidate)
-        if not normalized:
-            continue
-        tokens = [token for token in normalized.split() if len(token) > 2]
-        if not tokens:
-            continue
-        contract_hits = sum(1 for token in tokens if token in contract_like_tokens)
-        object_hits = sum(1 for token in tokens if token not in (contract_like_tokens | {"optional", "associated"}))
-        scored_candidates.append((normalized, object_hits - contract_hits, contract_hits, len(tokens)))
-    scored_candidates.sort(key=lambda item: (-item[1], item[2], item[3], len(item[0])))
-    preferred_object_query = _normalize_free_text(left_primary_core) if left_primary_core and left_primary_core != left_primary else ""
-    object_query = preferred_object_query or (scored_candidates[0][0] if scored_candidates else full_query)
-    full_query = _normalize_free_text(cleaned)
-    if len(object_query.split()) < 2 and len(object_query) < 10:
-        object_query = _normalize_free_text(original)
-    if len(full_query.split()) < 3:
-        full_query = _normalize_free_text(original)
-    procurement_action = _normalize_free_text(" ".join(action_terms[:3]))
-    secondary_context = _normalize_free_text(" ".join(secondary_parts[:4]))
-    exclude_as_primary = [
-        token
-        for token in _normalize_free_text(" ".join(secondary_parts + action_terms)).split()
-        if token in {"maintenance", "repair", "service", "services", "operation", "optional", "associated"}
-    ]
-    return {
-        "original_query": original,
-        "cleaned_query": full_query,
-        "object_query": object_query,
-        "main_object": object_query,
-        "procurement_action": procurement_action,
-        "secondary_context": secondary_context,
-        "exclude_as_primary": exclude_as_primary,
-        "removed_noise_patterns": removed_patterns,
-    }
+def _apply_procurement_type_rerank(
+    rows: List[Dict[str, object]],
+    *,
+    primary_selection_bias: str,
+    service_component: bool,
+) -> List[Dict[str, object]]:
+    if not rows or not primary_selection_bias:
+        return rows
+    reranked: List[Dict[str, object]] = []
+    for row in rows:
+        updated = dict(row)
+        bonus = procurement_type_bias(
+            primary_selection_bias=primary_selection_bias,
+            service_component=service_component,
+            candidate_procurement_type=str(updated.get("procurement_type") or ""),
+        )
+        updated["procurement_type_bias"] = bonus
+        updated["score_before_procurement_type"] = float(updated.get("score") or 0.0)
+        updated["score"] = float(updated["score_before_procurement_type"]) + bonus
+        if abs(bonus) > 1e-12:
+            updated["reranker"] = "procurement_type"
+        reranked.append(updated)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return reranked
 
 
 def _infer_contract_types(text: str) -> List[str]:
@@ -405,6 +330,123 @@ def _apply_contract_type_rerank(rows: List[Dict[str, object]], query_text: str) 
         if abs(bonus) > 1e-12:
             updated["reranker"] = "contract_type"
         reranked.append(updated)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return reranked
+
+
+def _apply_kg_decision_fusion(
+    rows: List[Dict[str, object]],
+    *,
+    graph,
+    query_text: str,
+    graph_weight: float,
+) -> List[Dict[str, object]]:
+    if not rows or graph is None:
+        return []
+    working = [dict(row) for row in rows]
+    score_norm = min_max_normalize([float(row.get("score") or 0.0) for row in working])
+    lexical_norm = min_max_normalize(
+        [
+            lexical_overlap_score(
+                query_text,
+                "\n".join(
+                    part
+                    for part in [
+                        str(row.get("cpv_label") or ""),
+                        str(row.get("text") or ""),
+                        str(row.get("cpv_parent_label") or ""),
+                    ]
+                    if part.strip()
+                ),
+            )
+            for row in working
+        ]
+    )
+    top_window = working[: min(6, len(working))]
+    dominant_prefixes: Dict[int, str] = {}
+    for prefix_len in (6, 4):
+        prefix_scores: Dict[str, float] = {}
+        prefix_counts: Dict[str, int] = {}
+        for row, norm_score in zip(top_window, score_norm[: len(top_window)]):
+            code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+            if not code:
+                continue
+            prefix = code[:prefix_len]
+            prefix_scores[prefix] = prefix_scores.get(prefix, 0.0) + float(norm_score)
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+        if not prefix_scores:
+            continue
+        best_prefix, best_weight = max(prefix_scores.items(), key=lambda item: item[1])
+        if prefix_counts.get(best_prefix, 0) >= 2 and best_weight >= 0.7:
+            dominant_prefixes[prefix_len] = best_prefix
+
+    top_codes = {normalize_cpv_code(str(row.get("cpv_code") or "")) for row in top_window}
+    top_codes.discard("")
+    score_norm_by_code = {
+        normalize_cpv_code(str(row.get("cpv_code") or "")): float(norm)
+        for row, norm in zip(working, score_norm)
+        if normalize_cpv_code(str(row.get("cpv_code") or ""))
+    }
+    lexical_norm_by_code = {
+        normalize_cpv_code(str(row.get("cpv_code") or "")): float(norm)
+        for row, norm in zip(working, lexical_norm)
+        if normalize_cpv_code(str(row.get("cpv_code") or ""))
+    }
+    sibling_counts: Dict[str, int] = {}
+    for code in top_codes:
+        parent = graph.parent_lookup.get(code, "")
+        if not parent:
+            continue
+        sibling_counts[code] = sum(
+            1
+            for other in top_codes
+            if other != code and graph.parent_lookup.get(other, "") == parent
+        )
+
+    scale = max(0.02, min(0.08, 0.18 * float(graph_weight or 0.0)))
+    reranked: List[Dict[str, object]] = []
+    for row, norm_score, lex_score in zip(working, score_norm, lexical_norm):
+        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+        if not code:
+            reranked.append(row)
+            continue
+        branch_bonus = 0.0
+        if 6 in dominant_prefixes and code.startswith(dominant_prefixes[6]):
+            branch_bonus += 0.50 * scale
+        elif 4 in dominant_prefixes and code.startswith(dominant_prefixes[4]):
+            branch_bonus += 0.28 * scale
+
+        sibling_bonus = min(0.35 * scale, 0.12 * scale * sibling_counts.get(code, 0))
+
+        specificity_bonus = 0.0
+        specificity_penalty = 0.0
+        parent = graph.parent_lookup.get(code, "")
+        if parent and parent in top_codes:
+            parent_score = score_norm_by_code.get(parent, 0.0)
+            parent_lex = lexical_norm_by_code.get(parent, 0.0)
+            if float(norm_score) >= parent_score - 0.08 and float(lex_score) >= parent_lex - 0.05:
+                specificity_bonus += 0.55 * scale
+
+        child_codes_in_top = [child for child in graph.children_lookup.get(code, []) if child in top_codes]
+        if child_codes_in_top:
+            best_child_score = max(score_norm_by_code.get(child, 0.0) for child in child_codes_in_top)
+            best_child_lex = max(lexical_norm_by_code.get(child, 0.0) for child in child_codes_in_top)
+            if best_child_score >= float(norm_score) - 0.05 and best_child_lex >= float(lex_score) - 0.04:
+                specificity_penalty -= 0.55 * scale
+
+        path_codes = set(ancestor_codes(code, graph.parent_lookup, include_self=True))
+        shared_path_hits = sum(1 for other in top_codes if other != code and other in path_codes)
+        path_bonus = min(0.20 * scale, 0.07 * scale * shared_path_hits) if shared_path_hits else 0.0
+
+        total_bonus = branch_bonus + sibling_bonus + specificity_bonus + specificity_penalty + path_bonus
+        row["kg_decision_bonus"] = total_bonus
+        row["kg_decision_branch_bonus"] = branch_bonus
+        row["kg_decision_sibling_bonus"] = sibling_bonus
+        row["kg_decision_specificity_bonus"] = specificity_bonus + specificity_penalty
+        row["kg_decision_path_bonus"] = path_bonus
+        row["kg_decision_code_level"] = code_level(code)
+        row["score"] = float(row.get("score") or 0.0) + total_bonus
+        reranked.append(row)
     reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
     return reranked
 
@@ -549,20 +591,30 @@ def _should_apply_llm_rerank(rows: List[Dict[str, object]], query_text: str, *, 
     scores = [float(row.get("score") or 0.0) for row in head[:3]]
     margin = scores[0] - scores[1] if len(scores) >= 2 else 1.0
     top_branch_prefixes = {str(row.get("cpv_code") or "")[:5] for row in head[:3] if str(row.get("cpv_code") or "").strip()}
+    top1_code = str(head[0].get("cpv_code") or "") if head else ""
+    top2_code = str(head[1].get("cpv_code") or "") if len(head) >= 2 else ""
+    top_pair_prefix = cpv_common_prefix_length(top1_code, top2_code) if top1_code and top2_code else 0
     query_types = set(_infer_contract_types(query_text))
     top_candidate_types = [set(str(row.get("candidate_contract_types") or "").split(",")) - {""} for row in head[:3]]
     specific_types = {"maintenance_repair", "installation_work", "consultancy", "security_service", "software_it_service"}
     query_specific = query_types & specific_types
-    if margin <= 0.03:
+    if margin <= 0.35:
         return True, "close_score_margin"
-    if len(top_branch_prefixes) <= 2:
+    if margin <= 0.80 and (len(top_branch_prefixes) <= 2 or top_pair_prefix >= 2):
         return True, "same_branch_cluster"
-    if query_specific and any(query_specific.isdisjoint(candidate_types & specific_types) for candidate_types in top_candidate_types[:2]):
+    if (
+        query_specific
+        and margin <= 0.80
+        and any(query_specific.isdisjoint(candidate_types & specific_types) for candidate_types in top_candidate_types[:2])
+    ):
         return True, "specific_contract_type_conflict"
-    if query_types and top_candidate_types and any(query_types.isdisjoint(candidate_types) for candidate_types in top_candidate_types[:2]):
+    if (
+        query_types
+        and margin <= 0.80
+        and top_candidate_types
+        and any(query_types.isdisjoint(candidate_types) for candidate_types in top_candidate_types[:2])
+    ):
         return True, "contract_type_conflict"
-    if len(_extract_procurement_object(query_text)["object_query"].split()) <= 4:
-        return True, "short_object_query"
     return False, "high_confidence_no_llm"
 
 
@@ -1474,9 +1526,18 @@ def _cpv_rank_diagnostics(
         failure_mode = "gold_missing_from_top_k"
         likely_bottleneck = "candidate_generation_or_retriever"
 
-    high_confidence_wrong = bool(not exact_top1 and prediction_confidence is not None and prediction_confidence >= 0.85)
-    low_margin_decision = bool(score_margin is not None and score_margin <= 0.05)
-    duplicate_candidate_pressure = bool(duplicate_rate >= 0.34)
+    high_confidence_wrong = bool(
+        not exact_top1
+        and (
+            (score_margin is not None and score_margin >= 1.20)
+            or (prediction_confidence is not None and prediction_confidence >= 0.55)
+        )
+    )
+    low_margin_decision = bool(score_margin is not None and score_margin <= 0.80)
+    duplicate_candidate_pressure = bool(
+        duplicate_rate >= 0.10
+        or (len(labels) >= 3 and len(unique_divisions) <= 2 and best_hierarchy_score >= 0.25)
+    )
     low_diversity_at_k = bool(len(labels) > 1 and len(unique_divisions) <= 1)
     short_or_ambiguous_query = bool(len(query_tokens) <= 3)
 
@@ -1529,6 +1590,53 @@ def _rate(rows: List[Dict[str, object]], key: str) -> float | None:
     if not rows:
         return None
     return sum(1 for row in rows if row.get(key) is True) / len(rows)
+
+
+def _bool_or_none(value: object) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _summarize_self_hit_leakage(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    total = len(rows)
+    if total == 0:
+        return {
+            "n_items": 0,
+            "self_hit_top1_rate": None,
+            "self_hit_any_at_k_rate": None,
+            "queries_with_self_examples_removed_rate": None,
+            "excluded_notice_example_rows_total": 0,
+            "excluded_notice_example_rows_mean": None,
+            "accuracy_self_hit_top1": None,
+            "accuracy_non_self_hit_top1": None,
+        }
+    self_top1 = [row for row in rows if _bool_or_none(row.get("top1_self_hit_before_filter")) is True]
+    non_self_top1 = [row for row in rows if _bool_or_none(row.get("top1_self_hit_before_filter")) is not True]
+    excluded_counts = [
+        int(float(row.get("excluded_notice_example_rows") or 0))
+        for row in rows
+        if row.get("excluded_notice_example_rows") not in {None, ""}
+    ]
+    return {
+        "n_items": total,
+        "self_hit_top1_rate": _rate(rows, "top1_self_hit_before_filter"),
+        "self_hit_any_at_k_rate": _rate(rows, "any_self_hit_before_filter"),
+        "queries_with_self_examples_removed_rate": _rate(rows, "self_examples_removed"),
+        "excluded_notice_example_rows_total": sum(excluded_counts),
+        "excluded_notice_example_rows_mean": (sum(excluded_counts) / len(excluded_counts)) if excluded_counts else None,
+        "accuracy_self_hit_top1": _rate(self_top1, "exact_top1_match"),
+        "accuracy_non_self_hit_top1": _rate(non_self_top1, "exact_top1_match"),
+    }
 
 
 def _summarize_cpv_diagnostics(rows: List[Dict[str, object]], *, top_k: int) -> Dict[str, object]:
@@ -1722,6 +1830,586 @@ def _catalog_row_from_prediction(
     }
 
 
+def _aggregate_cpv_channel_rows(
+    rows: List[Dict[str, object]],
+    *,
+    channel_name: str,
+    top_k: int,
+) -> List[Dict[str, object]]:
+    if not rows:
+        return []
+    normalized_scores = min_max_normalize([float(row.get("score") or 0.0) for row in rows])
+    grouped: Dict[str, Dict[str, object]] = {}
+    for row, normalized_score in zip(rows, normalized_scores):
+        cpv_code = str(row.get("cpv_code") or "").strip()
+        if not cpv_code:
+            continue
+        bucket = grouped.setdefault(
+            cpv_code,
+            {
+                "best_row": dict(row),
+                "best_score": float(row.get("score") or 0.0),
+                "normalized_scores": [],
+                "support_count": 0,
+                "publication_numbers": set(),
+            },
+        )
+        raw_score = float(row.get("score") or 0.0)
+        if raw_score > float(bucket["best_score"]):
+            bucket["best_score"] = raw_score
+            bucket["best_row"] = dict(row)
+        bucket["normalized_scores"].append(float(normalized_score))
+        bucket["support_count"] = int(bucket["support_count"]) + 1
+        publication_number = str(row.get("publication_number") or "").strip()
+        if publication_number:
+            bucket["publication_numbers"].add(publication_number)
+    aggregated: List[Dict[str, object]] = []
+    for bucket in grouped.values():
+        best_row = dict(bucket["best_row"])
+        normalized = sorted((float(value) for value in bucket["normalized_scores"]), reverse=True)
+        best_norm = normalized[0] if normalized else 0.0
+        mean_top3 = sum(normalized[:3]) / max(1, min(3, len(normalized)))
+        support_bonus = min(0.15, 0.03 * max(0, int(bucket["support_count"]) - 1))
+        channel_score = (0.7 * best_norm) + (0.3 * mean_top3) + support_bonus
+        best_row["score"] = channel_score
+        best_row["base_retrieval_score"] = channel_score
+        best_row[f"{channel_name}_channel_score"] = channel_score
+        best_row[f"{channel_name}_max_norm_score"] = best_norm
+        best_row[f"{channel_name}_top3_mean_score"] = mean_top3
+        best_row[f"{channel_name}_channel_support_count"] = int(bucket["support_count"])
+        best_row["retrieval_channel"] = channel_name
+        best_row["retrieval_source"] = channel_name
+        if channel_name == "notice_examples":
+            best_row["source_type"] = "cpv_notice_examples_db"
+            best_row["chunking_strategy"] = "cpv_notice_example_db"
+            best_row["notice_example_publication_numbers"] = sorted(str(item) for item in bucket["publication_numbers"] if str(item).strip())
+        aggregated.append(best_row)
+    aggregated.sort(key=lambda row: float(row.get("score") or 0.0), reverse=True)
+    return aggregated[:top_k]
+
+
+def _fuse_cpv_channel_rankings(
+    *,
+    profile_rows: List[Dict[str, object]],
+    example_rows: List[Dict[str, object]],
+    top_k: int,
+    profile_weight: float = 0.44,
+    example_weight: float = 0.56,
+) -> List[Dict[str, object]]:
+    if not profile_rows and not example_rows:
+        return []
+    if not profile_rows:
+        return example_rows[:top_k]
+    if not example_rows:
+        return profile_rows[:top_k]
+
+    profile_norm = min_max_normalize([float(row.get("score") or 0.0) for row in profile_rows])
+    example_norm = min_max_normalize([float(row.get("score") or 0.0) for row in example_rows])
+    grouped: Dict[str, Dict[str, object]] = {}
+
+    def _seed_row(channel: str, row: Dict[str, object], norm_score: float) -> None:
+        cpv_code = str(row.get("cpv_code") or "").strip()
+        if not cpv_code:
+            return
+        bucket = grouped.setdefault(
+            cpv_code,
+            {
+                "profile_row": None,
+                "example_row": None,
+                "profile_norm": 0.0,
+                "example_norm": 0.0,
+                "profile_score": 0.0,
+                "example_score": 0.0,
+                "publication_numbers": set(),
+            },
+        )
+        if channel == "profiles":
+            bucket["profile_row"] = dict(row)
+            bucket["profile_norm"] = float(norm_score)
+            bucket["profile_score"] = float(row.get("score") or 0.0)
+        else:
+            bucket["example_row"] = dict(row)
+            bucket["example_norm"] = float(norm_score)
+            bucket["example_score"] = float(row.get("score") or 0.0)
+            for item in row.get("notice_example_publication_numbers", []) or []:
+                if str(item).strip():
+                    bucket["publication_numbers"].add(str(item).strip())
+
+    for row, norm in zip(profile_rows, profile_norm):
+        _seed_row("profiles", row, norm)
+    for row, norm in zip(example_rows, example_norm):
+        _seed_row("examples", row, norm)
+
+    fused: List[Dict[str, object]] = []
+    for cpv_code, bucket in grouped.items():
+        profile_row = bucket.get("profile_row")
+        example_row = bucket.get("example_row")
+        base_row = dict(profile_row or example_row or {})
+        if not base_row:
+            continue
+        canonical_text = str((profile_row or {}).get("text") or base_row.get("text") or "").strip()
+        example_text = str((example_row or {}).get("text") or "").strip()
+        if canonical_text and example_text and canonical_text != example_text:
+            base_row["text"] = "\n".join(
+                [
+                    canonical_text,
+                    f"Representative notice example: {example_text}",
+                ]
+            )
+        base_row["cpv_code"] = cpv_code
+        base_row["profile_channel_score"] = float(bucket.get("profile_score") or 0.0)
+        base_row["notice_examples_channel_score"] = float(bucket.get("example_score") or 0.0)
+        base_row["profile_channel_support_count"] = int((profile_row or {}).get("profile_channel_support_count") or (1 if profile_row else 0))
+        base_row["notice_examples_channel_support_count"] = int((example_row or {}).get("notice_examples_channel_support_count") or (1 if example_row else 0))
+        base_row["notice_example_publication_numbers"] = sorted(bucket["publication_numbers"])
+        fused_score = (
+            profile_weight * float(bucket.get("profile_norm") or 0.0)
+            + example_weight * float(bucket.get("example_norm") or 0.0)
+        )
+        if profile_row and example_row:
+            fused_score += 0.05
+        base_row["score"] = fused_score
+        base_row["base_retrieval_score"] = fused_score
+        base_row["retrieval_channel"] = "profiles_notice_examples_fusion"
+        base_row["retrieval_source"] = "profiles+notice_examples"
+        base_row["source_type"] = "cpv_profiles_notice_examples_fusion"
+        base_row["chunking_strategy"] = "cpv_profile_notice_example_fusion"
+        base_row["canonical_profile_text"] = canonical_text
+        base_row["representative_notice_example_text"] = example_text
+        fused.append(base_row)
+
+    fused.sort(key=lambda row: float(row.get("score") or 0.0), reverse=True)
+    return fused[:top_k]
+
+
+def _canonical_signal_text(row: Dict[str, object]) -> str:
+    return "\n".join(
+        part
+        for part in [
+            str(row.get("cpv_code") or ""),
+            str(row.get("cpv_label") or ""),
+            str(row.get("description_en") or ""),
+            str(row.get("cpv_parent_label") or ""),
+            str(row.get("keywords_en") or ""),
+            str(row.get("use_when_text") or ""),
+            str(row.get("do_not_use_when_text") or ""),
+            str(row.get("common_tender_phrases") or ""),
+            str(row.get("canonical_profile_text") or ""),
+        ]
+        if str(part).strip()
+    )
+
+
+def _apply_canonical_profile_rerank(
+    rows: List[Dict[str, object]],
+    *,
+    query_text: str,
+    object_query: str,
+    translated_query: str,
+    procurement_action: str,
+) -> List[Dict[str, object]]:
+    if not rows:
+        return []
+    working = [dict(row) for row in rows]
+    score_norm = min_max_normalize([float(row.get("score") or 0.0) for row in working])
+    reranked: List[Dict[str, object]] = []
+    for row, norm_score in zip(working, score_norm):
+        canonical_text = _canonical_signal_text(row)
+        example_text = str(row.get("representative_notice_example_text") or row.get("text") or "")
+        canonical_overlap = max(
+            lexical_overlap_score(query_text, canonical_text),
+            lexical_overlap_score(translated_query, canonical_text),
+            lexical_overlap_score(object_query, canonical_text),
+        )
+        example_overlap = max(
+            lexical_overlap_score(query_text, example_text),
+            lexical_overlap_score(object_query, example_text),
+        )
+        action_overlap = lexical_overlap_score(procurement_action, canonical_text)
+        canonical_bonus = (
+            0.18 * canonical_overlap
+            + 0.06 * action_overlap
+            + 0.05 * float(norm_score)
+        )
+        if canonical_overlap >= example_overlap:
+            canonical_bonus += 0.04
+        row["canonical_overlap_score"] = canonical_overlap
+        row["example_overlap_score"] = example_overlap
+        row["canonical_action_overlap_score"] = action_overlap
+        row["canonical_profile_bonus"] = canonical_bonus
+        row["score_before_canonical_profile"] = float(row.get("score") or 0.0)
+        row["score"] = float(row["score_before_canonical_profile"]) + canonical_bonus
+        if abs(canonical_bonus) > 1e-12:
+            row["reranker"] = "canonical_profile"
+        reranked.append(row)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return reranked
+
+
+def _dominant_branch_prefix(rows: List[Dict[str, object]], *, width_candidates: List[int] | None = None) -> str:
+    if not rows:
+        return ""
+    widths = width_candidates or [6, 4]
+    head = rows[: min(8, len(rows))]
+    norm_scores = min_max_normalize([float(row.get("score") or 0.0) for row in head])
+    for width in widths:
+        prefix_weights: Dict[str, float] = {}
+        prefix_counts: Dict[str, int] = {}
+        for row, norm in zip(head, norm_scores):
+            code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+            if not code:
+                continue
+            prefix = code[:width]
+            prefix_weights[prefix] = prefix_weights.get(prefix, 0.0) + float(norm)
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
+        if not prefix_weights:
+            continue
+        best_prefix, best_weight = max(prefix_weights.items(), key=lambda item: item[1])
+        if prefix_counts.get(best_prefix, 0) >= 2 and best_weight >= 0.8:
+            return best_prefix
+    return ""
+
+
+def _apply_specificity_bias(
+    rows: List[Dict[str, object]],
+    *,
+    graph,
+    query_text: str,
+    object_query: str,
+) -> List[Dict[str, object]]:
+    if not rows or graph is None:
+        return rows
+    working = [dict(row) for row in rows]
+    by_code = {
+        normalize_cpv_code(str(row.get("cpv_code") or "")): row
+        for row in working
+        if normalize_cpv_code(str(row.get("cpv_code") or ""))
+    }
+    reranked: List[Dict[str, object]] = []
+    for row in working:
+        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+        if not code:
+            reranked.append(row)
+            continue
+        canonical_text = _canonical_signal_text(row)
+        query_overlap = max(
+            lexical_overlap_score(query_text, canonical_text),
+            lexical_overlap_score(object_query, canonical_text),
+        )
+        level = code_level(code)
+        specific_bonus = 0.0
+        broad_penalty = 0.0
+        parent_code = graph.parent_lookup.get(code, "")
+        if parent_code and parent_code in by_code:
+            parent_row = by_code[parent_code]
+            parent_overlap = max(
+                lexical_overlap_score(query_text, _canonical_signal_text(parent_row)),
+                lexical_overlap_score(object_query, _canonical_signal_text(parent_row)),
+            )
+            if query_overlap >= parent_overlap - 0.03 and level >= 8:
+                specific_bonus += 0.09
+        child_codes = [child for child in graph.children_lookup.get(code, []) if child in by_code]
+        if child_codes and level < 8:
+            best_child_overlap = max(
+                max(
+                    lexical_overlap_score(query_text, _canonical_signal_text(by_code[child])),
+                    lexical_overlap_score(object_query, _canonical_signal_text(by_code[child])),
+                )
+                for child in child_codes
+            )
+            if best_child_overlap >= query_overlap - 0.02:
+                broad_penalty -= 0.10
+        row["specificity_level"] = level
+        row["specificity_query_overlap"] = query_overlap
+        row["specificity_bias_bonus"] = specific_bonus + broad_penalty
+        row["score_before_specificity_bias"] = float(row.get("score") or 0.0)
+        row["score"] = float(row["score_before_specificity_bias"]) + specific_bonus + broad_penalty
+        if abs(specific_bonus + broad_penalty) > 1e-12:
+            row["reranker"] = "specificity_bias"
+        reranked.append(row)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return reranked
+
+
+def _apply_branch_local_selector(
+    rows: List[Dict[str, object]],
+    *,
+    graph,
+    query_text: str,
+    object_query: str,
+) -> List[Dict[str, object]]:
+    if not rows or graph is None:
+        return rows
+    dominant_prefix = _dominant_branch_prefix(rows)
+    if not dominant_prefix:
+        return rows
+    reranked: List[Dict[str, object]] = []
+    for row in rows:
+        updated = dict(row)
+        code = normalize_cpv_code(str(updated.get("cpv_code") or ""))
+        if not code:
+            reranked.append(updated)
+            continue
+        branch_bonus = 0.0
+        if code.startswith(dominant_prefix):
+            branch_bonus += 0.12 if len(dominant_prefix) >= 6 else 0.08
+            sibling_labels = str(updated.get("sibling_labels") or "")
+            children_labels = str(updated.get("children_labels") or "")
+            canonical_text = _canonical_signal_text(updated)
+            if lexical_overlap_score(object_query, canonical_text) >= 0.18:
+                branch_bonus += 0.05
+            if sibling_labels and lexical_overlap_score(query_text, sibling_labels) > 0.08:
+                branch_bonus += 0.03
+            if children_labels and code_level(code) < 8 and lexical_overlap_score(query_text, children_labels) > 0.10:
+                branch_bonus -= 0.04
+        updated["dominant_branch_prefix"] = dominant_prefix
+        updated["branch_local_selector_bonus"] = branch_bonus
+        updated["score_before_branch_local_selector"] = float(updated.get("score") or 0.0)
+        updated["score"] = float(updated["score_before_branch_local_selector"]) + branch_bonus
+        if abs(branch_bonus) > 1e-12:
+            updated["reranker"] = "branch_local_selector"
+        reranked.append(updated)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return reranked
+
+
+def _apply_canonical_only_shortlist_selector(
+    rows: List[Dict[str, object]],
+    *,
+    graph,
+    query_text: str,
+    object_query: str,
+    translated_query: str,
+    shortlist_n: int = 8,
+) -> List[Dict[str, object]]:
+    if not rows:
+        return rows
+    head = [dict(row) for row in rows[: min(shortlist_n, len(rows))]]
+    tail = [dict(row) for row in rows[min(shortlist_n, len(rows)) :]]
+    dominant_prefix = _dominant_branch_prefix(head)
+    head_norm = min_max_normalize([float(row.get("score") or 0.0) for row in head])
+    rescored: List[Dict[str, object]] = []
+    for row, prior_norm in zip(head, head_norm):
+        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+        canonical_text = _canonical_signal_text(row)
+        canonical_overlap = max(
+            lexical_overlap_score(query_text, canonical_text),
+            lexical_overlap_score(translated_query, canonical_text),
+            lexical_overlap_score(object_query, canonical_text),
+        )
+        use_when_overlap = lexical_overlap_score(query_text, str(row.get("use_when_text") or ""))
+        avoid_penalty = lexical_overlap_score(query_text, str(row.get("do_not_use_when_text") or ""))
+        branch_bonus = 0.04 if (dominant_prefix and code.startswith(dominant_prefix)) else 0.0
+        specificity_bonus = 0.03 if code and code_level(code) >= 8 else 0.0
+        selector_score = (
+            0.52 * canonical_overlap
+            + 0.16 * use_when_overlap
+            + 0.12 * float(prior_norm)
+            + branch_bonus
+            + specificity_bonus
+            - (0.18 * avoid_penalty)
+        )
+        row["canonical_only_selector_score"] = selector_score
+        row["canonical_only_selector_branch_bonus"] = branch_bonus
+        row["canonical_only_selector_specificity_bonus"] = specificity_bonus
+        row["score_before_canonical_only_selector"] = float(row.get("score") or 0.0)
+        row["score"] = float(row["score_before_canonical_only_selector"]) + selector_score
+        row["canonical_only_selector_dominant_branch"] = dominant_prefix
+        row["reranker"] = "canonical_only_selector"
+        rescored.append(row)
+    rescored.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    combined = rescored + tail
+    combined.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return combined
+
+
+def _apply_shortlist_final_selector(
+    rows: List[Dict[str, object]],
+    *,
+    graph,
+    query_text: str,
+    object_query: str,
+    translated_query: str,
+    procurement_action: str,
+    shortlist_n: int = 5,
+) -> List[Dict[str, object]]:
+    if not rows:
+        return rows
+    head = [dict(row) for row in rows[: min(shortlist_n, len(rows))]]
+    tail = [dict(row) for row in rows[min(shortlist_n, len(rows)) :]]
+    dominant_prefix = _dominant_branch_prefix(head, width_candidates=[6, 4, 2])
+    prior_norm = min_max_normalize([float(row.get("score") or 0.0) for row in head])
+    by_code = {
+        normalize_cpv_code(str(row.get("cpv_code") or "")): row
+        for row in head
+        if normalize_cpv_code(str(row.get("cpv_code") or ""))
+    }
+    selector_rows: List[Dict[str, object]] = []
+    winner_code = ""
+    winner_score = float("-inf")
+    for row, prior_score in zip(head, prior_norm):
+        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+        canonical_text = _canonical_signal_text(row)
+        canonical_overlap = max(
+            lexical_overlap_score(query_text, canonical_text),
+            lexical_overlap_score(object_query, canonical_text),
+            lexical_overlap_score(translated_query, canonical_text),
+        )
+        use_when_overlap = max(
+            lexical_overlap_score(query_text, str(row.get("use_when_text") or "")),
+            lexical_overlap_score(object_query, str(row.get("use_when_text") or "")),
+        )
+        avoid_penalty = max(
+            lexical_overlap_score(query_text, str(row.get("do_not_use_when_text") or "")),
+            lexical_overlap_score(object_query, str(row.get("do_not_use_when_text") or "")),
+        )
+        action_overlap = lexical_overlap_score(procurement_action, canonical_text) if procurement_action else 0.0
+        example_dominance_penalty = max(
+            0.0,
+            float(row.get("example_overlap_score") or 0.0) - float(row.get("canonical_overlap_score") or 0.0) - 0.10,
+        )
+        branch_bonus = 0.07 if (dominant_prefix and code.startswith(dominant_prefix)) else 0.0
+        specificity_bonus = 0.06 if code and code_level(code) >= 8 else 0.02 if code and code_level(code) >= 6 else 0.0
+        parent_penalty = 0.0
+        if graph is not None and code:
+            child_codes = [child for child in graph.children_lookup.get(code, []) if child in by_code]
+            if child_codes:
+                best_child_overlap = max(
+                    max(
+                        lexical_overlap_score(query_text, _canonical_signal_text(by_code[child])),
+                        lexical_overlap_score(object_query, _canonical_signal_text(by_code[child])),
+                        lexical_overlap_score(translated_query, _canonical_signal_text(by_code[child])),
+                    )
+                    for child in child_codes
+                )
+                if best_child_overlap >= canonical_overlap - 0.02:
+                    parent_penalty -= 0.10
+        selector_score = (
+            0.34 * float(prior_score)
+            + 0.34 * canonical_overlap
+            + 0.14 * use_when_overlap
+            + 0.08 * action_overlap
+            + branch_bonus
+            + specificity_bonus
+            - (0.16 * avoid_penalty)
+            - (0.10 * example_dominance_penalty)
+            + parent_penalty
+        )
+        row["shortlist_final_selector_score"] = selector_score
+        row["shortlist_final_selector_branch_bonus"] = branch_bonus
+        row["shortlist_final_selector_specificity_bonus"] = specificity_bonus
+        row["shortlist_final_selector_parent_penalty"] = parent_penalty
+        row["shortlist_final_selector_example_penalty"] = example_dominance_penalty
+        selector_rows.append(row)
+        if selector_score > winner_score:
+            winner_score = selector_score
+            winner_code = code
+
+    rescored: List[Dict[str, object]] = []
+    for row in selector_rows:
+        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+        winner_boost = 0.28 if winner_code and code == winner_code else 0.0
+        selector_bonus = float(row.get("shortlist_final_selector_score") or 0.0) + winner_boost
+        row["shortlist_final_selector_selected"] = 1 if winner_code and code == winner_code else 0
+        row["shortlist_final_selector_bonus"] = selector_bonus
+        row["score_before_shortlist_final_selector"] = float(row.get("score") or 0.0)
+        row["score"] = float(row["score_before_shortlist_final_selector"]) + selector_bonus
+        row["shortlist_final_selector_dominant_branch"] = dominant_prefix
+        if selector_bonus > 0.0:
+            row["reranker"] = "shortlist_final_selector"
+        rescored.append(row)
+
+    rescored.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    combined = rescored + tail
+    combined.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return combined
+
+
+def _apply_division_72_contrastive_selector(
+    rows: List[Dict[str, object]],
+    *,
+    query_text: str,
+    object_query: str,
+    translated_query: str,
+    shortlist_n: int = 8,
+) -> List[Dict[str, object]]:
+    if not rows:
+        return rows
+    head = [dict(row) for row in rows[: min(shortlist_n, len(rows))]]
+    tail = [dict(row) for row in rows[min(shortlist_n, len(rows)) :]]
+    division72_rows = [
+        row for row in head
+        if normalize_cpv_code(str(row.get("cpv_code") or "")).startswith("72")
+    ]
+    if len(division72_rows) < 2:
+        return rows
+
+    query_signals = f"{query_text} {object_query} {translated_query}".casefold()
+    dev_terms = ("software", "application", "development", "system", "platform", "evolution", "program", "digital")
+    support_terms = ("support", "maintenance", "hosting", "cloud", "server", "network", "infrastructure", "operation", "helpdesk")
+    data_terms = ("data", "database", "analytics", "information", "migration")
+    internet_terms = ("internet", "web", "portal", "online", "website", "communication")
+
+    overlap_by_code = {
+        normalize_cpv_code(str(row.get("cpv_code") or "")): max(
+            lexical_overlap_score(query_text, _canonical_signal_text(row)),
+            lexical_overlap_score(object_query, _canonical_signal_text(row)),
+            lexical_overlap_score(translated_query, _canonical_signal_text(row)),
+        )
+        for row in division72_rows
+    }
+
+    reranked: List[Dict[str, object]] = []
+    for row in head:
+        updated = dict(row)
+        code = normalize_cpv_code(str(updated.get("cpv_code") or ""))
+        bonus = 0.0
+        if code.startswith("72"):
+            if code == "72000000":
+                best_specific = max(
+                    (score for other_code, score in overlap_by_code.items() if other_code != "72000000"),
+                    default=0.0,
+                )
+                if best_specific >= overlap_by_code.get(code, 0.0) - 0.02:
+                    bonus -= 0.14
+            if code.startswith("722") and any(term in query_signals for term in dev_terms):
+                bonus += 0.10
+            if code.startswith(("725", "726")) and any(term in query_signals for term in support_terms):
+                bonus += 0.10
+            if code.startswith("723") and any(term in query_signals for term in data_terms):
+                bonus += 0.08
+            if code.startswith("724") and any(term in query_signals for term in internet_terms):
+                bonus += 0.08
+            if code_level(code) >= 8:
+                bonus += 0.03
+        elif any(term in query_signals for term in dev_terms + support_terms + data_terms + internet_terms):
+            bonus -= 0.03
+        updated["division_72_contrastive_bonus"] = bonus
+        updated["score_before_division_72_contrastive"] = float(updated.get("score") or 0.0)
+        updated["score"] = float(updated["score_before_division_72_contrastive"]) + bonus
+        if abs(bonus) > 1e-12:
+            updated["reranker"] = "division_72_contrastive"
+        reranked.append(updated)
+    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    combined = reranked + tail
+    combined.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return combined
+
+
+def _sync_ted_notices_to_db_from_corpus_export(
+    *,
+    ted_corpus_export_path: str,
+    ted_notice_db_path: str,
+) -> Dict[str, int]:
+    notices = load_ted_corpus_export_notices(ted_corpus_export_path)
+    normalized = [normalize_ted_notice_record(notice) for notice in notices]
+    conn = open_ted_notice_db(ted_notice_db_path)
+    try:
+        return upsert_ted_notices(conn, normalized)
+    finally:
+        conn.close()
+
+
 def evaluate_local_ted_cpv_classifier(
     *,
     ted_corpus_export_path: str,
@@ -1729,7 +2417,6 @@ def evaluate_local_ted_cpv_classifier(
     retriever: str,
     embedding_model: str,
     top_k: int,
-    use_examples: bool,
     classifier_label: str,
     run_dir: str,
     create_visualization: bool,
@@ -1744,13 +2431,16 @@ def evaluate_local_ted_cpv_classifier(
     llm_rerank_weight: float = 0.4,
     kg_enabled: bool = False,
     kg_graph_weight: float = 0.35,
-    kg_profile: str = "balanced",
+    kg_profile: str = "safe_branch",
     kg_algorithm: str | None = None,
     llm_config: LLMConfig | None = None,
     query_augmentation: str | None = None,
     query_augmentation_max_terms: int = 8,
+    cpv_notice_examples_channel: bool = False,
+    self_exclusion: bool = True,
     search_backend_config: Dict[str, object] | None = None,
     search_index_name: str | None = None,
+    export_kg_for_neo4j: bool = False,
 ) -> Dict[str, object]:
     import pandas as pd
 
@@ -1758,27 +2448,55 @@ def evaluate_local_ted_cpv_classifier(
         str((search_backend_config or {}).get("index_dir") or ".rag_eval_indices"),
         "ted_notices.sqlite",
     )
+    ted_notice_ingest_summary = _sync_ted_notices_to_db_from_corpus_export(
+        ted_corpus_export_path=ted_corpus_export_path,
+        ted_notice_db_path=ted_notice_db_path,
+    )
     bootstrap_catalog = load_cpv_catalog_from_ted_corpus_export(ted_corpus_export_path)
     sync_cpv_profiles_to_db(
         bootstrap_catalog,
-        use_examples=use_examples,
         ted_notice_db_path=ted_notice_db_path,
     )
     catalog = load_cpv_catalog_from_db(ted_notice_db_path) or bootstrap_catalog
     queries = load_queries(queries_path)
-    chunks = build_cpv_chunks_from_db(ted_notice_db_path) or build_cpv_chunks(
+    profile_chunks = build_cpv_chunks_from_db(ted_notice_db_path) or build_cpv_chunks(
         catalog,
-        use_examples=use_examples,
         ted_notice_db_path=ted_notice_db_path,
     )
-    retriever_state = build_cpv_multi_retriever(
-        chunks,
+    example_chunks = (
+        build_cpv_notice_example_chunks_from_db(ted_notice_db_path)
+        if cpv_notice_examples_channel
+        else []
+    )
+    profile_retriever_state = build_cpv_multi_retriever(
+        profile_chunks,
         embedding_model,
         retriever,
         search_backend_config=search_backend_config,
-        index_name=search_index_name,
+        index_name=f"{search_index_name}-profiles" if search_index_name else None,
     )
+    example_retriever_state = (
+        build_cpv_multi_retriever(
+            example_chunks,
+            embedding_model,
+            retriever,
+            search_backend_config=search_backend_config,
+            index_name=f"{search_index_name}-notice-examples" if search_index_name else None,
+        )
+        if example_chunks
+        else None
+    )
+    chunks = profile_chunks
+    retriever_state = profile_retriever_state
     cpv_graph = build_cpv_knowledge_graph(catalog) if kg_enabled else None
+    kg_neo4j_export = (
+        export_cpv_kg_for_neo4j(
+            cpv_graph,
+            out_dir=os.path.join(run_dir, "cpv_kg_neo4j"),
+        )
+        if export_kg_for_neo4j and cpv_graph is not None
+        else None
+    )
     chunks_by_code = {str(chunk["cpv_code"]): chunk for chunk in chunks}
     # mean_cpv_hierarchy_similarity_top1 shows how close top-1 is to the reference label.
     parent_lookup = build_parent_lookup(catalog)
@@ -1795,15 +2513,20 @@ def evaluate_local_ted_cpv_classifier(
     resolved_cross_encoder_model = cross_encoder_model or DEFAULT_CROSS_ENCODER_MODEL
     ce_top_n = max(1, int(cross_encoder_top_n)) if cross_encoder_rerank else 0
     llm_top_n = max(1, int(llm_rerank_top_n)) if llm_rerank else 0
+    max_candidate_codes = max(len(catalog), len(profile_chunks), 1)
     expanded_selector_pool = 500 if (kg_enabled or rerank_top_n > top_k or cross_encoder_rerank or llm_rerank) else max(top_k, 200)
     pool_size = min(
         max(top_k, rerank_top_n or top_k, ce_top_n, llm_top_n, expanded_selector_pool),
-        len(chunks),
+        max_candidate_codes,
     )
     candidate_k = min(
-        len(chunks),
+        max_candidate_codes,
         max(top_k, ce_top_n, llm_top_n, pool_size, 200 if (cross_encoder_rerank or llm_rerank or kg_enabled) else top_k),
     )
+    example_fetch_k = min(
+        len(example_chunks),
+        max(pool_size * 8, candidate_k * 8, 300),
+    ) if example_chunks else 0
     effective_rerank_top_n = rerank_top_n if rerank_top_n else (10 if kg_enabled else 0)
     effective_rerank_weight = rerank_weight if rerank_top_n else (0.3 if kg_enabled else 0.25)
     resolved_query_augmentation = query_augmentation or "none"
@@ -1812,44 +2535,61 @@ def evaluate_local_ted_cpv_classifier(
     for query in queries:
         llm_rerank_result = LLMCallResult(answer=None, used=False, status="disabled", error=None)
         query_object = _extract_procurement_object(query.query)
+        enrichment = None
+        query_augmentation_result = LLMCallResult(answer=query.query, used=False, status="disabled", error=None)
+        if resolved_query_augmentation == "translate_en":
+            enrichment = enrich_procurement_query(
+                query.query,
+                llm_config=base_llm_config if base_llm_config.enabled else None,
+                enable_translation=True,
+            )
+            query_object = enrichment.as_dict()
+            query_augmentation_result = LLMCallResult(
+                answer=enrichment.translation_domain_corrected or enrichment.clean_query,
+                used=enrichment.translation_status not in {"not_needed", "disabled"},
+                status=enrichment.translation_status,
+                error=enrichment.translation_error,
+            )
+        elif resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES:
+            query_augmentation_config = LLMConfig(True, base_llm_config.model, base_llm_config.api_key_env, 0.0)
+            query_augmentation_result = augment_query_with_llm(
+                str(query_object["object_query"]),
+                query_augmentation_config,
+                mode=resolved_query_augmentation,
+                max_terms=query_augmentation_max_terms,
+            )
+
         cleaned_query = str(query_object["cleaned_query"])
         object_query = str(query_object["object_query"])
         procurement_action = str(query_object.get("procurement_action") or "")
         secondary_context = str(query_object.get("secondary_context") or "")
         exclude_as_primary = [str(item) for item in query_object.get("exclude_as_primary", []) if str(item).strip()]
-        query_augmentation_config = (
-            LLMConfig(True, base_llm_config.model, base_llm_config.api_key_env, 0.0)
-            if resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES
-            else base_llm_config
+        primary_selection_bias = str(query_object.get("primary_selection_bias") or "")
+        service_component = bool(query_object.get("service_component"))
+        search_channels = enrichment.search_channels if enrichment is not None else None
+        retrieval_query = enrichment.clean_query if enrichment is not None else (query_augmentation_result.answer or object_query)
+        translated_query = (
+            enrichment.translation_domain_corrected if enrichment is not None
+            else (query_augmentation_result.answer or object_query)
         )
-        query_augmentation_result = augment_query_with_llm(
-            object_query,
-            query_augmentation_config,
-            mode=resolved_query_augmentation,
-            max_terms=query_augmentation_max_terms,
-        )
-        retrieval_query = query_augmentation_result.answer or object_query
-        translated_query = retrieval_query
-        if resolved_query_augmentation == "translate_en" and translated_query.startswith(object_query):
-            translated_query = translated_query[len(object_query):].strip() or retrieval_query
-        elif resolved_query_augmentation == "translate_en" and translated_query.startswith(query.query):
-            translated_query = translated_query[len(query.query):].strip() or retrieval_query
-        object_translation = translated_query if translated_query.strip() else retrieval_query
-        db_query_hints = _augment_query_with_cpv_db_hints(
-            sqlite_path=str(retriever_state.get("sqlite_path") or ""),
-            main_object=object_query,
-            translated_query=object_translation,
-            procurement_action=procurement_action,
-        )
-        english_hint_suffix = " ".join(str(item) for item in db_query_hints.get("english_hints", []) if str(item).strip())
-        multilingual_hint_suffix = " ".join(str(item) for item in db_query_hints.get("multilingual_hints", []) if str(item).strip())
-        if english_hint_suffix:
-            object_translation = f"{object_translation} {english_hint_suffix}".strip()
-            translated_query = f"{translated_query} {english_hint_suffix}".strip()
-        if multilingual_hint_suffix:
-            cleaned_query = f"{cleaned_query} {multilingual_hint_suffix}".strip()
+        object_translation = enrichment.main_object_english if enrichment is not None else object_query
+        db_query_hints = {"status": "skipped_structured_enrichment", "english_hints": [], "multilingual_hints": []}
+        if enrichment is None:
+            db_query_hints = _augment_query_with_cpv_db_hints(
+                sqlite_path=str(retriever_state.get("sqlite_path") or ""),
+                main_object=object_query,
+                translated_query=translated_query,
+                procurement_action=procurement_action,
+            )
+            english_hint_suffix = " ".join(str(item) for item in db_query_hints.get("english_hints", []) if str(item).strip())
+            multilingual_hint_suffix = " ".join(str(item) for item in db_query_hints.get("multilingual_hints", []) if str(item).strip())
+            if english_hint_suffix:
+                object_translation = f"{object_translation} {english_hint_suffix}".strip()
+                translated_query = f"{translated_query} {english_hint_suffix}".strip()
+            if multilingual_hint_suffix:
+                cleaned_query = f"{cleaned_query} {multilingual_hint_suffix}".strip()
 
-        base_retrieved = retrieve_top_k_cpv_multi(
+        profile_base_retrieved = retrieve_top_k_cpv_multi(
             query_original=cleaned_query or query.query,
             query_translated_to_en=translated_query,
             query_object=object_query,
@@ -1857,24 +2597,117 @@ def evaluate_local_ted_cpv_classifier(
             procurement_action=procurement_action,
             secondary_context=secondary_context,
             exclude_as_primary=exclude_as_primary,
-            retriever_state=retriever_state,
-            chunks=chunks,
+            search_channels=search_channels,
+            primary_selection_bias=primary_selection_bias,
+            service_component=service_component,
+            retriever_state=profile_retriever_state,
+            chunks=profile_chunks,
             k=pool_size,
         )
-        base_retrieved = rerank_with_lexical_signal(
+        profile_base_retrieved = rerank_with_lexical_signal(
             query=retrieval_query,
-            rows=base_retrieved,
-            top_k=min(max(top_k, 25 if kg_enabled else top_k), len(base_retrieved)),
+            rows=profile_base_retrieved,
+            top_k=min(max(top_k, 25 if kg_enabled else top_k), len(profile_base_retrieved)),
             rerank_top_n=effective_rerank_top_n,
             rerank_weight=effective_rerank_weight,
         )
-        base_retrieved = _apply_object_focus_rerank(
-            base_retrieved,
+        profile_base_retrieved = _apply_object_focus_rerank(
+            profile_base_retrieved,
             main_object=object_query,
             procurement_action=procurement_action,
             secondary_context=secondary_context,
             exclude_as_primary=exclude_as_primary,
         )
+        example_base_retrieved: List[Dict[str, object]] = []
+        example_self_hit_rows_before_filter = 0
+        any_self_hit_before_filter = False
+        top1_self_hit_before_filter = False
+        if example_retriever_state is not None and example_chunks:
+            unfiltered_example_rows = retrieve_top_k_cpv_multi(
+                query_original=cleaned_query or query.query,
+                query_translated_to_en=translated_query,
+                query_object=object_query,
+                query_object_translated=object_translation,
+                procurement_action=procurement_action,
+                secondary_context=secondary_context,
+                exclude_as_primary=exclude_as_primary,
+                search_channels=search_channels,
+                primary_selection_bias=primary_selection_bias,
+                service_component=service_component,
+                retriever_state=example_retriever_state,
+                chunks=example_chunks,
+                k=example_fetch_k,
+            )
+            example_self_hit_rows_before_filter = sum(
+                1
+                for row in unfiltered_example_rows
+                if str(row.get("publication_number") or "").strip() == query.id
+            )
+            prefilter_example_base = _aggregate_cpv_channel_rows(
+                unfiltered_example_rows,
+                channel_name="notice_examples",
+                top_k=top_k,
+            )
+            any_self_hit_before_filter = any(
+                query.id in [str(item).strip() for item in row.get("notice_example_publication_numbers", [])]
+                for row in prefilter_example_base
+            )
+            top1_self_hit_before_filter = bool(
+                prefilter_example_base
+                and query.id in [
+                    str(item).strip()
+                    for item in prefilter_example_base[0].get("notice_example_publication_numbers", [])
+                ]
+            )
+            raw_example_rows = retrieve_top_k_cpv_multi(
+                query_original=cleaned_query or query.query,
+                query_translated_to_en=translated_query,
+                query_object=object_query,
+                query_object_translated=object_translation,
+                procurement_action=procurement_action,
+                secondary_context=secondary_context,
+                exclude_as_primary=exclude_as_primary,
+                search_channels=search_channels,
+                primary_selection_bias=primary_selection_bias,
+                service_component=service_component,
+                retriever_state=example_retriever_state,
+                chunks=example_chunks,
+                k=example_fetch_k,
+                metadata_filter=(
+                    {"publication_number": {"exclude": query.id}}
+                    if self_exclusion
+                    else None
+                ),
+            )
+            raw_example_rows = rerank_with_lexical_signal(
+                query=retrieval_query,
+                rows=raw_example_rows,
+                top_k=min(example_fetch_k, len(raw_example_rows)),
+                rerank_top_n=min(max(effective_rerank_top_n, top_k), len(raw_example_rows)),
+                rerank_weight=effective_rerank_weight,
+            )
+            raw_example_rows = _apply_object_focus_rerank(
+                raw_example_rows,
+                main_object=object_query,
+                procurement_action=procurement_action,
+                secondary_context=secondary_context,
+                exclude_as_primary=exclude_as_primary,
+            )
+            example_base_retrieved = _aggregate_cpv_channel_rows(
+                raw_example_rows,
+                channel_name="notice_examples",
+                top_k=pool_size,
+            )
+
+        if cpv_notice_examples_channel and example_base_retrieved:
+            base_retrieved = _fuse_cpv_channel_rankings(
+                profile_rows=profile_base_retrieved,
+                example_rows=example_base_retrieved,
+                top_k=pool_size,
+            )
+        else:
+            base_retrieved = profile_base_retrieved
+
         kg_retrieval = {
             "enabled": False,
             "base_codes": [str(row["cpv_code"]) for row in base_retrieved[:top_k]],
@@ -1888,7 +2721,7 @@ def evaluate_local_ted_cpv_classifier(
                 base_rows=base_retrieved,
                 chunks_by_code=chunks_by_code,
                 graph=cpv_graph,
-                top_k=min(candidate_k, len(chunks)),
+                top_k=min(candidate_k, len(profile_chunks)),
                 graph_weight=kg_graph_weight,
                 kg_profile=kg_profile,
                 graph_algorithm=kg_algorithm,
@@ -1909,7 +2742,7 @@ def evaluate_local_ted_cpv_classifier(
             retrieved = rerank_with_cross_encoder(
                 query=retrieval_query,
                 rows=ce_source[: min(ce_top_n, len(ce_source))],
-                top_k=min(max(top_k, llm_top_n), len(chunks)),
+                top_k=min(max(top_k, llm_top_n), len(profile_chunks)),
                 rerank_top_n=min(max(ce_top_n, 200), len(ce_source)),
                 model_name=resolved_cross_encoder_model,
                 fusion_weight=0.55,
@@ -1924,7 +2757,62 @@ def evaluate_local_ted_cpv_classifier(
             secondary_context=secondary_context,
             exclude_as_primary=exclude_as_primary,
         )
+        retrieved = _apply_canonical_profile_rerank(
+            retrieved,
+            query_text=retrieval_query,
+            object_query=object_query,
+            translated_query=translated_query,
+            procurement_action=procurement_action,
+        )
+        retrieved = _apply_specificity_bias(
+            retrieved,
+            graph=cpv_graph,
+            query_text=retrieval_query,
+            object_query=object_query,
+        )
+        retrieved = _apply_branch_local_selector(
+            retrieved,
+            graph=cpv_graph,
+            query_text=retrieval_query,
+            object_query=object_query,
+        )
+        retrieved = _apply_canonical_only_shortlist_selector(
+            retrieved,
+            graph=cpv_graph,
+            query_text=retrieval_query,
+            object_query=object_query,
+            translated_query=translated_query,
+            shortlist_n=max(5, min(8, top_k)),
+        )
+        retrieved = _apply_shortlist_final_selector(
+            retrieved,
+            graph=cpv_graph,
+            query_text=retrieval_query,
+            object_query=object_query,
+            translated_query=translated_query,
+            procurement_action=procurement_action,
+            shortlist_n=max(3, min(5, top_k)),
+        )
+        retrieved = _apply_division_72_contrastive_selector(
+            retrieved,
+            query_text=retrieval_query,
+            object_query=object_query,
+            translated_query=translated_query,
+            shortlist_n=max(5, min(8, top_k)),
+        )
+        retrieved = _apply_procurement_type_rerank(
+            retrieved,
+            primary_selection_bias=primary_selection_bias,
+            service_component=service_component,
+        )
         retrieved = _apply_contract_type_rerank(retrieved, f"{object_query} {procurement_action}".strip() or retrieval_query)
+        if kg_enabled and cpv_graph is not None:
+            retrieved = _apply_kg_decision_fusion(
+                retrieved,
+                graph=cpv_graph,
+                query_text=retrieval_query,
+                graph_weight=kg_graph_weight,
+            )
         apply_llm, llm_reason = _should_apply_llm_rerank(retrieved, retrieval_query, top_k=top_k)
         if llm_rerank and apply_llm:
             llm_rerank_result_config = LLMConfig(
@@ -1933,15 +2821,15 @@ def evaluate_local_ted_cpv_classifier(
                 base_llm_config.api_key_env,
                 0.0,
             )
-            retrieved, llm_rerank_result = rerank_candidates_with_llm(
+            retrieved, llm_rerank_result = judge_cpv_candidates_with_llm(
                 question=f"{query.query}\nNormalized procurement object: {object_query}",
                 rows=retrieved,
                 llm_config=llm_rerank_result_config,
                 top_k=min(top_k, len(retrieved)),
-                rerank_top_n=llm_top_n,
-                rerank_weight=llm_rerank_weight,
+                judge_top_n=min(3, llm_top_n),
+                judge_weight=min(0.35, llm_rerank_weight),
             )
-            llm_rerank_result.status = f"{llm_rerank_result.status}:{llm_reason}"
+            llm_rerank_result.status = f"judge:{llm_rerank_result.status}:{llm_reason}"
         elif llm_rerank:
             llm_rerank_result = LLMCallResult(answer=None, used=False, status=f"skipped:{llm_reason}", error=None)
         else:
@@ -1961,6 +2849,13 @@ def evaluate_local_ted_cpv_classifier(
                     "procurement_action": procurement_action,
                     "secondary_context": secondary_context,
                     "retrieval_query": retrieval_query,
+                    "query_domain": query_object.get("domain"),
+                    "query_object_type": query_object.get("object_type"),
+                    "query_procurement_type_hint": query_object.get("procurement_type_hint"),
+                    "query_primary_selection_bias": primary_selection_bias,
+                    "query_noise_terms": " | ".join(str(item) for item in query_object.get("noise_terms", [])),
+                    "translation_literal": query_object.get("translation_literal"),
+                    "translation_domain_corrected": query_object.get("translation_domain_corrected"),
                     "db_query_hint_status": db_query_hints.get("status"),
                     "db_query_hints_en": " | ".join(str(item) for item in db_query_hints.get("english_hints", [])),
                     "db_query_hints_local": " | ".join(str(item) for item in db_query_hints.get("multilingual_hints", [])),
@@ -1999,8 +2894,8 @@ def evaluate_local_ted_cpv_classifier(
         retrieval_metrics = evaluate_retrieval_metrics(
             item=item,
             retrieved=retrieved,
-            candidate_chunks=chunks,
-            k=min(top_k, len(chunks)),
+            candidate_chunks=profile_chunks,
+            k=min(top_k, len(profile_chunks)),
         )
         diagnostics = diagnose_failure(
             answer_metrics=answer_metrics,
@@ -2032,6 +2927,26 @@ def evaluate_local_ted_cpv_classifier(
             paths=kg_retrieval["paths"],
             top_k=top_k,
         ) if kg_enabled else {}
+        retrieved_publication_numbers = sorted(
+            {
+                str(publication_number).strip()
+                for row in retrieved[:top_k]
+                for publication_number in row.get("notice_example_publication_numbers", [])
+                if str(publication_number).strip()
+            }
+        )
+        top1_publication_numbers = (
+            sorted(
+                str(item).strip()
+                for item in retrieved[0].get("notice_example_publication_numbers", [])
+                if str(item).strip()
+            )
+            if retrieved
+            else []
+        )
+        top1_self_hit_after_filter = query.id in top1_publication_numbers
+        any_self_hit_after_filter = query.id in retrieved_publication_numbers
+        self_examples_removed = bool(self_exclusion and example_self_hit_rows_before_filter > 0)
 
         for rank, row in enumerate(retrieved, start=1):
             relevance_grade = retrieval_relevance_grade(item, row)
@@ -2051,14 +2966,38 @@ def evaluate_local_ted_cpv_classifier(
                     "chunk_id": row["chunk_id"],
                     "score": row["score"],
                     "base_retrieval_score": row.get("base_retrieval_score", row["score"]),
+                    "profile_channel_score": row.get("profile_channel_score", 0.0),
+                    "notice_examples_channel_score": row.get("notice_examples_channel_score", 0.0),
+                    "profile_channel_support_count": row.get("profile_channel_support_count", 0),
+                    "notice_examples_channel_support_count": row.get("notice_examples_channel_support_count", 0),
                     "cross_encoder_score": row.get("cross_encoder_score", 0.0),
                     "llm_rerank_score": row.get("llm_rerank_score", 0.0),
+                    "canonical_profile_bonus": row.get("canonical_profile_bonus", 0.0),
+                    "canonical_overlap_score": row.get("canonical_overlap_score", 0.0),
+                    "example_overlap_score": row.get("example_overlap_score", 0.0),
+                    "specificity_bias_bonus": row.get("specificity_bias_bonus", 0.0),
+                    "branch_local_selector_bonus": row.get("branch_local_selector_bonus", 0.0),
+                    "canonical_only_selector_score": row.get("canonical_only_selector_score", 0.0),
+                    "shortlist_final_selector_score": row.get("shortlist_final_selector_score", 0.0),
+                    "shortlist_final_selector_bonus": row.get("shortlist_final_selector_bonus", 0.0),
+                    "shortlist_final_selector_selected": row.get("shortlist_final_selector_selected", 0),
+                    "division_72_contrastive_bonus": row.get("division_72_contrastive_bonus", 0.0),
                     "contract_type_bonus": row.get("contract_type_bonus", 0.0),
+                    "llm_judge_score": row.get("llm_judge_score", 0.0),
+                    "llm_judge_rank": row.get("llm_judge_rank", 0),
+                    "llm_judge_selected": row.get("llm_judge_selected", 0),
                     "query_contract_types": row.get("query_contract_types", ""),
                     "candidate_contract_types": row.get("candidate_contract_types", ""),
+                    "kg_decision_bonus": row.get("kg_decision_bonus", 0.0),
+                    "kg_decision_branch_bonus": row.get("kg_decision_branch_bonus", 0.0),
+                    "kg_decision_sibling_bonus": row.get("kg_decision_sibling_bonus", 0.0),
+                    "kg_decision_specificity_bonus": row.get("kg_decision_specificity_bonus", 0.0),
+                    "kg_decision_path_bonus": row.get("kg_decision_path_bonus", 0.0),
                     "kg_graph_score": row.get("kg_graph_score", 0.0),
                     "kg_path_score": row.get("kg_path_score", 0.0),
                     "retrieval_source": row.get("retrieval_source", "vector"),
+                    "publication_number": row.get("publication_number", ""),
+                    "notice_example_publication_numbers": _json_list(row.get("notice_example_publication_numbers", [])),
                     "kg_candidate_reason": row.get("kg_candidate_reason", ""),
                     "kg_path": row.get("kg_path", ""),
                     "doc_id": row["doc_id"],
@@ -2082,6 +3021,13 @@ def evaluate_local_ted_cpv_classifier(
                 "llm_rerank_status": llm_rerank_result.status,
                 "llm_rerank_error": llm_rerank_result.error,
                 **classification_metrics,
+                "self_exclusion_enabled": self_exclusion,
+                "excluded_notice_example_rows": example_self_hit_rows_before_filter,
+                "self_examples_removed": self_examples_removed,
+                "top1_self_hit_before_filter": top1_self_hit_before_filter,
+                "top1_self_hit_after_filter": top1_self_hit_after_filter,
+                "any_self_hit_before_filter": any_self_hit_before_filter,
+                "any_self_hit_after_filter": any_self_hit_after_filter,
                 "answer_accuracy_label": classifier_auto_flag,
                 "expected_answerable": answer_metrics.expected_answerable,
                 "abstained": answer_metrics.abstained,
@@ -2132,6 +3078,13 @@ def evaluate_local_ted_cpv_classifier(
                 "query_augmentation_status": query_augmentation_result.status,
                 "llm_rerank_status": llm_rerank_result.status,
                 **classification_metrics,
+                "self_exclusion_enabled": self_exclusion,
+                "excluded_notice_example_rows": example_self_hit_rows_before_filter,
+                "self_examples_removed": self_examples_removed,
+                "top1_self_hit_before_filter": top1_self_hit_before_filter,
+                "top1_self_hit_after_filter": top1_self_hit_after_filter,
+                "any_self_hit_before_filter": any_self_hit_before_filter,
+                "any_self_hit_after_filter": any_self_hit_after_filter,
                 "program_id": "cpv",
                 "program_name": "CPV",
                 "doc_id": query.gold_cpv_code,
@@ -2166,6 +3119,13 @@ def evaluate_local_ted_cpv_classifier(
                 "primary_error_reason": diagnostics.primary_error_reason,
                 "secondary_error_reason": diagnostics.secondary_error_reason,
                 **cpv_rank_diagnostics,
+                "self_exclusion_enabled": self_exclusion,
+                "excluded_notice_example_rows": example_self_hit_rows_before_filter,
+                "self_examples_removed": self_examples_removed,
+                "top1_self_hit_before_filter": top1_self_hit_before_filter,
+                "top1_self_hit_after_filter": top1_self_hit_after_filter,
+                "any_self_hit_before_filter": any_self_hit_before_filter,
+                "any_self_hit_after_filter": any_self_hit_after_filter,
                 **cpv_graph_metrics,
                 "kg_candidate_added_codes": _json_list(cpv_graph_metrics.get("kg_candidate_added_codes")),
                 "kg_candidate_pool_codes": _json_list(cpv_graph_metrics.get("kg_candidate_pool_codes")),
@@ -2198,6 +3158,13 @@ def evaluate_local_ted_cpv_classifier(
                 "expected_keywords": json.dumps(item["expected_keywords"], ensure_ascii=False),
                 **classification_metrics,
                 **cpv_rank_diagnostics,
+                "self_exclusion_enabled": self_exclusion,
+                "excluded_notice_example_rows": example_self_hit_rows_before_filter,
+                "self_examples_removed": self_examples_removed,
+                "top1_self_hit_before_filter": top1_self_hit_before_filter,
+                "top1_self_hit_after_filter": top1_self_hit_after_filter,
+                "any_self_hit_before_filter": any_self_hit_before_filter,
+                "any_self_hit_after_filter": any_self_hit_after_filter,
                 **cpv_graph_metrics,
                 **_all_retrieval_metric_fields(retrieval_metrics),
                 **_all_answer_metric_fields(answer_metrics),
@@ -2212,6 +3179,8 @@ def evaluate_local_ted_cpv_classifier(
                 "base_retrieved_chunk_ids": json.dumps(
                     [row["chunk_id"] for row in base_retrieved[:top_k]], ensure_ascii=False
                 ),
+                "top1_notice_example_publication_numbers": _json_list(top1_publication_numbers),
+                "retrieved_notice_example_publication_numbers_at_k": _json_list(retrieved_publication_numbers),
                 "kg_candidate_added_codes": _json_list(cpv_graph_metrics.get("kg_candidate_added_codes")),
                 "kg_candidate_pool_codes": _json_list(cpv_graph_metrics.get("kg_candidate_pool_codes")),
                 "kg_top1_path": cpv_graph_metrics.get("kg_top1_path", ""),
@@ -2288,6 +3257,12 @@ def evaluate_local_ted_cpv_classifier(
     aggregate_retrieval_metrics = _cpv_retrieval_summary(retrieval_metric_rows)
     aggregate_diagnostics = summarize_diagnostics(diagnostic_rows)
     aggregate_cpv_diagnostics = _summarize_cpv_diagnostics(metric_rows, top_k=top_k)
+    self_hit_leakage = _summarize_self_hit_leakage(metric_rows)
+    evidence_graph_summary = build_cpv_evidence_graph_summary(
+        result_rows=result_rows,
+        ranking_rows=ranking_rows,
+        parent_lookup=parent_lookup,
+    )
     classifier_calibration = summarize_confidence_calibration(
         result_rows,
         confidence_key="prediction_confidence",
@@ -2296,10 +3271,13 @@ def evaluate_local_ted_cpv_classifier(
 
     retrieval_metrics_json = os.path.join(run_dir, "retrieval_metrics_summary.json")
     diagnostics_json = os.path.join(run_dir, "diagnostics_summary.json")
+    evidence_graph_json = os.path.join(run_dir, "evidence_graph_summary.json")
     with open(retrieval_metrics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_retrieval_metrics, f, ensure_ascii=False, indent=2)
     with open(diagnostics_json, "w", encoding="utf-8") as f:
         json.dump(aggregate_diagnostics, f, ensure_ascii=False, indent=2)
+    with open(evidence_graph_json, "w", encoding="utf-8") as f:
+        json.dump(evidence_graph_summary, f, ensure_ascii=False, indent=2)
 
     ranking_metrics = evaluate_ranked_predictions(
         build_items_from_cpv_queries(queries_path),
@@ -2319,9 +3297,14 @@ def evaluate_local_ted_cpv_classifier(
 
     summary = {
         "experiment": classifier_label,
-        "chunking_strategy": "cpv_profile_db",
+        "chunking_strategy": "cpv_notice_example_db" if cpv_notice_examples_channel else "cpv_profile_db",
         "retriever": retriever,
         "search_backend": retriever_state.get("search_backend", {"backend": "local", "index_name": None}),
+        "retrieval_channels": {
+            "profiles": True,
+            "notice_examples": cpv_notice_examples_channel,
+        },
+        "ted_notice_ingest": ted_notice_ingest_summary,
         "chunk_size": 0,
         "chunk_overlap": 0,
         "hybrid_alpha": None,
@@ -2347,16 +3330,18 @@ def evaluate_local_ted_cpv_classifier(
             "weight": llm_rerank_weight if llm_rerank else 0.0,
             "conditional": True if llm_rerank else False,
         },
-        "n_chunks": len(chunks),
+        "n_chunks": len(profile_chunks),
+        "n_notice_example_chunks": len(example_chunks),
         "n_questions": len(queries),
         "n_correct": int((results_df["auto_flag"] == "correct").sum()),
         "n_incorrect": int((results_df["auto_flag"] == "incorrect").sum()),
         "answer_metrics": aggregate_answer_metrics,
         "retrieval_metrics": aggregate_retrieval_metrics,
         "diagnostics": aggregate_diagnostics,
+        "evidence_graph": evidence_graph_summary,
         "llm": {
-            "enabled": base_llm_config.enabled or resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES or llm_rerank,
-            "model": base_llm_config.model if (base_llm_config.enabled or resolved_query_augmentation in LLM_QUERY_AUGMENTATION_MODES or llm_rerank) else None,
+            "enabled": base_llm_config.enabled or resolved_query_augmentation in QUERY_AUGMENTATION_MODES or llm_rerank,
+            "model": base_llm_config.model if (base_llm_config.enabled or resolved_query_augmentation in QUERY_AUGMENTATION_MODES or llm_rerank) else None,
             "answer_generation": False,
         },
         "evaluation_settings": {
@@ -2364,18 +3349,32 @@ def evaluate_local_ted_cpv_classifier(
             "query_augmentation_max_terms": query_augmentation_max_terms,
             "query_cleaning": True,
             "contract_type_aware_rerank": True,
+            "cpv_notice_examples_channel": cpv_notice_examples_channel,
+            "self_exclusion": self_exclusion,
+            "profiles_notice_examples_fusion": True if cpv_notice_examples_channel else False,
+            "canonical_profile_rerank": True,
+            "specificity_bias": True,
+            "branch_local_selector": True,
+            "canonical_only_shortlist_selector": True,
+            "shortlist_final_selector": True,
+            "division_72_contrastive_selector": True,
+            "kg_decision_fusion": True if kg_enabled else False,
+            "export_kg_for_neo4j": True if kg_neo4j_export else False,
         },
         "classifier": {
             "type": "ted_cpv",
             "label": classifier_label,
-            "use_examples": use_examples,
+            "use_examples": True,
+            "retrieval_channel_mode": "profiles_notice_examples_fusion" if cpv_notice_examples_channel else "profiles",
             "kg": {
                 "enabled": kg_enabled,
                 "type": "cpv_taxonomy_graph",
                 "graph_weight": kg_graph_weight if kg_enabled else None,
                 "profile": kg_profile if kg_enabled else None,
                 "algorithm": kg_algorithm if kg_enabled else None,
+                "decision_fusion": True if kg_enabled else False,
                 "n_nodes": len(cpv_graph.nodes) if cpv_graph is not None else 0,
+                "neo4j_export": kg_neo4j_export,
             },
             "avg_top1_top2_margin": (
                 sum(top1_top2_margins) / len(top1_top2_margins) if top1_top2_margins else None
@@ -2384,6 +3383,7 @@ def evaluate_local_ted_cpv_classifier(
             "ranking_metrics": ranking_metrics,
             "calibration": classifier_calibration,
             "cpv_diagnostics": aggregate_cpv_diagnostics,
+            "self_hit_leakage": self_hit_leakage,
         },
         "visualization": {
             "enabled": create_visualization or create_showcase,
@@ -2406,6 +3406,12 @@ def evaluate_local_ted_cpv_classifier(
             "retrieval_metrics_summary_json": retrieval_metrics_json,
             "diagnostics_csv": diagnostics_csv,
             "diagnostics_summary_json": diagnostics_json,
+            "evidence_graph_summary_json": evidence_graph_json,
+            "cpv_kg_neo4j_dir": kg_neo4j_export.get("out_dir") if kg_neo4j_export else None,
+            "cpv_kg_neo4j_nodes_csv": kg_neo4j_export.get("nodes_csv") if kg_neo4j_export else None,
+            "cpv_kg_neo4j_edges_csv": kg_neo4j_export.get("edges_csv") if kg_neo4j_export else None,
+            "cpv_kg_neo4j_import_cypher": kg_neo4j_export.get("import_cypher") if kg_neo4j_export else None,
+            "cpv_kg_neo4j_readme_md": kg_neo4j_export.get("readme_md") if kg_neo4j_export else None,
             "strategy_score_profile_svg": None,
             "strategy_chunk_alignment_svg": None,
             "strategy_metric_overview_svg": None,
@@ -2457,7 +3463,7 @@ def evaluate_prepared_rag_results_classifier(
         raise ValueError(f"No data rows found in {prepared_results_path}.")
 
     catalog = load_cpv_catalog_from_ted_corpus_export(ted_corpus_export_path)
-    catalog_chunks = build_cpv_chunks(catalog, use_examples=True)
+    catalog_chunks = build_cpv_chunks(catalog)
     parent_lookup = build_parent_lookup(catalog)
     catalog_by_code = {record.code: record for record in catalog}
     label_by_code = {record.code: record.label for record in catalog}
@@ -3057,7 +4063,7 @@ def evaluate_api_ted_cpv_classifier(
 
     catalog = load_cpv_catalog_from_ted_corpus_export(ted_corpus_export_path)
     queries = load_queries(queries_path)
-    catalog_chunks = build_cpv_chunks(catalog, use_examples=True)
+    catalog_chunks = build_cpv_chunks(catalog)
     parent_lookup = build_parent_lookup(catalog)
     catalog_by_code = {record.code: record for record in catalog}
     label_by_code = {record.code: record.label for record in catalog}

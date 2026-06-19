@@ -213,11 +213,11 @@ def parse_pdf_sections(pdf_path: str, docs_root: str | None = None) -> Tuple[str
 
 def extract_paragraphs(sections: Sequence[Section]) -> List[Paragraph]:
     paragraphs: List[Paragraph] = []
-    for section in sections:
+    for section_position, section in enumerate(sections):
         for idx, paragraph_text in enumerate(split_paragraphs(section.text)):
             paragraphs.append(
                 Paragraph(
-                    paragraph_id=f"{section.doc_id}|{section.section_id}|p{idx}",
+                    paragraph_id=f"{section.doc_id}|s{section_position}|{section.section_id}|p{idx}",
                     doc_id=section.doc_id,
                     doc_path=section.doc_path,
                     program_id=section.program_id,

@@ -359,7 +359,7 @@ def build_cpv_catalog_rows_from_notices(
     notices: Sequence[Dict],
     *,
     min_examples_per_cpv: int = 1,
-    max_examples_per_cpv: int = 8,
+    max_examples_per_cpv: int = 12,
 ) -> List[Dict[str, str]]:
     examples_by_cpv: Dict[str, List[str]] = defaultdict(list)
     cpv_labels: Dict[str, str] = {}
@@ -396,7 +396,7 @@ def build_cpv_catalog_rows_from_corpus_export(
     path: str,
     *,
     min_examples_per_cpv: int = 1,
-    max_examples_per_cpv: int = 8,
+    max_examples_per_cpv: int = 12,
 ) -> List[Dict[str, str]]:
     notices = load_ted_corpus_export_notices(path)
     return build_cpv_catalog_rows_from_notices(
@@ -411,7 +411,7 @@ def transform_ted_notices_to_cpv_split_dataset(
     *,
     train_ratio: float = 0.8,
     min_examples_per_cpv: int = 1,
-    max_examples_per_cpv: int = 8,
+    max_examples_per_cpv: int = 12,
     max_queries: int = 100,
 ) -> tuple[list[Dict], list[Dict], Dict[str, object]]:
     train_notice_count = 0
