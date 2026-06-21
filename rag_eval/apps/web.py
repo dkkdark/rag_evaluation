@@ -230,7 +230,6 @@ def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     if not bool_flag(active, "cross_encoder_rerank"):
         active.pop("cross_encoder_model", None)
-        active.pop("cross_encoder_top_n", None)
     if not bool_flag(active, "llm_rerank"):
         active.pop("llm_rerank_top_n", None)
         active.pop("llm_rerank_weight", None)
@@ -365,8 +364,8 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--kg-ablation-edge-dropouts": payload.get("kg_ablation_edge_dropouts"),
         "--rerank-top-n": payload.get("rerank_top_n"),
         "--rerank-weight": payload.get("rerank_weight"),
+        "--candidate-k": payload.get("candidate_k"),
         "--cross-encoder-model": payload.get("cross_encoder_model"),
-        "--cross-encoder-top-n": payload.get("cross_encoder_top_n"),
         "--llm-rerank-top-n": payload.get("llm_rerank_top_n"),
         "--llm-rerank-weight": payload.get("llm_rerank_weight"),
         "--weight-answer": payload.get("weight_answer"),
@@ -395,12 +394,13 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--export-kg-for-neo4j": "export_kg_for_neo4j",
         "--cross-encoder-rerank": "cross_encoder_rerank",
         "--llm-rerank": "llm_rerank",
-        "--cpv-notice-examples-channel": "cpv_notice_examples_channel",
         "--disable-self-exclusion": "disable_self_exclusion",
     }
     for flag, key in flags.items():
         if bool_flag(payload, key):
             command.append(flag)
+    if is_document_classifier and "domain_specific_logic" in payload and not bool_flag(payload, "domain_specific_logic"):
+        command.append("--disable-domain-specific-logic")
     return command
 
 
@@ -1765,7 +1765,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="grid setting-group" data-show-for="ted_cpv" style="margin-top:10px">
-            <label class="check" style="grid-column:1/-1"><input type="checkbox" name="cpv_notice_examples_channel" /> Notice examples retrieval channel <span class="hint" title="Retrieve over cpv_notice_examples as a separate TED/CPV channel instead of relying only on cpv_profiles.">i</span></label>
+            <div class="meta" style="grid-column:1/-1">Notice-example fusion is always on for the local TED/CPV classifier. The current query notice is excluded by default for honest evaluation.</div>
             <label class="check" style="grid-column:1/-1"><input type="checkbox" name="disable_self_exclusion" /> Disable self-exclusion for notice examples <span class="hint" title="Leave this unchecked for honest evaluation. When unchecked, the current query notice is excluded from notice-example retrieval by publication_number.">i</span></label>
           </div>
 
@@ -1788,8 +1788,8 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="grid setting-group" data-show-for="ted_cpv" style="margin-top:10px">
+            <label><span class="label-row">Candidate pool size <span class="hint" title="How many CPV candidates to keep before soft hierarchy selection and final reranking. Leave empty for automatic sizing.">i</span></span><input name="candidate_k" type="number" min="1" placeholder="auto" /></label>
             <label class="check" style="grid-column:1/-1"><input type="checkbox" name="cross_encoder_rerank" /> Cross-encoder rerank <span class="hint" title="Rerank the top-N CPV candidates with a cross-encoder after retrieval and KG.">i</span></label>
-            <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder top N <span class="hint" title="How many top candidates the cross-encoder may inspect.">i</span></span><input name="cross_encoder_top_n" type="number" min="1" value="10" /></label>
             <label data-show-if="cross_encoder_rerank" class="inactive-field"><span class="label-row">Cross-encoder model <span class="hint" title="HuggingFace cross-encoder model. Leave empty for the default multilingual model.">i</span></span><input name="cross_encoder_model" placeholder="Alibaba-NLP/gte-multilingual-reranker-base" /></label>
             <label class="check" style="grid-column:1/-1"><input type="checkbox" name="llm_rerank" /> LLM rerank <span class="hint" title="Rerank top CPV candidates with the configured OpenAI model after retrieval and optional cross-encoder.">i</span></label>
             <label data-show-if="llm_rerank" class="inactive-field"><span class="label-row">LLM rerank top N <span class="hint" title="How many top candidates to pass to the LLM reranker. Shortlists around 5-8 are usually safer than 30.">i</span></span><input name="llm_rerank_top_n" type="number" min="1" value="8" /></label>
@@ -1832,6 +1832,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="checks setting-group" data-show-for="document_qa examination_regulations sweep">
             <label class="check"><input type="checkbox" name="llm_enable" /> LLM answers <span class="hint" title="Generate grounded answers from retrieved chunks instead of extractive fallback only.">i</span></label>
             <label class="check"><input type="checkbox" name="judge_enable" /> LLM judge <span class="hint" title="Use an LLM judge for claim-level support and contradiction metrics.">i</span></label>
+            <label class="check"><input type="checkbox" name="domain_specific_logic" checked /> Domain-specific logic <span class="hint" title="Enable regulation-specific heuristics such as year/program-aware document scoping, base-vs-amendment preference, and related KG quality hints.">i</span></label>
             <label class="check"><input type="checkbox" name="abstain_on_weak_evidence" /> Abstain weak <span class="hint" title="Abstain when runtime retrieval signals say evidence is weak or missing.">i</span></label>
             <label class="check"><input type="checkbox" name="self_rag_retry_on_weak_evidence" /> Self-RAG retry <span class="hint" title="Rewrite the query and retrieve again when runtime evidence is weak before answering.">i</span></label>
             <label class="check"><input type="checkbox" name="self_rag_critique" /> Self-RAG critique <span class="hint" title="Critique and revise generated answers against retrieved context before scoring.">i</span></label>
@@ -1958,10 +1959,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!payload.kg_enable) {
         ["kg_graph_weight","kg_profile","kg_algorithm","kg_max_added_chunks","kg_ppr_iterations","kg_ppr_damping","kg_quality_threshold","kg_intent_weight","kg_ablation_edge_dropouts"].forEach(key => delete payload[key]);
       }
-      if (!payload.cross_encoder_rerank) {
-        delete payload.cross_encoder_model;
-        delete payload.cross_encoder_top_n;
-      }
+      if (!payload.cross_encoder_rerank) delete payload.cross_encoder_model;
       if (!payload.llm_rerank) {
         delete payload.llm_rerank_top_n;
         delete payload.llm_rerank_weight;
@@ -2033,7 +2031,7 @@ INDEX_HTML = r"""<!doctype html>
           payload.retriever = "tfidf";
         }
       }
-      for (const key of ["top_k","chunk_size","overlap","rerank_top_n","cross_encoder_top_n","llm_rerank_top_n","self_rag_retry_max_attempts"]) payload[key] = Number(payload[key] || 0);
+      for (const key of ["top_k","chunk_size","overlap","rerank_top_n","candidate_k","llm_rerank_top_n","self_rag_retry_max_attempts"]) payload[key] = Number(payload[key] || 0);
       for (const key of ["rerank_weight","hybrid_alpha","llm_rerank_weight"]) {
         if (key in payload) payload[key] = Number(payload[key] || 0);
       }
@@ -2211,14 +2209,72 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function collectRecommendations(summary) {
+      const bestExperiment = bestExperimentSummary(summary);
       const design = summary.design_attribution || (summary.classifier_summary && summary.classifier_summary.design_attribution) || {};
       const rootCauses = design.root_cause_recommendations || [];
-      const advisor = (summary.classifier_summary && summary.classifier_summary.advisor) || {};
-      const classifierSummary = summary.classifier_summary || {};
+      const advisor = bestExperiment.advisor || (summary.classifier_summary && summary.classifier_summary.advisor) || {};
+      const classifierSummary = bestExperiment.experiment ? bestExperiment : (summary.classifier_summary || {});
       const evidenceGraph = classifierSummary.evidence_graph || {};
       const evidenceRates = evidenceGraph.rates || {};
       const componentSignals = evidenceGraph.component_signals || {};
+      const graphAwareModes = Array.isArray(evidenceGraph.graph_aware_failure_modes) ? evidenceGraph.graph_aware_failure_modes : [];
       const experiments = summary.experiments || [];
+      const graphModeTemplates = {
+        gold_section_missing: {
+          component: "graph_coverage",
+          issue: "Graph-aware QA · gold section missing",
+          recommendation: "The required regulation section often never enters the retrieved context. Focus first on section-level retrieval coverage rather than answer prompting.",
+          next_experiment: "Increase top-k and compare section-title-aware BM25/hybrid retrieval on the same questions.",
+        },
+        gold_path_missing: {
+          component: "graph_coverage",
+          issue: "Graph-aware QA · gold evidence path missing",
+          recommendation: "The linked evidence path is missing even when related material is retrieved. Improve bridge retrieval before changing answer formatting.",
+          next_experiment: "Compare KG-organized context and higher-recall retrieval on multi-hop or relation questions.",
+        },
+        gold_section_present_not_used: {
+          component: "answer_synthesis",
+          issue: "Graph-aware QA · gold section present but not used",
+          recommendation: "The correct section is present, but the answer does not use it reliably. This points to context selection or synthesis rather than pure retrieval.",
+          next_experiment: "Freeze retrieval and compare grounded_llm against cite_first and claim_checklist on these rows.",
+        },
+        same_branch_wrong_rule: {
+          component: "context_selection",
+          issue: "Graph-aware QA · same branch, wrong rule",
+          recommendation: "The system retrieves a related rule but still resolves the wrong legal provision. Add same-document rule disambiguation.",
+          next_experiment: "Contrast nearby sections explicitly, especially for exam-form, deadline, and requirement questions.",
+        },
+        wrong_version_branch: {
+          component: "context_selection",
+          issue: "Graph-aware QA · wrong version branch",
+          recommendation: "The answer appears to be built from the wrong regulation version or amendment branch. Add stronger version-aware filtering or reranking.",
+          next_experiment: "Compare base-MPO-only retrieval against version-aware reranking for cohort-sensitive questions.",
+        },
+        missing_bridge_fact: {
+          component: "bridge_composition",
+          issue: "Graph-aware QA · missing bridge fact",
+          recommendation: "One required fact is present but the linked consequence or condition is not assembled. This is a multi-hop composition issue.",
+          next_experiment: "Evaluate multi-hop questions with KG-organized context and checklist-style answer prompts.",
+        },
+        graph_supported_false_refusal: {
+          component: "refusal_policy",
+          issue: "Graph-aware QA · graph-supported false refusal",
+          recommendation: "The evidence graph indicates support, but the system still refuses. Revisit weak-evidence thresholds on this subset.",
+          next_experiment: "Audit abstention thresholds only on graph-supported refusal rows.",
+        },
+        graph_supported_incomplete_answer: {
+          component: "answer_synthesis",
+          issue: "Graph-aware QA · graph-supported incomplete answer",
+          recommendation: "The graph shows that relevant evidence was available, but the final answer remains incomplete. Retrieval is not the only bottleneck here.",
+          next_experiment: "Keep retrieval fixed and compare answer prompts that force claim coverage.",
+        },
+        graph_noise_error: {
+          component: "graph_noise",
+          issue: "Graph-aware QA · graph noise",
+          recommendation: "KG expansion is introducing noisy or weakly relevant evidence. Constrain graph additions before passing context to the generator.",
+          next_experiment: "Compare safe_branch against more conservative graph expansion profiles on the same rows.",
+        },
+      };
       function inferRecommendationSource(item) {
         if (item.recommendation_source) return item.recommendation_source;
         const component = String(item.component || "");
@@ -2263,6 +2319,29 @@ INDEX_HTML = r"""<!doctype html>
           .concat(advisor.summary_recommendations || [])
           .concat(advisor.top_recommendations || []);
       }
+      items = items.concat(
+        graphAwareModes
+          .filter(item => Number(item.rate || 0) > 0)
+          .map(item => {
+            const mode = String(item.mode || "");
+            const template = graphModeTemplates[mode] || {
+              component: "graph_aware",
+              issue: `Graph-aware QA · ${mode || "failure mode"}`,
+              recommendation: "Inspect this graph-aware error mode before changing the next experiment broadly.",
+              next_experiment: "Validate the mode on the affected rows and compare against a controlled ablation.",
+            };
+            return {
+              recommendation_source: "Graph-aware",
+              priority: Number(item.rate || 0) >= 0.2 ? "P2" : "P3",
+              component: template.component,
+              issue: template.issue,
+              n_cases: item.count,
+              evidence: `rate=${fmt(item.rate)}; count=${fmt(item.count)}`,
+              recommendation: template.recommendation,
+              next_experiment: template.next_experiment,
+            };
+          })
+      );
       const seen = new Set();
       return items.filter(item => {
         const source = inferRecommendationSource(item);

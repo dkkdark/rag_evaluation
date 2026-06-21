@@ -364,6 +364,42 @@ def _catalog_fingerprint(records: Sequence[CPVRecord]) -> str:
     return digest.hexdigest()
 
 
+def _ancestor_path_codes(code: str, parent_lookup: Dict[str, str]) -> List[str]:
+    normalized = str(code or "").strip()
+    if not normalized:
+        return []
+    path: List[str] = []
+    seen: set[str] = set()
+    current = normalized
+    while current and current not in seen:
+        seen.add(current)
+        path.append(current)
+        current = parent_lookup.get(current, "")
+    path.reverse()
+    return path
+
+
+def _taxonomy_profile_text(profile: Dict[str, object]) -> str:
+    return "\n".join(
+        part
+        for part in [
+            f"Code: {str(profile.get('code') or '')}".strip(),
+            f"Label: {str(profile.get('label') or '')}".strip(),
+            f"Description: {str(profile.get('description_en') or '')}".strip() if str(profile.get("description_en") or "").strip() else "",
+            f"Hierarchy path: {str(profile.get('hierarchy_path_text') or '')}".strip() if str(profile.get("hierarchy_path_text") or "").strip() else "",
+            f"Parent: {str(profile.get('parent_label') or '')}".strip() if str(profile.get("parent_label") or "").strip() else "",
+            f"Procurement type: {str(profile.get('procurement_type') or '')}".strip() if str(profile.get("procurement_type") or "").strip() else "",
+            str(profile.get("use_when_text") or ""),
+            str(profile.get("do_not_use_when_text") or ""),
+            f"Related terms: {str(profile.get('keywords_en') or '')}".strip() if str(profile.get("keywords_en") or "").strip() else "",
+            f"Multilingual labels: {str(profile.get('generated_synonyms_en') or '')}".strip() if str(profile.get("generated_synonyms_en") or "").strip() else "",
+            f"Sibling distinctions: {' | '.join(str(item) for item in profile.get('sibling_labels', []) if str(item).strip())}" if profile.get("sibling_labels") else "",
+            f"Children: {' | '.join(str(item) for item in profile.get('children_labels', []) if str(item).strip())}" if profile.get("children_labels") else "",
+        ]
+        if str(part).strip()
+    )
+
+
 def _build_cpv_profiles(
     records: Sequence[CPVRecord],
     *,
@@ -371,6 +407,7 @@ def _build_cpv_profiles(
     ted_notice_examples_limit: int = 12,
 ) -> List[Dict[str, object]]:
     label_by_code = {record.code: record.label for record in records}
+    parent_lookup = build_parent_lookup(records)
     children_by_parent: Dict[str, List[CPVRecord]] = {}
     for record in records:
         if record.parent_code:
@@ -383,6 +420,13 @@ def _build_cpv_profiles(
     profiles: List[Dict[str, object]] = []
     for record in records:
         parent_label = label_by_code.get(record.parent_code, "")
+        hierarchy_path_codes = _ancestor_path_codes(record.code, parent_lookup)
+        hierarchy_path_labels = [label_by_code.get(code, code) for code in hierarchy_path_codes]
+        hierarchy_path_text = " > ".join(
+            f"{code} {label}".strip()
+            for code, label in zip(hierarchy_path_codes, hierarchy_path_labels)
+            if code or label
+        )
         children = children_by_parent.get(record.code, [])
         siblings = [child for child in children_by_parent.get(record.parent_code, []) if child.code != record.code]
         notice_examples = ted_examples_by_cpv.get(record.code, [])
@@ -406,25 +450,32 @@ def _build_cpv_profiles(
         children_codes = [child.code for child in children[:8]]
         sibling_labels = [sibling.label for sibling in siblings[:8]]
         sibling_codes = [sibling.code for sibling in siblings[:8]]
-        text_parts = [
+        representative_notice_example_text = notice_examples[0] if notice_examples else (merged_examples[0] if merged_examples else "")
+        taxonomy_text_parts = [
             f"Code: {record.code}",
             f"Label: {record.label}",
             f"Description: {record.description}" if record.description else "",
+            f"Hierarchy path: {hierarchy_path_text}" if hierarchy_path_text else "",
             f"Multilingual labels: {' | '.join(record.multilingual_labels[:8])}" if record.multilingual_labels else "",
             f"Parent: {parent_label}" if parent_label else "",
             f"Procurement type: {procurement_type}",
             use_when,
             do_not_use_when,
-            f"Common tender phrases: {' | '.join(common_phrases)}" if common_phrases else "",
             f"Related terms: {keywords_en}" if keywords_en else "",
             f"Sibling distinctions: {' | '.join(sibling_labels[:8])}" if sibling_labels else "",
             f"Children: {' | '.join(children_labels[:8])}" if children_labels else "",
+        ]
+        text_parts = [
+            *taxonomy_text_parts,
+            f"Common tender phrases: {' | '.join(common_phrases)}" if common_phrases else "",
+            f"Representative notice example: {representative_notice_example_text}" if representative_notice_example_text else "",
         ]
         search_text_en = "\n".join(
             part for part in [
                 record.code,
                 record.label,
                 record.description,
+                hierarchy_path_text,
                 " | ".join(record.multilingual_labels),
                 parent_label,
                 procurement_type,
@@ -454,25 +505,31 @@ def _build_cpv_profiles(
                 str(override.get("common_tender_phrases") or "").split(" | "),
                 limit=8,
             ) or common_phrases
-            text_parts = [
+            taxonomy_text_parts = [
                 f"Code: {record.code}",
                 f"Label: {record.label}",
                 f"Description: {description_en}" if description_en else "",
+                f"Hierarchy path: {hierarchy_path_text}" if hierarchy_path_text else "",
                 f"Multilingual labels: {' | '.join(record.multilingual_labels[:8])}" if record.multilingual_labels else "",
                 f"Parent: {parent_label}" if parent_label else "",
                 f"Procurement type: {procurement_type}",
                 use_when,
                 do_not_use_when,
-                f"Common tender phrases: {' | '.join(common_phrases)}" if common_phrases else "",
                 f"Related terms: {keywords_en}" if keywords_en else "",
                 f"Sibling distinctions: {' | '.join(sibling_labels[:8])}" if sibling_labels else "",
                 f"Children: {' | '.join(children_labels[:8])}" if children_labels else "",
+            ]
+            text_parts = [
+                *taxonomy_text_parts,
+                f"Common tender phrases: {' | '.join(common_phrases)}" if common_phrases else "",
+                f"Representative notice example: {representative_notice_example_text}" if representative_notice_example_text else "",
             ]
             search_text_en = "\n".join(
                 part for part in [
                     record.code,
                     record.label,
                     description_en,
+                    hierarchy_path_text,
                     " | ".join(record.multilingual_labels),
                     parent_label,
                     procurement_type,
@@ -501,6 +558,9 @@ def _build_cpv_profiles(
                 "description_en": description_en,
                 "parent_code": record.parent_code,
                 "parent_label": parent_label,
+                "hierarchy_path_codes": hierarchy_path_codes,
+                "hierarchy_path_labels": hierarchy_path_labels,
+                "hierarchy_path_text": hierarchy_path_text,
                 "procurement_type": procurement_type,
                 "keywords_en": keywords_en,
                 "generated_synonyms_en": multilingual_aliases,
@@ -511,8 +571,10 @@ def _build_cpv_profiles(
                 "children_labels": children_labels,
                 "sibling_codes": sibling_codes,
                 "sibling_labels": sibling_labels,
+                "taxonomy_text": "\n".join(part for part in taxonomy_text_parts if part.strip()),
                 "examples": merged_examples,
                 "notice_examples": notice_examples[:ted_notice_examples_limit],
+                "representative_notice_example_text": representative_notice_example_text,
                 "text": "\n".join(part for part in text_parts if part.strip()),
                 "search_text_en": search_text_en,
                 "search_text_multilingual": search_text_multilingual,
@@ -574,11 +636,51 @@ def load_cpv_catalog_from_ted_corpus_export(
     return _load_legacy_cpv_rows(rows)
 
 
+def merge_cpv_catalogs(
+    official_records: Sequence[CPVRecord],
+    ted_records: Sequence[CPVRecord],
+) -> List[CPVRecord]:
+    official_by_code = {record.code: record for record in official_records if str(record.code).strip()}
+    ted_by_code = {record.code: record for record in ted_records if str(record.code).strip()}
+    merged_codes = sorted(set(official_by_code.keys()) | set(ted_by_code.keys()))
+    merged: List[CPVRecord] = []
+    for code in merged_codes:
+        official = official_by_code.get(code)
+        ted = ted_by_code.get(code)
+        base = official or ted
+        if base is None:
+            continue
+        merged.append(
+            CPVRecord(
+                code=code,
+                label=(
+                    str((official.label if official and official.label else "") or (ted.label if ted else "")).strip()
+                    or code
+                ),
+                description=(
+                    str((official.description if official and official.description else "") or (ted.description if ted else "")).strip()
+                    or str((official.label if official and official.label else "") or (ted.label if ted else "")).strip()
+                    or code
+                ),
+                parent_code=str((official.parent_code if official and official.parent_code else "") or (ted.parent_code if ted else "")).strip(),
+                examples=_unique_texts(list(ted.examples if ted else []) + list(official.examples if official else []), limit=12),
+                multilingual_labels=_unique_texts(list(official.multilingual_labels if official else []) + list(ted.multilingual_labels if ted else []), limit=24),
+            )
+        )
+    return merged
+
+
 def build_cpv_chunks_from_db(path: str) -> List[Dict]:
     profiles = load_cpv_profiles(path)
     chunks: List[Dict] = []
     for index, profile in enumerate(profiles):
         examples = [str(item).strip() for item in profile.get("examples", []) if str(item).strip()]
+        taxonomy_text = str(profile.get("taxonomy_text") or _taxonomy_profile_text(profile))
+        representative_notice_example_text = str(
+            profile.get("representative_notice_example_text")
+            or next((str(item).strip() for item in profile.get("notice_examples", []) if str(item).strip()), "")
+            or (examples[0] if examples else "")
+        )
         chunks.append(
             {
                 "chunk_id": str(profile.get("code") or ""),
@@ -589,13 +691,16 @@ def build_cpv_chunks_from_db(path: str) -> List[Dict]:
                 "program_name": "CPV",
                 "section_id": str(profile.get("code") or ""),
                 "title": str(profile.get("label") or ""),
-                "text": str(profile.get("text") or ""),
+                "text": str(profile.get("text") or taxonomy_text),
                 "chunking_strategy": "cpv_profile_db",
                 "source_type": "cpv_profiles_db",
                 "cpv_code": str(profile.get("code") or ""),
                 "cpv_label": str(profile.get("label") or ""),
                 "cpv_parent_code": str(profile.get("parent_code") or ""),
                 "cpv_parent_label": str(profile.get("parent_label") or ""),
+                "cpv_hierarchy_path_codes": " | ".join(str(item) for item in profile.get("hierarchy_path_codes", []) if str(item).strip()),
+                "cpv_hierarchy_path_labels": " | ".join(str(item) for item in profile.get("hierarchy_path_labels", []) if str(item).strip()),
+                "cpv_hierarchy_path_text": str(profile.get("hierarchy_path_text") or ""),
                 "description_en": str(profile.get("description_en") or ""),
                 "description_multilingual_aliases": str(profile.get("generated_synonyms_en") or ""),
                 "generated_synonyms_en": str(profile.get("generated_synonyms_en") or ""),
@@ -608,6 +713,8 @@ def build_cpv_chunks_from_db(path: str) -> List[Dict]:
                 "children_labels": " | ".join(str(item) for item in profile.get("children_labels", []) if str(item).strip()),
                 "sibling_labels": " | ".join(str(item) for item in profile.get("sibling_labels", []) if str(item).strip()),
                 "examples_text": " | ".join(examples),
+                "representative_notice_example_text": representative_notice_example_text,
+                "taxonomy_text": taxonomy_text,
                 "notice_examples_count": len([item for item in profile.get("notice_examples", []) if str(item).strip()]),
                 "search_text_en": str(profile.get("search_text_en") or ""),
                 "search_text_multilingual": str(profile.get("search_text_multilingual") or ""),
@@ -634,6 +741,7 @@ def build_cpv_notice_example_chunks_from_db(
         if not examples:
             continue
         for example_index, example_text in enumerate(examples):
+            taxonomy_text = str(profile.get("taxonomy_text") or _taxonomy_profile_text(profile))
             chunks.append(
                 {
                     "chunk_id": f"{cpv_code}::notice_example::{example_index + 1}",
@@ -652,6 +760,9 @@ def build_cpv_notice_example_chunks_from_db(
                     "cpv_label": str(profile.get("label") or ""),
                     "cpv_parent_code": str(profile.get("parent_code") or ""),
                     "cpv_parent_label": str(profile.get("parent_label") or ""),
+                    "cpv_hierarchy_path_codes": " | ".join(str(item) for item in profile.get("hierarchy_path_codes", []) if str(item).strip()),
+                    "cpv_hierarchy_path_labels": " | ".join(str(item) for item in profile.get("hierarchy_path_labels", []) if str(item).strip()),
+                    "cpv_hierarchy_path_text": str(profile.get("hierarchy_path_text") or ""),
                     "description_en": str(profile.get("description_en") or ""),
                     "description_multilingual_aliases": str(profile.get("generated_synonyms_en") or ""),
                     "generated_synonyms_en": str(profile.get("generated_synonyms_en") or ""),
@@ -664,6 +775,8 @@ def build_cpv_notice_example_chunks_from_db(
                     "children_labels": " | ".join(str(item) for item in profile.get("children_labels", []) if str(item).strip()),
                     "sibling_labels": " | ".join(str(item) for item in profile.get("sibling_labels", []) if str(item).strip()),
                     "examples_text": example_text,
+                    "representative_notice_example_text": example_text,
+                    "taxonomy_text": taxonomy_text,
                     "notice_examples_count": len(examples),
                     "notice_example_publication_numbers": publication_numbers,
                     "search_text_en": "\n".join(
@@ -671,6 +784,7 @@ def build_cpv_notice_example_chunks_from_db(
                         for part in [
                             cpv_code,
                             str(profile.get("label") or ""),
+                            str(profile.get("hierarchy_path_text") or ""),
                             example_text,
                             str(profile.get("keywords_en") or ""),
                             str(profile.get("use_when_text") or ""),
@@ -683,7 +797,7 @@ def build_cpv_notice_example_chunks_from_db(
                         for part in [
                             cpv_code,
                             str(profile.get("label") or ""),
-                            str(profile.get("search_text_multilingual") or ""),
+                            taxonomy_text,
                             example_text,
                         ]
                         if str(part).strip()
@@ -749,6 +863,8 @@ def build_cpv_chunks(
                 "children_labels": " | ".join(str(item) for item in profile.get("children_labels", []) if str(item).strip()),
                 "sibling_labels": " | ".join(str(item) for item in profile.get("sibling_labels", []) if str(item).strip()),
                 "examples_text": " | ".join(str(item) for item in profile.get("examples", []) if str(item).strip()),
+                "representative_notice_example_text": str(profile.get("representative_notice_example_text") or ""),
+                "taxonomy_text": str(profile.get("taxonomy_text") or ""),
                 "notice_examples_count": len([item for item in profile.get("notice_examples", []) if str(item).strip()]),
                 "search_text_en": str(profile.get("search_text_en") or ""),
                 "search_text_multilingual": str(profile.get("search_text_multilingual") or ""),

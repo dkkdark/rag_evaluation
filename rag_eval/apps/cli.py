@@ -60,6 +60,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to questions JSON. Defaults to data/questions_by_file.json.",
     )
     parser.add_argument(
+        "--disable-domain-specific-logic",
+        action="store_true",
+        help="Disable domain-specific document QA heuristics such as year/program-aware document scoping and regulation-specific file preference.",
+    )
+    parser.add_argument(
         "--cpv-catalog",
         default=TED_DEFAULT_CORPUS_EXPORT_PATH,
         help="teddata corpus export CSV used to rebuild CPV profiles on the fly for TED/CPV evaluation.",
@@ -195,10 +200,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Cross-encoder model id (default: Alibaba-NLP/gte-multilingual-reranker-base).",
     )
     parser.add_argument(
-        "--cross-encoder-top-n",
+        "--candidate-k",
         type=int,
-        default=10,
-        help="How many top candidates to pass to the cross-encoder reranker.",
+        default=None,
+        help="Optional TED/CPV candidate-pool size before soft hierarchy selection and final reranking.",
     )
     parser.add_argument(
         "--llm-rerank",
@@ -775,7 +780,7 @@ def run_classifier_mode(args) -> Dict:
             rerank_weight=args.rerank_weight,
             cross_encoder_rerank=args.cross_encoder_rerank,
             cross_encoder_model=args.cross_encoder_model,
-            cross_encoder_top_n=args.cross_encoder_top_n,
+            candidate_k=args.candidate_k,
             llm_rerank=args.llm_rerank,
             llm_rerank_top_n=args.llm_rerank_top_n,
             llm_rerank_weight=args.llm_rerank_weight,
@@ -786,7 +791,7 @@ def run_classifier_mode(args) -> Dict:
             llm_config=build_llm_config_from_args(args),
             query_augmentation=args.query_augmentation,
             query_augmentation_max_terms=args.query_augmentation_max_terms,
-            cpv_notice_examples_channel=args.cpv_notice_examples_channel,
+            cpv_notice_examples_channel=True,
             self_exclusion=not args.disable_self_exclusion,
             search_backend_config=search_backend_config,
             search_index_name=None,
@@ -810,7 +815,9 @@ def run_classifier_mode(args) -> Dict:
             "cross_encoder_reranker": {
                 "enabled": args.cross_encoder_rerank,
                 "model": args.cross_encoder_model,
-                "top_n": args.cross_encoder_top_n,
+            },
+            "candidate_pool": {
+                "size": args.candidate_k,
             },
             "llm_reranker": {
                 "enabled": args.llm_rerank,
@@ -939,6 +946,7 @@ def run_classifier_mode(args) -> Dict:
         rerank_weight=args.rerank_weight,
         search_backend_config=search_backend_config,
         search_index_name=None,
+        domain_specific_logic=not args.disable_domain_specific_logic,
         )
 
     if not args.kg_enable:
@@ -990,6 +998,7 @@ def run_classifier_mode(args) -> Dict:
             "query_augmentation": args.query_augmentation,
             "self_rag_retry_on_weak_evidence": args.self_rag_retry_on_weak_evidence,
             "self_rag_critique": args.self_rag_critique,
+            "domain_specific_logic": not args.disable_domain_specific_logic,
         },
         "reranker": {
             "enabled": args.rerank_top_n > 1 and args.rerank_weight > 0.0,
@@ -1017,6 +1026,7 @@ def run_classifier_mode(args) -> Dict:
             "paragraphs_csv": corpus["paragraphs_csv"],
             **summary["outputs"],
         },
+        "domain_specific_logic": not args.disable_domain_specific_logic,
     }
     if args.kg_enable:
         run_summary["kg"] = {
@@ -1139,6 +1149,7 @@ def main() -> None:
                 self_rag_critique=bool(config.get("self_rag_critique", args.self_rag_critique)),
                 rerank_top_n=args.rerank_top_n,
                 rerank_weight=args.rerank_weight,
+                domain_specific_logic=not args.disable_domain_specific_logic,
                 search_backend_config=search_backend_config,
                 search_index_name=None,
                 prepared_resources=prepared_resources,
@@ -1227,6 +1238,7 @@ def main() -> None:
             "query_augmentation": args.query_augmentation,
             "self_rag_retry_on_weak_evidence": args.self_rag_retry_on_weak_evidence,
             "self_rag_critique": args.self_rag_critique,
+            "domain_specific_logic": not args.disable_domain_specific_logic,
         },
         "reranker": {
             "enabled": args.rerank_top_n > 1 and args.rerank_weight > 0.0,

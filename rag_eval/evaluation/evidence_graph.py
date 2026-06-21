@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import re
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Dict, List, Sequence
 
 
@@ -37,6 +40,77 @@ def _top_items(counter: Counter, *, limit: int = 10, key_names: Sequence[str] = 
             payload = {first_key: item, second_key: count}
         rows.append(payload)
     return rows
+
+
+def _normalized_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").strip()
+
+
+def _doc_type(doc_path: str) -> str:
+    filename = Path(_normalized_path(doc_path)).name.casefold()
+    if "berichtigung" in filename:
+        return "correction"
+    if "auslauf" in filename:
+        return "phase_out"
+    if any(token in filename for token in ["aenderung", "änderung", "nachtrag", "supplement"]):
+        return "amendment"
+    return "base"
+
+
+def _question_prefers_special_regulation(question: str) -> str | None:
+    normalized = str(question or "").casefold()
+    if any(token in normalized for token in ["berichtigung", "corrected", "correction", "erratum"]):
+        return "correction"
+    if any(token in normalized for token in ["auslauf", "übergang", "uebergang", "transition", "phasing out"]):
+        return "phase_out"
+    if any(token in normalized for token in ["änderung", "aenderung", "amendment", "change order", "supplement"]):
+        return "amendment"
+    return None
+
+
+def _doc_year(doc_path: str) -> int | None:
+    matches = re.findall(r"20\d{2}", Path(str(doc_path or "")).name)
+    if not matches:
+        return None
+    try:
+        return int(matches[0])
+    except ValueError:
+        return None
+
+
+def _json_list(value: object) -> List[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if str(item).strip()]
+    except json.JSONDecodeError:
+        pass
+    return [text]
+
+
+def _scope_doc_paths(row: Dict[str, object]) -> List[str]:
+    raw_scope = row.get("evaluation_scope") or row.get("answer_scope")
+    if raw_scope is None or raw_scope == "":
+        return []
+    try:
+        scope = json.loads(str(raw_scope))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(scope, dict):
+        return []
+    paths = scope.get("doc_path")
+    if isinstance(paths, list):
+        return [_normalized_path(path) for path in paths if _normalized_path(path)]
+    if isinstance(paths, str) and _normalized_path(paths):
+        return [_normalized_path(paths)]
+    return []
 
 
 def build_cpv_evidence_graph_summary(
@@ -219,6 +293,12 @@ def build_document_evidence_graph_summary(
     unsupported_without_graph_path_errors = 0
     cross_doc_pressure_errors = 0
     graph_only_addition_errors = 0
+    gold_section_missing_errors = 0
+    gold_path_missing_errors = 0
+    gold_section_present_not_used_errors = 0
+    same_branch_wrong_rule_errors = 0
+    wrong_version_branch_errors = 0
+    missing_bridge_fact_errors = 0
 
     primary_reasons: Counter = Counter()
     claim_diagnostics: Counter = Counter()
@@ -239,6 +319,11 @@ def build_document_evidence_graph_summary(
         path_correctness = _as_float(row.get("kg_path_correctness"))
         context_claim_recall = _as_float(row.get("context_claim_recall"))
         unsupported_missing_path = _as_float(row.get("unsupported_claim_missing_kg_path_rate"))
+        first_target_doc_rank = _as_float(row.get("first_target_doc_rank"))
+        n_target_doc_chunks = _as_float(row.get("n_retrieved_target_doc_chunks"))
+        question_type = str(row.get("question_type") or "unknown")
+        question_text = str(row.get("question") or "")
+        selected_doc_paths = set(_scope_doc_paths(row))
 
         graph_support_strong = (
             (relation_recall is not None and relation_recall >= 0.8)
@@ -265,6 +350,7 @@ def build_document_evidence_graph_summary(
             unsupported_without_graph_path_errors += 1
 
         top_rows = ranking_by_qid.get(qid, [])
+        top1_doc_path = _normalized_path(top_rows[0].get("doc_path") or top_rows[0].get("doc_id") or "") if top_rows else ""
         top_doc_paths = {
             str(item.get("doc_path") or item.get("doc_id") or "").strip()
             for item in top_rows[:10]
@@ -279,6 +365,55 @@ def build_document_evidence_graph_summary(
             cross_doc_pressure_errors += 1
         if graph_only_rows:
             graph_only_addition_errors += 1
+
+        target_doc_present = bool(n_target_doc_chunks and n_target_doc_chunks > 0)
+        if (
+            not target_doc_present
+            and (first_target_doc_rank is None or first_target_doc_rank <= 0)
+            and str(row.get("primary_error_reason") or "") in {"false_refusal", "retrieval_claim_miss", "partial_retrieval"}
+        ):
+            gold_section_missing_errors += 1
+
+        if (
+            (relation_recall is not None and relation_recall < 0.5)
+            and (path_availability is None or path_availability == 0.0)
+            and question_type in {"multi_hop", "relation"}
+        ):
+            gold_path_missing_errors += 1
+
+        if (
+            target_doc_present
+            and graph_support_strong
+            and claim_diag in {"answer_incomplete_from_available_context", "unsupported_generated_claims", "claim_contradiction"}
+        ):
+            gold_section_present_not_used_errors += 1
+
+        if (
+            target_doc_present
+            and (first_target_doc_rank is not None and first_target_doc_rank <= 3)
+            and graph_noise is not None and graph_noise > 0.25
+            and str(row.get("primary_error_reason") or "") in {"false_refusal", "answer_incomplete_from_good_context", "generation_hallucination"}
+        ):
+            same_branch_wrong_rule_errors += 1
+
+        if selected_doc_paths and top1_doc_path:
+            preferred_special = _question_prefers_special_regulation(question_text)
+            selected_years = [year for year in (_doc_year(path) for path in selected_doc_paths) if year is not None]
+            selected_max_year = max(selected_years) if selected_years else None
+            top1_year = _doc_year(top1_doc_path)
+            top1_type = _doc_type(top1_doc_path)
+            if top1_doc_path not in selected_doc_paths:
+                if preferred_special is None and top1_type in {"amendment", "correction", "phase_out"}:
+                    wrong_version_branch_errors += 1
+                elif selected_max_year is not None and top1_year is not None and top1_year > selected_max_year:
+                    wrong_version_branch_errors += 1
+
+        if (
+            question_type in {"multi_hop", "relation"}
+            and graph_support_strong
+            and claim_diag in {"answer_incomplete_from_available_context", "retrieval_claim_miss", "partial_evidence_retrieved"}
+        ):
+            missing_bridge_fact_errors += 1
 
     graph_summary = {
         "enabled": True,
@@ -295,6 +430,12 @@ def build_document_evidence_graph_summary(
             "unsupported_without_graph_path_errors": unsupported_without_graph_path_errors,
             "cross_doc_pressure_errors": cross_doc_pressure_errors,
             "graph_only_addition_errors": graph_only_addition_errors,
+            "gold_section_missing_errors": gold_section_missing_errors,
+            "gold_path_missing_errors": gold_path_missing_errors,
+            "gold_section_present_not_used_errors": gold_section_present_not_used_errors,
+            "same_branch_wrong_rule_errors": same_branch_wrong_rule_errors,
+            "wrong_version_branch_errors": wrong_version_branch_errors,
+            "missing_bridge_fact_errors": missing_bridge_fact_errors,
         },
         "rates": {
             "missing_relation_evidence_error_rate": (missing_relation_evidence_errors / n_errors) if n_errors else 0.0,
@@ -306,6 +447,12 @@ def build_document_evidence_graph_summary(
             "unsupported_without_graph_path_error_rate": (unsupported_without_graph_path_errors / n_errors) if n_errors else 0.0,
             "cross_doc_pressure_error_rate": (cross_doc_pressure_errors / n_errors) if n_errors else 0.0,
             "graph_only_addition_error_rate": (graph_only_addition_errors / n_errors) if n_errors else 0.0,
+            "gold_section_missing_error_rate": (gold_section_missing_errors / n_errors) if n_errors else 0.0,
+            "gold_path_missing_error_rate": (gold_path_missing_errors / n_errors) if n_errors else 0.0,
+            "gold_section_present_not_used_error_rate": (gold_section_present_not_used_errors / n_errors) if n_errors else 0.0,
+            "same_branch_wrong_rule_error_rate": (same_branch_wrong_rule_errors / n_errors) if n_errors else 0.0,
+            "wrong_version_branch_error_rate": (wrong_version_branch_errors / n_errors) if n_errors else 0.0,
+            "missing_bridge_fact_error_rate": (missing_bridge_fact_errors / n_errors) if n_errors else 0.0,
         },
         "top_primary_error_reasons": _top_items(primary_reasons, limit=10, key_names=("reason", "count")),
         "top_claim_diagnostics": _top_items(claim_diagnostics, limit=10, key_names=("claim_diagnostic", "count")),
@@ -313,13 +460,35 @@ def build_document_evidence_graph_summary(
         "top_programs": _top_items(programs, limit=10, key_names=("program_name", "count")),
     }
     graph_summary["component_signals"] = {
-        "graph_coverage": float(graph_summary["rates"]["missing_relation_evidence_error_rate"]),
+        "graph_coverage": max(
+            float(graph_summary["rates"]["missing_relation_evidence_error_rate"]),
+            float(graph_summary["rates"]["gold_section_missing_error_rate"]),
+            float(graph_summary["rates"]["gold_path_missing_error_rate"]),
+        ),
         "graph_noise": float(graph_summary["rates"]["graph_noise_error_rate"]),
         "answer_synthesis": max(
             float(graph_summary["rates"]["graph_supported_incomplete_error_rate"]),
             float(graph_summary["rates"]["graph_supported_contradiction_error_rate"]),
+            float(graph_summary["rates"]["gold_section_present_not_used_error_rate"]),
         ),
         "refusal_policy": float(graph_summary["rates"]["graph_supported_false_refusal_rate"]),
-        "context_selection": float(graph_summary["rates"]["cross_doc_pressure_error_rate"]),
+        "context_selection": max(
+            float(graph_summary["rates"]["cross_doc_pressure_error_rate"]),
+            float(graph_summary["rates"]["same_branch_wrong_rule_error_rate"]),
+            float(graph_summary["rates"]["wrong_version_branch_error_rate"]),
+        ),
+        "versioning": float(graph_summary["rates"]["wrong_version_branch_error_rate"]),
+        "bridge_composition": float(graph_summary["rates"]["missing_bridge_fact_error_rate"]),
     }
+    graph_summary["graph_aware_failure_modes"] = [
+        {"mode": "gold_section_missing", "count": gold_section_missing_errors, "rate": graph_summary["rates"]["gold_section_missing_error_rate"]},
+        {"mode": "gold_path_missing", "count": gold_path_missing_errors, "rate": graph_summary["rates"]["gold_path_missing_error_rate"]},
+        {"mode": "gold_section_present_not_used", "count": gold_section_present_not_used_errors, "rate": graph_summary["rates"]["gold_section_present_not_used_error_rate"]},
+        {"mode": "same_branch_wrong_rule", "count": same_branch_wrong_rule_errors, "rate": graph_summary["rates"]["same_branch_wrong_rule_error_rate"]},
+        {"mode": "wrong_version_branch", "count": wrong_version_branch_errors, "rate": graph_summary["rates"]["wrong_version_branch_error_rate"]},
+        {"mode": "missing_bridge_fact", "count": missing_bridge_fact_errors, "rate": graph_summary["rates"]["missing_bridge_fact_error_rate"]},
+        {"mode": "graph_supported_false_refusal", "count": graph_supported_false_refusals, "rate": graph_summary["rates"]["graph_supported_false_refusal_rate"]},
+        {"mode": "graph_supported_incomplete_answer", "count": graph_supported_incomplete_errors, "rate": graph_summary["rates"]["graph_supported_incomplete_error_rate"]},
+        {"mode": "graph_noise_error", "count": graph_noise_errors, "rate": graph_summary["rates"]["graph_noise_error_rate"]},
+    ]
     return graph_summary

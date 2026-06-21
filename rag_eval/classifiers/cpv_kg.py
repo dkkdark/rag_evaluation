@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Sequence
 
 from rag_eval.classifiers.cpv_baseline import CPVRecord, build_parent_lookup
-from rag_eval.evaluation.core import best_cpv_hierarchy_match
+from rag_eval.evaluation.core import best_cpv_hierarchy_match, cpv_common_prefix_length
 from rag_eval.retrieval.engines import lexical_overlap_score, min_max_normalize
 
 
@@ -25,6 +25,8 @@ CPV_SELECTION_WEIGHTS = {
 CPV_REFINEMENT_BASE_WINDOW = 15
 CPV_REFINEMENT_SEED_WINDOW = 5
 SAFE_BRANCH_PREFIX_LEVELS = (6, 4)
+HIERARCHY_STAGE_TOP_COUNTS = {2: 6, 4: 4, 6: 3}
+HIERARCHY_STAGE_RELATIVE_THRESHOLDS = {2: 0.82, 4: 0.86, 6: 0.88}
 
 
 @dataclass
@@ -133,6 +135,41 @@ def build_cpv_knowledge_graph(records: Sequence[CPVRecord]) -> CPVKnowledgeGraph
         children_lookup=children_lookup,
         sibling_lookup=sibling_lookup,
     )
+
+
+def _select_stage_prefixes(
+    *,
+    codes: Sequence[str],
+    combined_scores: Dict[str, float],
+    lexical_norm: Dict[str, float],
+    width: int,
+) -> List[str]:
+    groups = _group_codes_by_prefix(list(codes), width)
+    if not groups:
+        return []
+    scored_prefixes: List[tuple[str, float]] = []
+    for prefix, members in groups.items():
+        member_scores = sorted((combined_scores.get(code, 0.0) for code in members), reverse=True)
+        member_lex = sorted((lexical_norm.get(code, 0.0) for code in members), reverse=True)
+        score = (
+            0.55 * (sum(member_scores[:3]) / max(1, min(3, len(member_scores))))
+            + 0.30 * (max(member_scores) if member_scores else 0.0)
+            + 0.10 * (max(member_lex) if member_lex else 0.0)
+            + min(0.05, 0.01 * len(members))
+        )
+        scored_prefixes.append((prefix, score))
+    scored_prefixes.sort(key=lambda item: item[1], reverse=True)
+    if not scored_prefixes:
+        return []
+    best_score = scored_prefixes[0][1]
+    threshold = best_score * HIERARCHY_STAGE_RELATIVE_THRESHOLDS.get(width, 0.9)
+    top_count = HIERARCHY_STAGE_TOP_COUNTS.get(width, 2)
+    selected = [
+        prefix
+        for index, (prefix, score) in enumerate(scored_prefixes)
+        if index < top_count or score >= threshold
+    ]
+    return selected
 
 
 def cpv_path_text(node: CPVGraphNode) -> str:
@@ -788,7 +825,7 @@ def hierarchy_select_cpv_candidates(
     lexical_norm = dict(zip(pool_codes, min_max_normalize([lexical_scores[code] for code in pool_codes])))
     graph_norm = dict(zip(pool_codes, min_max_normalize([graph_scores[code] for code in pool_codes])))
 
-    final_scores: Dict[str, float] = {}
+    combined_scores: Dict[str, float] = {}
     sibling_boost_applied: Dict[str, float] = {}
     class_boost_applied: Dict[str, float] = {}
     refinement_codes = _refinement_candidate_codes(
@@ -798,17 +835,45 @@ def hierarchy_select_cpv_candidates(
         rows_by_code=rows_by_code,
     )
     for code in pool_codes:
-        final_scores[code] = float(base_scores.get(code, 0.0))
+        combined_scores[code] = float(base_scores.get(code, 0.0))
 
     for code in refinement_codes:
-        final_scores[code] = (
+        combined_scores[code] = (
             weights["base"] * base_norm.get(code, 0.0)
             + weights["lexical"] * lexical_norm.get(code, 0.0)
             + weights["graph"] * graph_norm.get(code, 0.0)
         )
 
+    active_codes = list(refinement_codes)
+    selected_division_prefixes = _select_stage_prefixes(
+        codes=active_codes,
+        combined_scores=combined_scores,
+        lexical_norm=lexical_norm,
+        width=2,
+    )
+    if selected_division_prefixes:
+        active_codes = [code for code in active_codes if code[:2] in selected_division_prefixes]
+    selected_group_prefixes = _select_stage_prefixes(
+        codes=active_codes,
+        combined_scores=combined_scores,
+        lexical_norm=lexical_norm,
+        width=4,
+    )
+    if selected_group_prefixes:
+        active_codes = [code for code in active_codes if code[:4] in selected_group_prefixes]
+    selected_class_prefixes = _select_stage_prefixes(
+        codes=active_codes,
+        combined_scores=combined_scores,
+        lexical_norm=lexical_norm,
+        width=6,
+    )
+    if selected_class_prefixes:
+        active_codes = [code for code in active_codes if code[:6] in selected_class_prefixes]
+    if not active_codes:
+        active_codes = list(refinement_codes)
+
     parent_groups: Dict[str, List[str]] = defaultdict(list)
-    for code in refinement_codes:
+    for code in active_codes:
         parent = graph.parent_lookup.get(code, "")
         if parent:
             parent_groups[parent].append(code)
@@ -821,11 +886,11 @@ def hierarchy_select_cpv_candidates(
             continue
         for code in siblings:
             boost = weights["sibling_boost"] * (lexical_norm.get(code, 0.0) / max_lex)
-            final_scores[code] += boost
+            combined_scores[code] += boost
             sibling_boost_applied[code] = boost
 
     for prefix_len in (6, 4):
-        for _, members in _group_codes_by_prefix(list(refinement_codes), prefix_len).items():
+        for _, members in _group_codes_by_prefix(list(active_codes), prefix_len).items():
             if len(members) < 2:
                 continue
             cluster_lex = [lexical_norm.get(code, 0.0) for code in members]
@@ -834,7 +899,7 @@ def hierarchy_select_cpv_candidates(
                 continue
             for code in members:
                 boost = weights["class_cluster_boost"] * (lexical_norm.get(code, 0.0) / max_lex)
-                final_scores[code] += boost
+                combined_scores[code] += boost
                 class_boost_applied[code] = class_boost_applied.get(code, 0.0) + boost
 
     base_sorted = sorted(pool_codes, key=lambda code: base_scores.get(code, 0.0), reverse=True)
@@ -852,9 +917,9 @@ def hierarchy_select_cpv_candidates(
                 if lexical_winner != top_base:
                     margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_base, 0.0)
                     if margin >= 0.07:
-                        final_scores[lexical_winner] = max(
-                            final_scores.get(lexical_winner, 0.0),
-                            final_scores.get(top_base, 0.0) + margin * weights["sibling_boost"],
+                        combined_scores[lexical_winner] = max(
+                            combined_scores.get(lexical_winner, 0.0),
+                            combined_scores.get(top_base, 0.0) + margin * weights["sibling_boost"],
                         )
         top_window = base_sorted[: min(CPV_REFINEMENT_BASE_WINDOW, len(base_sorted))]
         if len(top_window) >= 2:
@@ -862,35 +927,46 @@ def hierarchy_select_cpv_candidates(
             if lexical_winner != top_base:
                 margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_base, 0.0)
                 if margin >= 0.14:
-                    final_scores[lexical_winner] = max(
-                        final_scores.get(lexical_winner, 0.0),
-                        final_scores.get(top_base, 0.0) + margin * weights["lexical"],
+                    combined_scores[lexical_winner] = max(
+                        combined_scores.get(lexical_winner, 0.0),
+                        combined_scores.get(top_base, 0.0) + margin * weights["lexical"],
                     )
 
-    refined_sorted = sorted(refinement_codes, key=lambda code: final_scores.get(code, 0.0), reverse=True)
+    refined_sorted = sorted(active_codes, key=lambda code: combined_scores.get(code, 0.0), reverse=True)
+    dropped_refinement = sorted(
+        [code for code in refinement_codes if code not in set(active_codes)],
+        key=lambda code: combined_scores.get(code, 0.0),
+        reverse=True,
+    )
     tail = [code for code in base_sorted if code not in refinement_codes]
-    ranked_codes = list(dict.fromkeys(refined_sorted + tail))
+    ranked_codes = list(dict.fromkeys(refined_sorted + dropped_refinement + tail))
 
     selected: List[Dict[str, object]] = []
     for code in ranked_codes[: min(top_k, len(ranked_codes))]:
         row = rows_by_code.get(code)
         if row is None:
             continue
-        row["score"] = float(final_scores.get(code, 0.0))
-        row["hierarchy_selection_score"] = float(final_scores.get(code, 0.0))
+        row["score"] = float(combined_scores.get(code, 0.0))
+        row["hierarchy_selection_score"] = float(combined_scores.get(code, 0.0))
         row["hierarchy_lexical_score"] = float(lexical_scores.get(code, 0.0))
         row["hierarchy_sibling_boost"] = float(sibling_boost_applied.get(code, 0.0))
         row["hierarchy_class_boost"] = float(class_boost_applied.get(code, 0.0))
+        row["hierarchy_stage_division_selected"] = 1 if code[:2] in selected_division_prefixes else 0
+        row["hierarchy_stage_group_selected"] = 1 if code[:4] in selected_group_prefixes else 0
+        row["hierarchy_stage_class_selected"] = 1 if code[:6] in selected_class_prefixes else 0
         row["retriever"] = str(row.get("retriever") or "hierarchy_selection")
         selected.append(row)
 
     return selected, {
         "selection_enabled": True,
         "pool_size": len(pool_codes),
-        "refinement_size": len(refinement_codes),
+        "refinement_size": len(active_codes),
+        "selected_division_prefixes": selected_division_prefixes,
+        "selected_group_prefixes": selected_group_prefixes,
+        "selected_class_prefixes": selected_class_prefixes,
         "sibling_groups_applied": sum(1 for siblings in parent_groups.values() if len(siblings) >= 2),
         "class_clusters_applied": sum(
-            1 for prefix_len in (6, 4) for members in _group_codes_by_prefix(list(refinement_codes), prefix_len).values() if len(members) >= 2
+            1 for prefix_len in (6, 4) for members in _group_codes_by_prefix(list(active_codes), prefix_len).values() if len(members) >= 2
         ),
     }
 
@@ -1083,68 +1159,61 @@ def post_refine_cpv_ranking(
     chunks_by_code: Dict[str, Dict[str, object]],
     top_k: int,
 ) -> tuple[List[Dict[str, object]], Dict[str, object]]:
-    del pool_rows  # pool is kept for API compatibility; refinement only reorders current top-k.
+    del query
+    del pool_rows
     if top_k <= 0 or not ranked_rows:
         return [], {"post_refine_applied": False}
 
     current = [dict(row) for row in ranked_rows[:top_k]]
-    ranked_codes = [
-        str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
-        for row in current
-        if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()
-    ]
+    ranked_codes = [str(row.get("cpv_code") or row.get("chunk_id") or "").strip() for row in current if str(row.get("cpv_code") or row.get("chunk_id") or "").strip()]
     if len(ranked_codes) < 2:
         return current, {"post_refine_applied": False}
 
     rows_by_code = {code: dict(row) for code, row in zip(ranked_codes, current)}
-    lexical_scores = {
-        code: lexical_overlap_score(
-            query,
-            _candidate_rich_text(code, graph=graph, chunks_by_code=chunks_by_code),
-        )
-        for code in ranked_codes
-    }
-    lexical_norm = dict(
-        zip(ranked_codes, min_max_normalize([lexical_scores[code] for code in ranked_codes]))
-    )
-
-    top_code = ranked_codes[0]
-    promoted_code: str | None = None
-    promote_reason = ""
-
-    sibling_cluster = [code for code in ranked_codes if _is_direct_sibling(code, top_code, graph)]
-    if len(sibling_cluster) >= 2:
-        lexical_winner = max(sibling_cluster, key=lambda code: lexical_scores.get(code, 0.0))
-        margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_code, 0.0)
-        if lexical_winner != top_code and margin >= 0.12:
-            promoted_code = lexical_winner
-            promote_reason = "sibling_lexical"
-
-    if promoted_code is None:
-        lexical_winner = max(ranked_codes, key=lambda code: lexical_scores.get(code, 0.0))
-        margin = lexical_norm.get(lexical_winner, 0.0) - lexical_norm.get(top_code, 0.0)
-        if lexical_winner != top_code and margin >= 0.18:
-            promoted_code = lexical_winner
-            promote_reason = "topk_lexical"
-
-    if promoted_code is None or promoted_code == top_code:
-        return current, {"post_refine_applied": False, "post_refine_reason": None}
-
-    reordered_codes = [promoted_code] + [code for code in ranked_codes if code != promoted_code]
-    refined: List[Dict[str, object]] = []
-    for code in reordered_codes:
+    branch_support: Dict[str, float] = {}
+    branch_neighbor_counts: Dict[str, int] = {}
+    for code in ranked_codes:
         row = rows_by_code[code]
-        if code == promoted_code:
-            row = dict(row)
-            row["post_refine_promoted"] = True
-            row["post_refine_reason"] = promote_reason
-            row["score"] = float(row.get("score") or 0.0) + 0.05
-        refined.append(row)
+        neighbors: List[float] = []
+        for other in ranked_codes:
+            if other == code:
+                continue
+            if (
+                _is_direct_sibling(code, other, graph)
+                or cpv_common_prefix_length(code, other) >= 4
+                or _is_strict_ancestor(code, other, graph)
+                or _is_strict_ancestor(other, code, graph)
+            ):
+                neighbors.append(float(rows_by_code[other].get("learned_label_score", rows_by_code[other].get("score", 0.0)) or 0.0))
+        branch_neighbor_counts[code] = len(neighbors)
+        branch_support[code] = sum(neighbors) / len(neighbors) if neighbors else 0.0
+        learned_score = float(row.get("learned_label_score", row.get("score", 0.0)) or 0.0)
+        row["post_refine_branch_support"] = branch_support[code]
+        row["post_refine_neighbor_count"] = branch_neighbor_counts[code]
+        row["post_refine_bonus"] = 0.10 * branch_support[code] + min(0.03, 0.01 * branch_neighbor_counts[code])
+        row["post_refine_score"] = learned_score + float(row.get("post_refine_bonus") or 0.0)
+        row["post_refine_promoted"] = False
+        row["post_refine_reason"] = ""
+        row["post_refine_lexical_score"] = 0.0
+        rows_by_code[code] = row
+
+    refined = sorted(
+        [rows_by_code[code] for code in ranked_codes],
+        key=lambda row: float(row.get("post_refine_score", row.get("score", 0.0)) or 0.0),
+        reverse=True,
+    )
+    original_top = ranked_codes[0]
+    refined_top = str(refined[0].get("cpv_code") or refined[0].get("chunk_id") or "").strip()
+    if refined_top and refined_top != original_top:
+        refined[0]["post_refine_promoted"] = True
+        refined[0]["post_refine_reason"] = "branch_graph_support"
+    for row in refined:
+        row["score"] = float(row.get("post_refine_score", row.get("score", 0.0)) or 0.0)
 
     return refined, {
         "post_refine_applied": True,
-        "post_refine_reason": promote_reason,
-        "post_refine_promoted_code": promoted_code,
+        "post_refine_reason": "branch_graph_support",
+        "post_refine_promoted_code": refined_top,
     }
 
 

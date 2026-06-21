@@ -970,6 +970,8 @@ def chunk_year_text(chunk: Dict) -> str:
 
 
 def kg_chunk_quality_factor(query: str, chunk: Dict) -> float:
+    if bool(chunk.get("_disable_domain_specific_logic")):
+        return 1.0
     factor = 1.0
     years = query_year_hints(query)
     if years:

@@ -358,11 +358,17 @@ def _select_doc_paths_for_year(
     return _preferred_doc_paths(explicit_doc_paths, question)
 
 
-def question_metadata_filter(item: Dict, *, chunks: Sequence[Dict], include_document: bool) -> Dict[str, object]:
+def question_metadata_filter(
+    item: Dict,
+    *,
+    chunks: Sequence[Dict],
+    include_document: bool,
+    domain_specific_logic: bool = True,
+) -> Dict[str, object]:
     metadata_filter: Dict[str, object] = {}
     doc_paths = list_field(item.get("doc_path")) + list_field(item.get("doc_paths"))
     program_names = list_field(item.get("program_name")) + list_field(item.get("program_names"))
-    if not program_names:
+    if domain_specific_logic and not program_names:
         # Fall back to the document folder so retrieval stays inside the
         # program directory even when a question row omitted program_name.
         program_names = infer_program_names_from_doc_paths(doc_paths)
@@ -372,7 +378,10 @@ def question_metadata_filter(item: Dict, *, chunks: Sequence[Dict], include_docu
     ]
     if program_names:
         metadata_filter["program_name"] = program_names
-    selected_doc_paths = _select_doc_paths_for_year(item=item, chunks=chunks)
+    if domain_specific_logic:
+        selected_doc_paths = _select_doc_paths_for_year(item=item, chunks=chunks)
+    else:
+        selected_doc_paths = doc_paths
     if not selected_doc_paths:
         selected_doc_paths = doc_paths
     if selected_doc_paths:
@@ -643,6 +652,7 @@ def run_single_experiment(
     search_backend_config: Dict[str, object] | None = None,
     search_index_name: str | None = None,
     prepared_resources: Dict[str, object] | None = None,
+    domain_specific_logic: bool = True,
 ) -> Dict:
     import pandas as pd
 
@@ -691,6 +701,8 @@ def run_single_experiment(
         search_index_name=search_index_name,
     )
     chunks = list(resource_state["chunks"])
+    if not domain_specific_logic:
+        chunks = [dict(chunk, _disable_domain_specific_logic=True) for chunk in chunks]
 
     chunks_df = pd.DataFrame(chunks)
     chunks_csv = os.path.join(experiment_dir, "chunks.csv")
@@ -747,8 +759,18 @@ def run_single_experiment(
             max_terms=query_augmentation_max_terms,
         )
         retrieval_query = query_augmentation_result.answer or item["question"]
-        answer_metadata_filter = question_metadata_filter(item, chunks=chunks, include_document=False)
-        evaluation_metadata_filter = question_metadata_filter(item, chunks=chunks, include_document=True)
+        answer_metadata_filter = question_metadata_filter(
+            item,
+            chunks=chunks,
+            include_document=False,
+            domain_specific_logic=domain_specific_logic,
+        )
+        evaluation_metadata_filter = question_metadata_filter(
+            item,
+            chunks=chunks,
+            include_document=True,
+            domain_specific_logic=domain_specific_logic,
+        )
         candidate_chunks = filter_chunks_by_metadata(chunks, evaluation_metadata_filter)
         if evaluation_metadata_filter and not candidate_chunks:
             raise ValueError(

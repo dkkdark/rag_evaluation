@@ -878,6 +878,19 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
     retriever_signal = as_float(component_signals.get("retriever"))
     query_enrichment_signal = as_float(component_signals.get("query_enrichment"))
     examples_signal = as_float(component_signals.get("examples"))
+    graph_coverage_signal = as_float(component_signals.get("graph_coverage"))
+    graph_noise_signal = as_float(component_signals.get("graph_noise"))
+    answer_synthesis_signal = as_float(component_signals.get("answer_synthesis"))
+    refusal_policy_signal = as_float(component_signals.get("refusal_policy"))
+    context_selection_signal = as_float(component_signals.get("context_selection"))
+    versioning_signal = as_float(component_signals.get("versioning"))
+    bridge_signal = as_float(component_signals.get("bridge_composition"))
+    gold_section_missing_error_rate = as_float(evidence_rates.get("gold_section_missing_error_rate"))
+    gold_path_missing_error_rate = as_float(evidence_rates.get("gold_path_missing_error_rate"))
+    gold_section_present_not_used_error_rate = as_float(evidence_rates.get("gold_section_present_not_used_error_rate"))
+    same_branch_wrong_rule_error_rate = as_float(evidence_rates.get("same_branch_wrong_rule_error_rate"))
+    wrong_version_branch_error_rate = as_float(evidence_rates.get("wrong_version_branch_error_rate"))
+    missing_bridge_fact_error_rate = as_float(evidence_rates.get("missing_bridge_fact_error_rate"))
 
     if hierarchy_signal is not None and hierarchy_signal >= 0.18:
         recs.append(
@@ -975,6 +988,107 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 next_experiment="Compare raw top-k against a deduplicated code-level shortlist while keeping the same retrieval scores.",
                 implementation_hint="Duplicate pressure is not always the main bottleneck, but when it appears in many errors it can suppress useful alternatives.",
                 success_signal="Unique candidate coverage rises and some same-branch misses turn into exact matches.",
+                source="Graph-aware",
+            )
+        )
+
+    if graph_coverage_signal is not None and graph_coverage_signal >= 0.15:
+        recs.append(
+            recommendation(
+                component="graph_coverage",
+                priority="P1",
+                issue="Graph-aware QA summary shows repeated misses where the required section or evidence path never enters context",
+                evidence=(
+                    f"gold_section_missing_error_rate={gold_section_missing_error_rate}, "
+                    f"gold_path_missing_error_rate={gold_path_missing_error_rate}, "
+                    f"missing_relation_evidence_error_rate={evidence_rates.get('missing_relation_evidence_error_rate')}"
+                ),
+                recommendation_text="Treat these as candidate-generation or evidence-linking failures before changing answer prompts.",
+                next_experiment="Compare the same questions with higher top-k, BM25/hybrid retrieval, and section-title-aware reranking while keeping answer generation fixed.",
+                implementation_hint="The graph-aware signal is useful here because it distinguishes section-not-found cases from answer-synthesis failures.",
+                success_signal="Gold-section and gold-path missing rates decline before answer-side metrics move.",
+                source="Graph-aware",
+            )
+        )
+
+    if context_selection_signal is not None and context_selection_signal >= 0.12:
+        recs.append(
+            recommendation(
+                component="context_selection",
+                priority="P2",
+                issue="Graph-aware QA summary shows related-rule or cross-version confusions inside the retrieved neighborhood",
+                evidence=(
+                    f"same_branch_wrong_rule_error_rate={same_branch_wrong_rule_error_rate}, "
+                    f"wrong_version_branch_error_rate={wrong_version_branch_error_rate}, "
+                    f"cross_doc_pressure_error_rate={evidence_rates.get('cross_doc_pressure_error_rate')}"
+                ),
+                recommendation_text="Add rule- and version-aware disambiguation rather than only broadening retrieval.",
+                next_experiment="Contrast base MPO vs amendment/correction candidates explicitly and rerank same-document competing sections for questions that mention exam forms, deadlines, or conditions.",
+                implementation_hint="These failures are often close-rule mistakes such as selecting a related exam form or the wrong regulation version rather than missing the program entirely.",
+                success_signal="Same-branch and wrong-version error rates fall without reducing retrieval recall.",
+                source="Graph-aware",
+            )
+        )
+
+    if bridge_signal is not None and bridge_signal >= 0.10:
+        recs.append(
+            recommendation(
+                component="bridge_composition",
+                priority="P2",
+                issue="Graph-aware QA summary shows missing bridge facts on multi-hop or relation questions",
+                evidence=f"missing_bridge_fact_error_rate={missing_bridge_fact_error_rate}",
+                recommendation_text="Focus on combining linked facts across sections instead of only retrieving one locally relevant chunk.",
+                next_experiment="Evaluate multi-hop questions with KG-organized context or a checklist answer mode that must cover each linked condition explicitly.",
+                implementation_hint="This is the QA analogue of a graph bridge miss: one needed fact is present, but the linked consequence or condition is not assembled into the final answer.",
+                success_signal="Multi-hop incomplete-answer cases shrink while context-claim recall stays high.",
+                source="Graph-aware",
+            )
+        )
+
+    if answer_synthesis_signal is not None and answer_synthesis_signal >= 0.20:
+        recs.append(
+            recommendation(
+                component="answer_synthesis",
+                priority="P1",
+                issue="Graph-aware QA summary shows answers failing even when graph-supported evidence is already available",
+                evidence=(
+                    f"graph_supported_incomplete_error_rate={evidence_rates.get('graph_supported_incomplete_error_rate')}, "
+                    f"gold_section_present_not_used_error_rate={gold_section_present_not_used_error_rate}"
+                ),
+                recommendation_text="Do not interpret all remaining failures as retrieval misses; the answer step is often leaving available evidence unused.",
+                next_experiment="Freeze retrieval and compare grounded_llm against cite_first and claim_checklist on the graph-supported failure subset.",
+                implementation_hint="This category is especially useful because KG shows that evidence exists, which narrows the problem to synthesis, completeness, or citation behavior.",
+                success_signal="Graph-supported incomplete-answer rates fall while retrieval metrics remain roughly stable.",
+                source="Graph-aware",
+            )
+        )
+
+    if refusal_policy_signal is not None and refusal_policy_signal >= 0.12:
+        recs.append(
+            recommendation(
+                component="refusal_policy",
+                priority="P2",
+                issue="Graph-aware QA summary shows false refusals despite evidence-supported context",
+                evidence=f"graph_supported_false_refusal_rate={evidence_rates.get('graph_supported_false_refusal_rate')}",
+                recommendation_text="Tighten refusal criteria on cases where the evidence graph already supports the required rule or relation.",
+                next_experiment="Audit weak-evidence thresholds only on graph-supported refusal rows and compare with a less conservative abstention policy.",
+                implementation_hint="This helps separate genuine low-evidence abstentions from cases where the decision layer is overly cautious after retrieval has already succeeded.",
+                success_signal="False refusals decrease without a matching rise in unsupported answers.",
+                source="Graph-aware",
+            )
+        )
+
+    if graph_noise_signal is not None and graph_noise_signal >= 0.20:
+        recs.append(
+            recommendation(
+                component="graph_noise",
+                priority="P2",
+                issue="Graph-aware QA summary shows noisy KG expansion around wrong answers",
+                evidence=f"graph_noise_error_rate={evidence_rates.get('graph_noise_error_rate')}",
+                recommendation_text="Constrain graph expansion or rerank graph-added chunks more aggressively before passing them to answer generation.",
+                next_experiment="Compare safe_branch against conservative/direct_only profiles and inspect whether graph-only additions still help on the same rows.",
+                implementation_hint="Graph-aware analysis is useful here because it identifies when KG is contributing evidence pressure without actually improving the answer path.",
+                success_signal="Graph-noise errors fall while KG-added evidence precision rises.",
                 source="Graph-aware",
             )
         )
