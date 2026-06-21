@@ -185,11 +185,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Rerank top CPV candidates with a cross-encoder after retrieval and optional KG.",
     )
     parser.add_argument(
-        "--cpv-notice-examples-channel",
-        action="store_true",
-        help="Retrieve over cpv_notice_examples instead of only cpv_profiles for TED/CPV classification.",
-    )
-    parser.add_argument(
         "--disable-self-exclusion",
         action="store_true",
         help="Allow TED/CPV notice-example retrieval to use examples from the query notice itself.",

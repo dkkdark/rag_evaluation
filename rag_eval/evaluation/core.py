@@ -28,35 +28,6 @@ class PredictionRecord:
     metadata: Dict[str, object] | None = None
 
 
-def hierarchical_distance_from_parent_map(
-    predicted: str,
-    gold: str,
-    parent_map: Dict[str, str],
-) -> int | None:
-    if not predicted or not gold:
-        return None
-    if predicted == gold:
-        return 0
-
-    def chain(label: str) -> List[str]:
-        out: List[str] = []
-        seen = set()
-        current = label
-        while current and current not in seen:
-            out.append(current)
-            seen.add(current)
-            current = parent_map.get(current, "")
-        return out
-
-    predicted_chain = chain(predicted)
-    gold_chain = chain(gold)
-    gold_steps = {label: index for index, label in enumerate(gold_chain)}
-    for predicted_index, label in enumerate(predicted_chain):
-        if label in gold_steps:
-            return predicted_index + gold_steps[label]
-    return None
-
-
 CPV_HIERARCHY_LEVELS = [2, 4, 6, 8]
 CPV_MAX_STRUCTURAL_DISTANCE = (len(CPV_HIERARCHY_LEVELS) - 1) * 2 + 2
 CPV_HIERARCHY_LABELS = {

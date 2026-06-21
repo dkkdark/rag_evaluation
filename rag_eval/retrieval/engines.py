@@ -460,18 +460,6 @@ def build_cpv_multi_retriever(
     }
 
 
-# Build one retrieval backend behind a shared interface so the rest of the
-# pipeline can switch strategies without changing the experiment logic.
-def build_retriever(chunks: Sequence[Dict], retriever_type: str, model_name: str) -> Dict:
-    return build_retriever_with_backend(
-        chunks,
-        retriever_type,
-        model_name,
-        search_backend_config=None,
-        index_name=None,
-    )
-
-
 def build_retriever_with_backend(
     chunks: Sequence[Dict],
     retriever_type: str,

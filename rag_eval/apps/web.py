@@ -266,14 +266,7 @@ def filter_active_payload(payload: dict[str, Any]) -> dict[str, Any]:
         or bool_flag(active, "self_rag_retry_on_weak_evidence")
         or bool_flag(active, "self_rag_critique")
     )
-    if not (
-        bool_flag(active, "llm_enable")
-        or bool_flag(active, "llm_rerank")
-        or bool_flag(active, "judge_enable")
-        or query_augmentation in {"llm", "hyde", "translate_en"}
-        or bool_flag(active, "self_rag_retry_on_weak_evidence")
-        or bool_flag(active, "self_rag_critique")
-    ):
+    if not llm_needed:
         active.pop("llm_model", None)
         active.pop("llm_temperature", None)
     if not bool_flag(active, "judge_enable"):
@@ -394,7 +387,6 @@ def build_command(payload: dict[str, Any], run_name: str, output_dir: Path) -> l
         "--export-kg-for-neo4j": "export_kg_for_neo4j",
         "--cross-encoder-rerank": "cross_encoder_rerank",
         "--llm-rerank": "llm_rerank",
-        "--disable-self-exclusion": "disable_self_exclusion",
     }
     for flag, key in flags.items():
         if bool_flag(payload, key):
@@ -1765,8 +1757,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
 
           <div class="grid setting-group" data-show-for="ted_cpv" style="margin-top:10px">
-            <div class="meta" style="grid-column:1/-1">Notice-example fusion is always on for the local TED/CPV classifier. The current query notice is excluded by default for honest evaluation.</div>
-            <label class="check" style="grid-column:1/-1"><input type="checkbox" name="disable_self_exclusion" /> Disable self-exclusion for notice examples <span class="hint" title="Leave this unchecked for honest evaluation. When unchecked, the current query notice is excluded from notice-example retrieval by publication_number.">i</span></label>
+            <div class="meta" style="grid-column:1/-1">Notice-example fusion is always on for the local TED/CPV classifier. The current query notice is excluded automatically for honest evaluation.</div>
           </div>
 
           <div class="grid setting-group" data-show-for="api_classifier" style="margin-top:10px">
