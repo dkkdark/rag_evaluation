@@ -35,8 +35,12 @@ def recommendation(
     evidence: str,
     recommendation_text: str,
     next_experiment: str,
+    probable_root_cause: str = "",
     implementation_hint: str = "",
     success_signal: str = "",
+    tactic: str = "",
+    why_tactic: str = "",
+    expected_metric_movement: str = "",
     source: str = "Advisor",
 ) -> Dict[str, str]:
     return {
@@ -46,8 +50,12 @@ def recommendation(
         "evidence": evidence,
         "recommendation": recommendation_text,
         "next_experiment": next_experiment,
+        "probable_root_cause": probable_root_cause,
         "implementation_hint": implementation_hint,
         "success_signal": success_signal,
+        "tactic": tactic,
+        "why_tactic": why_tactic,
+        "expected_metric_movement": expected_metric_movement,
         "recommendation_source": source,
     }
 
@@ -115,9 +123,17 @@ def _append_recommendation_block(
     lines.append(heading)
     if rec.get("evidence"):
         lines.append(f"  - Evidence: {rec.get('evidence')}")
+    if rec.get("probable_root_cause"):
+        lines.append(f"  - Probable root cause: {rec.get('probable_root_cause')}")
     lines.append(f"  - Recommendation: {rec.get('recommendation')}")
     if rec.get("implementation_hint"):
         lines.append(f"  - Implementation hint: {rec.get('implementation_hint')}")
+    if rec.get("tactic"):
+        lines.append(f"  - Recommended tactic: {rec.get('tactic')}")
+    if rec.get("why_tactic"):
+        lines.append(f"  - Why this tactic: {rec.get('why_tactic')}")
+    if rec.get("expected_metric_movement"):
+        lines.append(f"  - Expected metric movement: {rec.get('expected_metric_movement')}")
     if rec.get("success_signal"):
         lines.append(f"  - Success signal: {rec.get('success_signal')}")
     lines.append(f"  - Next experiment: `{rec.get('next_experiment')}`")
@@ -184,6 +200,26 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
     duplicate_pressure = as_bool(row.get("duplicate_candidate_pressure")) is True
     low_diversity = as_bool(row.get("low_diversity_at_k")) is True
     short_query = as_bool(row.get("short_or_ambiguous_query")) is True
+    query_token_count = as_float(row.get("query_token_count"))
+
+    def _row_probable_root_cause() -> str:
+        if failure_mode == "gold_missing_from_top_k":
+            if short_query and query_token_count is not None and query_token_count <= 3:
+                return "The query is likely under-specified for retrieval, so coverage fails before selection can help."
+            if duplicate_pressure:
+                return "The candidate pool is crowded by repeated or near-identical alternatives, so the expected answer is pushed out of top-k."
+            if low_diversity:
+                return "Candidate generation is collapsing into one broad branch too early, which excludes the expected answer before reranking."
+            if best_hierarchy_score is not None and best_hierarchy_score >= 0.25:
+                return "Retrieval is reaching a related hierarchy region, but it is not discriminative enough to bring the correct code into top-k."
+            return "Retriever coverage is the immediate constraint because the expected answer never enters the candidate set."
+        if failure_mode == "gold_present_but_not_ranked_first":
+            if low_margin_decision or (score_margin is not None and score_margin <= 0.05):
+                return "The expected answer is already available, but the final selector is too weak to resolve a low-margin shortlist."
+            return "The shortlist contains the expected answer, so the main problem is candidate ordering rather than retrieval coverage."
+        if failure_mode in {"same_branch_wrong_code", "same_class_wrong_code"}:
+            return "The system is retrieving semantically related alternatives, but it lacks enough hierarchy-aware discrimination to pick the exact node."
+        return ""
 
     if failure_mode and failure_mode != "ok":
         if likely_bottleneck == "candidate_generation_or_retriever":
@@ -195,7 +231,11 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                     evidence=f"failure_mode={display_failure_mode}, best_hierarchy_score_at_k={best_hierarchy_score}",
                     recommendation_text="Treat this as a candidate generation problem before tuning the final prompt.",
                     next_experiment="Increase top-k to 10 or 20 and compare expected-answer coverage; then test richer candidate text and alternative embeddings.",
-                    implementation_hint="Add descriptions, examples, synonyms, and parent/child labels to the retriever text. If coverage stays low, compare dense vs BM25/hybrid retrieval.",
+                    probable_root_cause=_row_probable_root_cause(),
+                    implementation_hint="Enrich the candidate data with descriptions, examples, synonyms, and hierarchy context. If coverage stays low, compare dense vs BM25/hybrid retrieval.",
+                    tactic="candidate generation upgrade with richer candidate data and hybrid retrieval",
+                    why_tactic="The expected answer never appears in the candidate list, so no selector can recover it later.",
+                    expected_metric_movement="gold_present_at_k_rate up; hit@k up before top-1 changes much",
                     success_signal="Expected-answer coverage and hit@k rise, even before top-1 accuracy improves.",
                 )
             )
@@ -208,7 +248,11 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                     evidence=f"expected_answer_rank={gold_rank}, score_margin_top1_top2={score_margin}",
                     recommendation_text="Focus on the decision layer: reranker, score fusion, or a contrastive prompt over the top candidates.",
                     next_experiment="Freeze retrieval, then compare current top-1 selection against a reranker or prompt that must contrast rank-1 vs candidates containing the expected answer.",
+                    probable_root_cause=_row_probable_root_cause(),
                     implementation_hint="Ask the selector to justify why the winning answer is better than close alternatives, especially when the score margin is small.",
+                    tactic="contrastive reranking over the retrieved shortlist",
+                    why_tactic="The expected answer is already present, so the bottleneck is candidate ordering or final selection.",
+                    expected_metric_movement="top-1 accuracy up; MRR up; hit@k roughly flat",
                     success_signal="top-1 accuracy rises while hit@k stays roughly stable.",
                 )
             )
@@ -219,12 +263,16 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                     priority="P2",
                     issue="Prediction is in a related hierarchy branch but still wrong",
                     evidence=f"failure_mode={display_failure_mode}, best_hierarchy_score_at_k={best_hierarchy_score}",
-                recommendation_text="Improve hierarchy-aware disambiguation instead of treating these as random retrieval misses.",
-                next_experiment="Add branch definitions/examples and run a hierarchy-aware reranker for related alternatives.",
-                implementation_hint="For each candidate, include parent labels, exclusions, domain-specific examples, and contrastive descriptions for related alternatives.",
-                success_signal="same-branch misses convert into exact matches and mean_hierarchy_score_top1 stays high.",
+                    recommendation_text="Improve hierarchy-aware disambiguation instead of treating these as random retrieval misses.",
+                    next_experiment="Add branch definitions/examples and run a hierarchy-aware reranker for related alternatives.",
+                    probable_root_cause=_row_probable_root_cause(),
+                    implementation_hint="For each candidate, include parent labels, exclusions, domain-specific examples, and contrastive descriptions for related alternatives.",
+                    tactic="branch-local hierarchy-aware reranker",
+                    why_tactic="The system is landing near the correct branch but failing to resolve the final node inside that branch.",
+                    expected_metric_movement="same-branch misses down; mean_hierarchy_score_top1 stays high; exact top-1 up",
+                    success_signal="same-branch misses convert into exact matches and mean_hierarchy_score_top1 stays high.",
+                )
             )
-        )
         elif likely_bottleneck == "confidence_calibration":
             recs.append(
                 recommendation(
@@ -249,6 +297,9 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                 recommendation_text="Use a contrastive selection prompt or reranker on low-margin cases instead of trusting rank 1.",
                 next_experiment="Only rerank examples where score_margin_top1_top2 <= 0.05 and compare accuracy/cost.",
                 implementation_hint="Prompt the model with top candidates, their hierarchy or category context, and a required reason for rejecting each close alternative.",
+                tactic="selective expensive rerank for low-margin cases only",
+                why_tactic="The shortlist is already close, but the score gap is too small to trust the default ranking blindly.",
+                expected_metric_movement="low-margin accuracy up; cost increase limited to ambiguous rows",
                 success_signal="Low-margin accuracy improves without adding cost to easy cases.",
             )
         )
@@ -291,6 +342,9 @@ def build_question_recommendations(row: Dict[str, object]) -> List[Dict[str, str
                 recommendation_text="Treat this row as needing extra domain context before blaming only the classifier.",
                 next_experiment="Add title, description, source/category metadata, or manual ambiguity label for this query and rerun.",
                 implementation_hint="Short titles often need object description, accepted alternatives, or source context to disambiguate related classes.",
+                tactic="selective object-focused query enrichment",
+                why_tactic="Short or underspecified queries often fail because retrieval never gets enough lexical cues to bring in the right branch.",
+                expected_metric_movement="short_query_gold_missing_rate down; gold_present_at_k_rate up on ambiguous rows",
                 success_signal="Manual audit confirms whether the expected answer is uniquely inferable from the provided query.",
             )
         )
@@ -628,6 +682,27 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
     error_low_diversity_rate = as_float(cpv_diagnostics.get("error_low_diversity_at_k_rate"))
     error_short_query_rate = as_float(cpv_diagnostics.get("error_short_or_ambiguous_query_rate"))
 
+    def _summary_candidate_generation_root_cause() -> str:
+        if error_short_query_rate is not None and error_short_query_rate >= 0.40:
+            return "Many misses come from short or ambiguous queries, so weak query specification is likely reducing retrieval coverage before ranking begins."
+        if dominant_bottleneck in {"sibling_disambiguation", "hierarchy_disambiguation"}:
+            return "Retrieval is often reaching the right neighborhood but not separating nearby hierarchy codes well enough to keep the expected answer in top-k."
+        if evidence_rates.get("same_division_error_rate") is not None and as_float(evidence_rates.get("same_division_error_rate")) is not None and as_float(evidence_rates.get("same_division_error_rate")) >= 0.20:
+            return "A large share of misses stays inside related divisions, suggesting insufficient hierarchy-aware discrimination rather than completely random retrieval."
+        if error_duplicate_pressure_rate is not None and error_duplicate_pressure_rate >= 0.20:
+            return "The candidate pool is likely saturated by repeated or near-identical alternatives, which pushes some correct answers out of top-k."
+        if error_low_diversity_rate is not None and error_low_diversity_rate >= 0.40:
+            return "Candidate generation appears to over-commit to one branch too early, reducing the chance that the correct branch survives into top-k."
+        return "Retriever coverage is the main visible constraint because correct answers are frequently absent from top-k."
+
+    def _summary_selection_root_cause() -> str:
+        if low_margin_rate is not None and low_margin_rate >= 0.40:
+            return "The correct candidate is often present, but shortlist score margins are too small for the current selector to rank confidently."
+        return "The correct candidate is already available, so the main problem is weak final ordering rather than retrieval coverage."
+
+    def _summary_hierarchy_root_cause() -> str:
+        return "The system is directionally close but lacks enough branch-local evidence to distinguish neighboring codes within the same hierarchy region."
+
     if dominant_bottleneck == "candidate_generation_or_retriever" or (
         gold_present_rate is not None and gold_present_rate < 0.70
     ):
@@ -639,7 +714,11 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 evidence=f"expected_answer_present_at_k={gold_present_rate}, dominant_bottleneck={display_dominant_bottleneck}",
                 recommendation_text="Improve candidate generation alongside selection work, because the final selector cannot recover labels that never appear in top-k.",
                 next_experiment="Run top-k 10/20 and compare dense, BM25, and hybrid retrieval on expected-answer coverage.",
-                implementation_hint="Enrich candidate text with labels, descriptions, parent labels, child labels, examples, and domain synonyms. If the expected answer still does not appear, the selector never had a fair chance.",
+                probable_root_cause=_summary_candidate_generation_root_cause(),
+                implementation_hint="Enrich the underlying candidate data with descriptions, hierarchy context, examples, and domain synonyms. If the expected answer still does not appear, the selector never had a fair chance.",
+                tactic="hybrid candidate generation with enriched candidate data",
+                why_tactic="Coverage is the limiting factor, so the next iteration should widen and enrich the candidate pool before adding more selection complexity.",
+                expected_metric_movement="gold_present_at_k_rate up; hit@k up; dominant_bottleneck shifts away from candidate generation",
                 success_signal="Expected-answer coverage and hit@k rise; then top-1 can be improved with reranking.",
             )
         )
@@ -655,7 +734,11 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 evidence=f"top1={top1}, hit_at_k={hit_at_k}, low_margin_decision_rate={low_margin_rate}",
                 recommendation_text="Freeze retrieval and improve the final selection step with reranking or a contrastive prompt.",
                 next_experiment="Evaluate the same top-k candidates with a cross-encoder/reranker or a prompt that must compare the top candidates side by side.",
+                probable_root_cause=_summary_selection_root_cause(),
                 implementation_hint="This is the likely prompt/reranker failure pattern: the correct answer is available but not promoted to rank 1.",
+                tactic="cross-encoder or contrastive shortlist reranker",
+                why_tactic="The shortlist already contains the correct candidate, so extra recall will not help as much as a stronger final ranker.",
+                expected_metric_movement="exact_top1_accuracy up; MRR up; hit@k stable",
                 success_signal="top-1 accuracy and MRR improve while expected-answer coverage remains stable.",
             )
         )
@@ -669,7 +752,11 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 evidence=f"dominant_bottleneck={display_dominant_bottleneck}, mean_hierarchy_score_top1={hierarchy_similarity}",
                 recommendation_text="Add hierarchy-aware disambiguation for related but still incorrect answers.",
                 next_experiment="Build a branch-aware reranking evaluation for rows with close-branch misses.",
+                probable_root_cause=_summary_hierarchy_root_cause(),
                 implementation_hint="The system is sometimes directionally close; add exclusions, examples, and contrastive definitions for related alternatives rather than only increasing broad recall.",
+                tactic="branch-aware reranking inside related hierarchy alternatives",
+                why_tactic="Near-miss errors show that broad retrieval already works, but sibling/parent-child discrimination is weak.",
+                expected_metric_movement="same-branch wrong-code rate down; exact top-1 up",
                 success_signal="Near misses inside the same branch turn into exact matches.",
             )
         )
@@ -697,6 +784,7 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 evidence=f"error_duplicate_candidate_pressure_rate={error_duplicate_pressure_rate:.2f}",
                 recommendation_text="Deduplicate repeated candidates in error cases and measure whether unique candidate coverage improves.",
                 next_experiment="Compare raw top-k against unique-answer top-k on incorrect rows.",
+                probable_root_cause="Repeated or near-identical candidates are likely consuming shortlist capacity that should be available for genuinely different alternatives.",
                 implementation_hint="Duplicates matter most when they appear in errors; if duplicates are mostly correct rows, this should not drive the next iteration.",
                 success_signal="Higher unique answer count and better hit@k/selection accuracy.",
             )
@@ -711,6 +799,7 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 evidence=f"error_low_diversity_at_k_rate={error_low_diversity_rate:.2f}, overall_low_diversity_at_k_rate={low_diversity_rate}",
                 recommendation_text="Measure whether the retriever is over-committing to one hierarchy branch too early.",
                 next_experiment="Compare unrestricted retrieval with a diversity-aware candidate set, then rerank both.",
+                probable_root_cause="The retriever may be collapsing into one broad branch before the correct branch has a chance to enter the candidate pool.",
                 implementation_hint="Diversity is diagnostic, not always better; use it to discover whether the expected answer's branch is being excluded too early.",
                 success_signal="More relevant branches appear in top-k without reducing exact top-1.",
             )
@@ -725,6 +814,7 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 evidence=f"error_short_or_ambiguous_query_rate={error_short_query_rate:.2f}, overall_short_or_ambiguous_query_rate={short_query_rate}",
                 recommendation_text="Add richer source context before treating every miss as a model failure.",
                 next_experiment="Rerun a subset with title + description + buyer/category metadata and compare failure modes.",
+                probable_root_cause="A substantial share of failures may come from weak query specification rather than from the retriever alone.",
                 implementation_hint="Short titles often need domain context or accepted alternative answers to become fair classification examples.",
                 success_signal="Manual audit labels fewer rows as ambiguous and top-1 accuracy becomes more stable.",
             )
@@ -739,6 +829,7 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 evidence=f"top1={top1:.2f}, hit_at_k={hit_at_k:.2f}",
                 recommendation_text="Prioritize a stronger reranking or decision layer before changing the whole retriever.",
                 next_experiment="Keep the same candidate generator and compare current ranking against reranked top-10 outputs.",
+                probable_root_cause=_summary_selection_root_cause(),
                 implementation_hint="Use a second-stage reranker, hierarchy-aware scoring, or better score fusion before touching retrieval recall.",
                 success_signal="top1 rises materially while hit@k stays flat or improves.",
             )
@@ -951,6 +1042,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Apply selective object-focused query enrichment only to short or ambiguous queries.",
                 next_experiment="Enrich only short queries with object terms and close product-family synonyms, then compare against the unchanged baseline.",
                 implementation_hint="Do not rewrite all queries globally; target only the weak lexical cases where retrieval evidence is too sparse.",
+                tactic="selective structured query enrichment for short queries",
+                why_tactic="Only the short or ambiguous subset needs more lexical guidance; applying enrichment globally risks adding noise.",
+                expected_metric_movement="short_query_gold_missing_rate down; candidate coverage up on weak lexical queries",
                 success_signal="Short-query misses decrease without broad noise increase on well-specified queries.",
                 source="Graph-aware",
             )
@@ -972,6 +1066,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Inspect and clean the notice examples and profile evidence for the most frequent wrong-vs-gold confusion pairs.",
                 next_experiment="Take the top confusion pairs and compare their notice examples side by side before changing global retrieval settings.",
                 implementation_hint="If one wrong code repeatedly wins with strong evidence support, its examples or profile text may be too generic or overly attractive.",
+                tactic="example-channel audit for top confusion pairs",
+                why_tactic="Repeated wrong-code wins with supporting examples usually indicate biased or overly generic example evidence rather than pure ranker failure.",
+                expected_metric_movement="notice_example_supported_error_rate down; repeated confusion-pair frequency down",
                 success_signal="The same wrong code stops dominating across repeated related queries.",
                 source="Graph-aware",
             )
@@ -1006,6 +1103,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Treat these as candidate-generation or evidence-linking failures before changing answer prompts.",
                 next_experiment="Compare the same questions with higher top-k, BM25/hybrid retrieval, and section-title-aware reranking while keeping answer generation fixed.",
                 implementation_hint="The graph-aware signal is useful here because it distinguishes section-not-found cases from answer-synthesis failures.",
+                tactic="section-title-aware retrieval plus graph path coverage audit",
+                why_tactic="The graph indicates that required sections or evidence paths never enter context, so the fix belongs in retrieval and linking.",
+                expected_metric_movement="gold_section_missing_error_rate down; gold_path_missing_error_rate down; kg_added_evidence_recall up",
                 success_signal="Gold-section and gold-path missing rates decline before answer-side metrics move.",
                 source="Graph-aware",
             )
@@ -1025,6 +1125,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Add rule- and version-aware disambiguation rather than only broadening retrieval.",
                 next_experiment="Contrast base MPO vs amendment/correction candidates explicitly and rerank same-document competing sections for questions that mention exam forms, deadlines, or conditions.",
                 implementation_hint="These failures are often close-rule mistakes such as selecting a related exam form or the wrong regulation version rather than missing the program entirely.",
+                tactic="version-aware and same-document competing-section reranker",
+                why_tactic="The correct neighborhood is already retrieved, but the model confuses related rules or document versions inside that neighborhood.",
+                expected_metric_movement="wrong_version_branch_error_rate down; same_branch_wrong_rule_error_rate down",
                 success_signal="Same-branch and wrong-version error rates fall without reducing retrieval recall.",
                 source="Graph-aware",
             )
@@ -1040,6 +1143,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Focus on combining linked facts across sections instead of only retrieving one locally relevant chunk.",
                 next_experiment="Evaluate multi-hop questions with KG-organized context or a checklist answer mode that must cover each linked condition explicitly.",
                 implementation_hint="This is the QA analogue of a graph bridge miss: one needed fact is present, but the linked consequence or condition is not assembled into the final answer.",
+                tactic="bridge composition over linked KG-supported facts",
+                why_tactic="The failure is not missing all evidence; it is failing to assemble linked facts across sections into one answer path.",
+                expected_metric_movement="missing_bridge_fact_error_rate down; answer_claim_kg_path_support_rate up",
                 success_signal="Multi-hop incomplete-answer cases shrink while context-claim recall stays high.",
                 source="Graph-aware",
             )
@@ -1058,6 +1164,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Do not interpret all remaining failures as retrieval misses; the answer step is often leaving available evidence unused.",
                 next_experiment="Freeze retrieval and compare grounded_llm against cite_first and claim_checklist on the graph-supported failure subset.",
                 implementation_hint="This category is especially useful because KG shows that evidence exists, which narrows the problem to synthesis, completeness, or citation behavior.",
+                tactic="cite-first or claim-checklist answer synthesis",
+                why_tactic="Graph-supported evidence already exists, so the most leveraged change is to force the generator to consume and cite it more completely.",
+                expected_metric_movement="graph_supported_incomplete_error_rate down; grounded_claim_ratio stable or up",
                 success_signal="Graph-supported incomplete-answer rates fall while retrieval metrics remain roughly stable.",
                 source="Graph-aware",
             )
@@ -1073,6 +1182,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Tighten refusal criteria on cases where the evidence graph already supports the required rule or relation.",
                 next_experiment="Audit weak-evidence thresholds only on graph-supported refusal rows and compare with a less conservative abstention policy.",
                 implementation_hint="This helps separate genuine low-evidence abstentions from cases where the decision layer is overly cautious after retrieval has already succeeded.",
+                tactic="graph-supported abstention override or threshold relaxation",
+                why_tactic="A refusal is less justified when the evidence graph already links the required rule or relation with supporting context.",
+                expected_metric_movement="graph_supported_false_refusal_rate down; unsupported answer rate roughly flat",
                 success_signal="False refusals decrease without a matching rise in unsupported answers.",
                 source="Graph-aware",
             )
@@ -1088,6 +1200,9 @@ def build_summary_recommendations(summary: Dict[str, object]) -> List[Dict[str, 
                 recommendation_text="Constrain graph expansion or rerank graph-added chunks more aggressively before passing them to answer generation.",
                 next_experiment="Compare safe_branch against conservative/direct_only profiles and inspect whether graph-only additions still help on the same rows.",
                 implementation_hint="Graph-aware analysis is useful here because it identifies when KG is contributing evidence pressure without actually improving the answer path.",
+                tactic="conservative KG expansion with graph-added chunk reranking",
+                why_tactic="The KG is adding evidence pressure without enough precision, so the next change should reduce expansion breadth before it reaches generation.",
+                expected_metric_movement="kg_graph_noise_at_k down; kg_added_evidence_precision up",
                 success_signal="Graph-noise errors fall while KG-added evidence precision rises.",
                 source="Graph-aware",
             )
@@ -1106,6 +1221,9 @@ def apply_question_recommendations(row: Dict[str, object]) -> Dict[str, object]:
     row["recommended_action"] = primary["recommendation"] if primary else ""
     row["recommendation_reason"] = primary["evidence"] if primary else ""
     row["recommended_experiment"] = primary["next_experiment"] if primary else ""
+    row["recommended_tactic"] = primary["tactic"] if primary else ""
+    row["recommended_tactic_reason"] = primary["why_tactic"] if primary else ""
+    row["recommended_expected_metric_movement"] = primary["expected_metric_movement"] if primary else ""
     row["needs_manual_review"] = any(
         rec["component"] == "evaluation" or rec["priority"] == "P0" for rec in recs
     )
@@ -1155,20 +1273,28 @@ def build_run_advisor(summary: Dict[str, object], rows: Sequence[Dict[str, objec
                 "priority": rec.get("priority", "P3"),
                 "count": 0,
                 "evidence": rec.get("evidence", ""),
+                "probable_root_cause": rec.get("probable_root_cause", ""),
                 "recommendation": rec.get("recommendation", ""),
                 "next_experiment": rec.get("next_experiment", ""),
                 "implementation_hint": rec.get("implementation_hint", ""),
                 "success_signal": rec.get("success_signal", ""),
+                "tactic": rec.get("tactic", ""),
+                "why_tactic": rec.get("why_tactic", ""),
+                "expected_metric_movement": rec.get("expected_metric_movement", ""),
             },
         )
         item["count"] = int(item["count"]) + 1
         if priority_rank(str(rec.get("priority"))) < priority_rank(str(item["priority"])):
             item["priority"] = rec.get("priority", item["priority"])
             item["evidence"] = rec.get("evidence", item["evidence"])
+            item["probable_root_cause"] = rec.get("probable_root_cause", item["probable_root_cause"])
             item["recommendation"] = rec.get("recommendation", item["recommendation"])
             item["next_experiment"] = rec.get("next_experiment", item["next_experiment"])
             item["implementation_hint"] = rec.get("implementation_hint", item["implementation_hint"])
             item["success_signal"] = rec.get("success_signal", item["success_signal"])
+            item["tactic"] = rec.get("tactic", item["tactic"])
+            item["why_tactic"] = rec.get("why_tactic", item["why_tactic"])
+            item["expected_metric_movement"] = rec.get("expected_metric_movement", item["expected_metric_movement"])
 
     top_recommendations = sorted(
         grouped.values(),

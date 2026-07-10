@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sqlite3
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List, Sequence
 
 
 _EXAMPLE_SOURCE_WEIGHTS = {

@@ -659,11 +659,8 @@ def retrieve_top_k_cpv_multi(
 ) -> List[Dict]:
     if k <= 0:
         return []
-    if retriever_state.get("backend") != "cpv_multi":
-        if retriever_state.get("backend") == "sqlite_cpv_multi":
-            pass
-        else:
-            raise ValueError("retrieve_top_k_cpv_multi requires a cpv_multi retriever state.")
+    if retriever_state.get("backend") not in {"cpv_multi", "sqlite_cpv_multi"}:
+        raise ValueError("retrieve_top_k_cpv_multi requires a cpv_multi retriever state.")
 
     if retriever_state.get("backend") == "sqlite_cpv_multi":
         if retriever_state.get("profile") == "hybrid":

@@ -78,23 +78,6 @@ def _doc_year(doc_path: str) -> int | None:
         return None
 
 
-def _json_list(value: object) -> List[str]:
-    if value is None or value == "":
-        return []
-    if isinstance(value, list):
-        return [str(item) for item in value if str(item).strip()]
-    text = str(value).strip()
-    if not text:
-        return []
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return [str(item) for item in parsed if str(item).strip()]
-    except json.JSONDecodeError:
-        pass
-    return [text]
-
-
 def _scope_doc_paths(row: Dict[str, object]) -> List[str]:
     raw_scope = row.get("evaluation_scope") or row.get("answer_scope")
     if raw_scope is None or raw_scope == "":

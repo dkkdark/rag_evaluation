@@ -1,6 +1,6 @@
 # RAG Evaluation Admin
 
-This project evaluates RAG and classifier outputs from a small local web UI. It can score document-question answering over PDF regulations, local TED/CPV classification, external classifier APIs, and already prepared RAG/classifier result files.
+This project evaluates RAG and classifier outputs from a small local web UI and CLI. It can score document-question answering over PDF regulations, local TED/CPV classification, external classifier APIs, and already prepared RAG/classifier result files.
 
 ## Quick Start
 
@@ -15,7 +15,8 @@ This project evaluates RAG and classifier outputs from a small local web UI. It 
 
    - PDF regulations: `data/files/**/*.pdf*`
    - Evaluation questions: `data/questions_by_file.json`
-   - CPV catalog: `data/cpv_ted_train_catalog.csv`
+   - TED source export: `data/teddata_corpus_export.csv`
+   - TED corpus export for CPV candidate building: `data/teddata_corpus_export.csv`
    - CPV test queries: `data/cpv_ted_test_queries.json`
    - Prepared result workbook: `data/eval_dataset.xlsx`
 
@@ -33,7 +34,7 @@ This project evaluates RAG and classifier outputs from a small local web UI. It 
 
 5. Choose `Mode`, choose a `Classifier`, fill the visible settings, then click `Start evaluation`.
 
-Runs are written under `outputs/<run_name>/`. The most important files are `run_summary.json`, `rag_results.csv`, `retrieved_chunks.csv`, `answer_metrics.csv`, `retrieval_metrics.csv`, `diagnostics.csv`, and `quality_report.md`.
+Runs are written under `outputs/<run_name>/`. The most important file is always `run_summary.json`; depending on classifier and enabled features you will also see `rag_results.csv`, `retrieved_chunks.csv`, `answer_metrics.csv`, `retrieval_metrics.csv`, `diagnostics.csv`, `quality_report.md`, and optional showcase/visualization artifacts.
 
 ## Code Layout
 
@@ -55,16 +56,19 @@ Runs are written under `outputs/<run_name>/`. The most important files are `run_
 
 `Classifier` controls what is being evaluated.
 
-- `examination_regulations`: PDF-based RAG over examination/regulation documents from `data/files/`.
+- `document_qa`: PDF-based RAG over examination/regulation documents from `data/files/`.
+- `examination_regulations`: backwards-compatible alias for `document_qa`.
 - `ted_cpv`: local CPV classifier that ranks CPV catalog entries for TED-style queries.
 - `api_classifier`: calls an external HTTP classifier and evaluates its ranked CPV predictions.
 - `prepared_rag_results`: evaluates predictions already stored in an Excel workbook.
 
 ## Running Each Classifier in the Web UI
 
-### `examination_regulations`
+### `document_qa`
 
 Use this when you want to evaluate question answering over PDF regulation documents.
+
+In the current web UI this appears as `document_qa_files`. The older name `examination_regulations` is still accepted as a compatibility alias in the CLI/backend.
 
 Required inputs:
 
@@ -87,6 +91,7 @@ Main outputs:
 - `sections.csv` and `paragraphs.csv`: parsed document structure.
 - `retrieved_chunks.csv`: chunks retrieved for each question.
 - `rag_results.csv`: one row per question with answer, retrieval, diagnostics, and recommendations.
+- `answer_metrics.csv`, `retrieval_metrics.csv`, `diagnostics.csv`, `quality_report.md`: aggregate and per-row evaluation outputs.
 
 ### `ted_cpv`
 
@@ -94,9 +99,16 @@ Use this when you want to evaluate the built-in local CPV classifier. It treats 
 
 Required inputs:
 
-- `CPV catalog`: usually `data/cpv_ted_train_catalog.csv`.
+- `TED corpus export`: usually `data/teddata_corpus_export.csv`.
 - `CPV queries`: usually `data/cpv_ted_test_queries.json`.
 - `Retriever`: retrieval method used to rank CPV labels/descriptions.
+
+Typical TED data preparation flow:
+
+- `python -m rag_eval.entrypoints.prepare_ted_cpv_data --source auto`
+- `python -m rag_eval.entrypoints.ingest_ted_notices --source auto`
+
+`--source auto` now prefers `data/teddata_corpus_export.csv` and falls back to the TED API only when the file is missing.
 
 Useful options:
 
@@ -239,6 +251,40 @@ CPV diagnostic metrics explain where the classifier likely failed:
 - `questions_with_relevant_chunk`: number of questions with at least one relevant retrieved item.
 - `questions_with_target_doc_at_k`: number of questions where top-K includes the target document/code.
 
+### KG Metrics
+
+When `KG retrieval` is enabled, the run writes `kg_entities.csv`, `kg_relations.csv`, `kg_metrics.csv`, and `kg_summary.json`.
+
+- `kg_graph_gain_at_k`: KG-added relation evidence gain over base retrieval.
+- `kg_graph_noise_at_k`: share of graph-only chunks judged noisy for the question.
+- `kg_added_evidence_precision`: useful KG-added chunks divided by all KG-added chunks.
+- `kg_added_evidence_recall`: missing gold relation evidence recovered by KG expansion.
+- `kg_path_availability`: share of required triples supported by an available KG path.
+- `kg_path_correctness`: share of available KG paths that also support source evidence.
+- `answer_claim_kg_path_support_rate`: answer claims whose supporting chunks are connected to KG paths.
+- `kg_path_grounded_claim_ratio`: answer claims grounded by both text evidence and KG paths.
+- `kg_node_grounding_rate` and `kg_edge_grounding_rate`: graph construction provenance coverage.
+- `metrics_by_question_type`: KG metrics grouped by inferred or explicit `question_type`.
+
+Optional `--kg-ablation-edge-dropouts 0.1,0.3` writes `kg_incompleteness_ablation.csv` and checks how relation-evidence recall changes when graph edges are removed.
+
+### Design Attribution Outputs
+
+Every classifier run also writes artifacts that connect quality scores to concrete design choices. These files are shown in the web UI for `document_qa`, `ted_cpv`, `api_classifier`, and `prepared_rag_results` runs.
+
+- `design_trace.csv`: per-question trace with retrieval, answer, KG, configuration, parsing, and cost-proxy fields.
+- `paired_design_comparisons.csv`: same-question comparisons across changed factors such as retriever, chunking, top-k, KG profile, context organization, HyDE, and Self-RAG. Rows include `comparison_type` so controlled comparisons can be separated from confounded comparisons.
+- `design_factor_effects.csv`: aggregate deltas by factor/value, including controlled-only deltas, confidence intervals, and win/loss rates.
+- `failure_attribution.csv`: row-level likely component attribution, suspected design factors, component scores, best observed counterfactual fix, evidence, and recommended next ablation.
+- `group_failure_explanations.csv`: grouped causal explanations over similar failure cases, using aggregate metrics and repeated observed fixes instead of one explanation per question.
+- `component_attribution.csv`: failure and quality summaries grouped by likely failing component such as candidate generation, ranking, KG noise, answer generation, citation attribution, calibration, parsing, or benchmark ambiguity.
+- `failure_taxonomy.csv`: reference table explaining each failure taxonomy label and mapping it to advisor-style issue, recommendation, and next experiment.
+- `task_type_attribution.csv`: factor effects grouped by `question_type`, useful for separating single-hop, multi-hop, relation, summary/global, and taxonomy behavior.
+- `design_pareto_frontier.csv`: quality-versus-cost trade-off table showing which configurations are Pareto optimal.
+- `parsing_diagnostics.csv`: document parsing diagnostics used to separate parsing failures from retrieval or generation failures.
+- `cost_latency_attribution.csv`: per-configuration runtime and relative cost proxies, including estimated LLM calls and KG overhead.
+- `design_attribution_report.md`: thesis-friendly narrative summary of the strongest factor effects, failure causes, parsing issues, and cost/latency trade-offs.
+
 ### Answer Quality Metrics
 
 - `answer_accuracy_label`: automatic label such as `correct`, `partially_correct`, `incorrect`, `unsupported`, or `needs_manual_review`.
@@ -324,4 +370,5 @@ Start with these files:
 3. `rag_results.csv`: the main per-question table.
 4. `retrieved_chunks.csv`: what the retriever/classifier actually returned.
 5. `answer_metrics_summary.json` and `retrieval_metrics_summary.json`: aggregate scores.
-6. `diagnostics.csv`: why each row failed or needs review.
+6. `kg_summary.json`: KG graph quality, KG-aware retrieval metrics, and task-type breakdowns when KG is enabled.
+7. `diagnostics.csv`: why each row failed or needs review.

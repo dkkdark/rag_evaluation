@@ -116,6 +116,10 @@ def _truthy_flag(value: object) -> bool:
     return bool(value)
 
 
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
 def _unique_chunk_counts_by_k(
     retrieved_rows: Sequence[Dict],
     *,
@@ -472,6 +476,225 @@ def write_strategy_diagnostics_svg(summary: Dict, output_path: str) -> str | Non
     return output_path
 
 
+def write_kg_contribution_funnel_svg(
+    summary: Dict,
+    result_rows: Sequence[Dict],
+    output_path: str,
+) -> str | None:
+    kg_summary = summary.get("kg", {}) if isinstance(summary.get("kg"), dict) else {}
+    if not kg_summary.get("enabled"):
+        return None
+
+    valid_rows = [row for row in result_rows if isinstance(row, dict)]
+    if not valid_rows:
+        return None
+
+    incorrect_rows = [row for row in valid_rows if str(row.get("auto_flag") or "") != "correct"]
+    if not incorrect_rows:
+        return None
+
+    def as_float(value: object) -> float | None:
+        return _safe_float(value)
+
+    def has_gold_section(row: Dict) -> bool:
+        return any(
+            (as_float(row.get(key)) or 0.0) > 0.0
+            for key in ("gold_kg_doc_recall", "gold_kg_section_recall")
+        )
+
+    def has_path_support(row: Dict) -> bool:
+        relation_recall = as_float(row.get("gold_kg_relation_evidence_recall")) or 0.0
+        path_availability = as_float(row.get("kg_path_availability")) or 0.0
+        path_correctness = as_float(row.get("kg_path_correctness")) or 0.0
+        return relation_recall >= 0.5 or path_availability >= 0.5 or path_correctness >= 0.5
+
+    def failed_despite_support(row: Dict) -> bool:
+        claim_diag = str(row.get("claim_diagnostic") or "")
+        false_refusal = _truthy_flag(row.get("false_refusal"))
+        return false_refusal or claim_diag in {
+            "answer_incomplete",
+            "answer_incomplete_from_available_context",
+            "unsupported_generated_claims",
+            "claim_contradiction",
+        }
+
+    gold_section_rows = [row for row in incorrect_rows if has_gold_section(row)]
+    path_support_rows = [row for row in gold_section_rows if has_path_support(row)]
+    support_not_used_rows = [row for row in path_support_rows if failed_despite_support(row)]
+
+    stages = [
+        ("All questions", len(valid_rows), "#d6ccbb"),
+        ("Incorrect answers", len(incorrect_rows), "#efb366"),
+        ("Gold section present", len(gold_section_rows), "#7ec7b2"),
+        ("KG path support available", len(path_support_rows), "#68a8ff"),
+        ("Support present, answer still failed", len(support_not_used_rows), "#ef7d8f"),
+    ]
+
+    if max(count for _, count, _ in stages) <= 0:
+        return None
+
+    width = 1160
+    height = 700
+    center_x = width / 2
+    top_y = 90
+    stage_height = 94
+    gap = 18
+    max_width = 820
+    min_width = 260
+    max_count = max(count for _, count, _ in stages) or 1
+
+    blocks: List[str] = []
+    connectors: List[str] = []
+    for index, (label, count, color) in enumerate(stages):
+        ratio = count / max_count
+        block_width = min_width + (max_width - min_width) * ratio
+        x = center_x - block_width / 2
+        y = top_y + index * (stage_height + gap)
+        rate = count / len(valid_rows) if valid_rows else 0.0
+        blocks.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{block_width:.1f}" height="{stage_height:.1f}" '
+            f'rx="22" fill="{color}" fill-opacity="0.92" />'
+            f'<text x="{center_x:.1f}" y="{y + 38:.1f}" text-anchor="middle" font-size="28" fill="#253043" '
+            'font-family="Helvetica, Arial, sans-serif">'
+            f"{html.escape(label)}</text>"
+            f'<text x="{center_x:.1f}" y="{y + 68:.1f}" text-anchor="middle" font-size="20" fill="#364055" '
+            'font-family="Helvetica, Arial, sans-serif">'
+            f"{count} questions ({rate:.1%})</text>"
+        )
+        if index < len(stages) - 1:
+            next_count = stages[index + 1][1]
+            next_ratio = next_count / max_count
+            next_width = min_width + (max_width - min_width) * next_ratio
+            next_x = center_x - next_width / 2
+            next_y = top_y + (index + 1) * (stage_height + gap)
+            connectors.append(
+                f'<path d="M {x + 22:.1f} {y + stage_height:.1f} L {next_x + 22:.1f} {next_y:.1f} '
+                f'L {next_x + next_width - 22:.1f} {next_y:.1f} L {x + block_width - 22:.1f} {y + stage_height:.1f} Z" '
+                'fill="#e8e1d3" fill-opacity="0.78" />'
+            )
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="KG contribution funnel">
+  <rect width="{width}" height="{height}" fill="#fffdf8" />
+  <text x="36" y="42" font-size="30" fill="#444b57" font-family="Helvetica, Arial, sans-serif">KG Contribution Funnel</text>
+  <text x="36" y="72" font-size="18" fill="#7b808a" font-family="Helvetica, Arial, sans-serif">Progressive view from overall errors to cases where graph-supported evidence still was not converted into a correct answer.</text>
+  {''.join(connectors)}
+  {''.join(blocks)}
+</svg>
+"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(svg)
+    return output_path
+
+
+def write_kg_uplift_scatter_svg(
+    result_rows: Sequence[Dict],
+    output_path: str,
+    *,
+    chart_label: str,
+) -> str | None:
+    points: List[Dict[str, object]] = []
+    for index, row in enumerate(result_rows):
+        if not isinstance(row, dict):
+            continue
+        base_value = _safe_float(row.get("base_gold_kg_relation_evidence_recall"))
+        final_value = _safe_float(row.get("gold_kg_relation_evidence_recall"))
+        if base_value is None or final_value is None:
+            continue
+        delta = final_value - base_value
+        if delta > 1e-9:
+            bucket = "improved"
+            color = "#58c28c"
+        elif delta < -1e-9:
+            bucket = "degraded"
+            color = "#ef7d8f"
+        else:
+            bucket = "unchanged"
+            color = "#68a8ff"
+        jitter_x = ((index % 7) - 3) * 2.1
+        jitter_y = (((index // 7) % 7) - 3) * 2.1
+        points.append(
+            {
+                "base": _clamp01(base_value),
+                "final": _clamp01(final_value),
+                "color": color,
+                "bucket": bucket,
+                "jitter_x": jitter_x,
+                "jitter_y": jitter_y,
+            }
+        )
+
+    if not points:
+        return None
+
+    width = 1120
+    height = 760
+    margin_left = 110
+    margin_right = 60
+    margin_top = 110
+    margin_bottom = 110
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+
+    def x_for(value: float) -> float:
+        return margin_left + _clamp01(value) * plot_width
+
+    def y_for(value: float) -> float:
+        return margin_top + (1.0 - _clamp01(value)) * plot_height
+
+    ticks: List[str] = []
+    for ratio in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        x = x_for(ratio)
+        y = y_for(ratio)
+        ticks.append(f'<line x1="{x:.1f}" y1="{margin_top}" x2="{x:.1f}" y2="{margin_top + plot_height}" stroke="#efe7d8" stroke-width="1.5" />')
+        ticks.append(f'<line x1="{margin_left}" y1="{y:.1f}" x2="{margin_left + plot_width}" y2="{y:.1f}" stroke="#efe7d8" stroke-width="1.5" />')
+        ticks.append(
+            f'<text x="{x:.1f}" y="{margin_top + plot_height + 34:.1f}" text-anchor="middle" font-size="18" fill="#6f7683" font-family="Helvetica, Arial, sans-serif">{ratio:.2f}</text>'
+        )
+        ticks.append(
+            f'<text x="{margin_left - 16:.1f}" y="{y + 6:.1f}" text-anchor="end" font-size="18" fill="#6f7683" font-family="Helvetica, Arial, sans-serif">{ratio:.2f}</text>'
+        )
+
+    bucket_counts = {
+        "improved": sum(1 for point in points if point["bucket"] == "improved"),
+        "unchanged": sum(1 for point in points if point["bucket"] == "unchanged"),
+        "degraded": sum(1 for point in points if point["bucket"] == "degraded"),
+    }
+
+    circles = "".join(
+        f'<circle cx="{x_for(float(point["base"])) + float(point["jitter_x"]):.1f}" '
+        f'cy="{y_for(float(point["final"])) + float(point["jitter_y"]):.1f}" r="6.5" '
+        f'fill="{point["color"]}" fill-opacity="0.86" stroke="#ffffff" stroke-width="1.4" />'
+        for point in points
+    )
+
+    legend_x = width - 320
+    legend_y = 44
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="KG uplift scatter for {html.escape(chart_label)}">
+  <rect width="{width}" height="{height}" fill="#fffdf8" />
+  <text x="36" y="40" font-size="30" fill="#444b57" font-family="Helvetica, Arial, sans-serif">KG vs No-KG Uplift Scatter</text>
+  <text x="36" y="70" font-size="18" fill="#7b808a" font-family="Helvetica, Arial, sans-serif">{html.escape(chart_label)}</text>
+  {''.join(ticks)}
+  <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{margin_left + plot_width}" y2="{margin_top}" stroke="#9aa3b3" stroke-width="3" stroke-dasharray="10 8" />
+  <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{margin_left + plot_width}" y2="{margin_top + plot_height}" stroke="#8d8d8d" stroke-width="3" />
+  <line x1="{margin_left}" y1="{margin_top + plot_height}" x2="{margin_left}" y2="{margin_top}" stroke="#8d8d8d" stroke-width="3" />
+  {circles}
+  <rect x="{legend_x}" y="{legend_y}" width="20" height="20" rx="5" fill="#58c28c" />
+  <text x="{legend_x + 30}" y="{legend_y + 16}" font-size="18" fill="#4f5665" font-family="Helvetica, Arial, sans-serif">improved ({bucket_counts["improved"]})</text>
+  <rect x="{legend_x}" y="{legend_y + 30}" width="20" height="20" rx="5" fill="#68a8ff" />
+  <text x="{legend_x + 30}" y="{legend_y + 46}" font-size="18" fill="#4f5665" font-family="Helvetica, Arial, sans-serif">unchanged ({bucket_counts["unchanged"]})</text>
+  <rect x="{legend_x}" y="{legend_y + 60}" width="20" height="20" rx="5" fill="#ef7d8f" />
+  <text x="{legend_x + 30}" y="{legend_y + 76}" font-size="18" fill="#4f5665" font-family="Helvetica, Arial, sans-serif">degraded ({bucket_counts["degraded"]})</text>
+  <text x="{width - margin_right - 8}" y="{margin_top + plot_height + 70}" font-size="24" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">No-KG relation evidence recall</text>
+  <text x="42" y="{margin_top + 40}" transform="rotate(-90 42 {margin_top + 40})" font-size="24" fill="#7c7f87" font-family="Helvetica, Arial, sans-serif">With-KG relation evidence recall</text>
+</svg>
+"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(svg)
+    return output_path
+
+
 def build_strategy_improvement_summary(summary: Dict) -> Dict[str, object]:
     answer_metrics = summary.get("answer_metrics", {})
     retrieval = summary.get("retrieval_metrics", {})
@@ -643,35 +866,43 @@ def write_strategy_showcase_bundle(
     retrieved_rows: Sequence[Dict],
     experiment_dir: str,
 ) -> Dict[str, object]:
+    paths = {
+        "score_profile_svg": os.path.join(experiment_dir, "strategy_score_profile.svg"),
+        "metric_overview_svg": os.path.join(experiment_dir, "strategy_metric_overview.svg"),
+        "chunk_alignment_svg": os.path.join(experiment_dir, "strategy_chunk_alignment.svg"),
+        "unique_chunk_alignment_svg": os.path.join(experiment_dir, "strategy_unique_chunk_alignment.svg"),
+        "diagnostics_svg": os.path.join(experiment_dir, "strategy_diagnostics.svg"),
+        "showcase_md": os.path.join(experiment_dir, "strategy_showcase.md"),
+    }
     score_profile_svg = write_strategy_score_profile_svg(
         retrieved_rows,
-        os.path.join(experiment_dir, "strategy_score_profile.svg"),
+        paths["score_profile_svg"],
         experiment_slug=summary["experiment"],
         top_k=int(summary["top_k"]),
     )
     metric_overview_svg = write_strategy_metric_overview_svg(
-        summary, os.path.join(experiment_dir, "strategy_metric_overview.svg")
+        summary, paths["metric_overview_svg"]
     )
     chunk_alignment_svg = write_chunk_relevance_comparison_svg(
         retrieved_rows,
-        os.path.join(experiment_dir, "strategy_chunk_alignment.svg"),
+        paths["chunk_alignment_svg"],
         top_k=int(summary["top_k"]),
         chart_label=summary["experiment"],
     )
     unique_chunk_alignment_svg = write_chunk_relevance_comparison_svg(
         retrieved_rows,
-        os.path.join(experiment_dir, "strategy_unique_chunk_alignment.svg"),
+        paths["unique_chunk_alignment_svg"],
         top_k=int(summary["top_k"]),
         chart_label=summary["experiment"],
         unique_relevance=True,
     )
     diagnostics_svg = write_strategy_diagnostics_svg(
-        summary, os.path.join(experiment_dir, "strategy_diagnostics.svg")
+        summary, paths["diagnostics_svg"]
     )
     recommendation = build_strategy_improvement_summary(summary)
     showcase_md = write_strategy_showcase_md(
         summary,
-        os.path.join(experiment_dir, "strategy_showcase.md"),
+        paths["showcase_md"],
         score_profile_svg=score_profile_svg,
         metric_overview_svg=metric_overview_svg,
         diagnostics_svg=diagnostics_svg,
@@ -914,35 +1145,43 @@ def write_classifier_showcase_bundle(
     ranking_rows: Sequence[Dict],
     experiment_dir: str,
 ) -> Dict[str, object]:
+    paths = {
+        "score_profile_svg": os.path.join(experiment_dir, "classifier_score_profile.svg"),
+        "metric_overview_svg": os.path.join(experiment_dir, "classifier_metric_overview.svg"),
+        "chunk_alignment_svg": os.path.join(experiment_dir, "classifier_chunk_alignment.svg"),
+        "unique_chunk_alignment_svg": os.path.join(experiment_dir, "classifier_unique_chunk_alignment.svg"),
+        "diagnostics_svg": os.path.join(experiment_dir, "classifier_diagnostics.svg"),
+        "showcase_md": os.path.join(experiment_dir, "classifier_showcase.md"),
+    }
     score_profile_svg = write_strategy_score_profile_svg(
         ranking_rows,
-        os.path.join(experiment_dir, "classifier_score_profile.svg"),
+        paths["score_profile_svg"],
         experiment_slug=summary["experiment"],
         top_k=int(summary["top_k"]),
     )
     metric_overview_svg = write_classifier_metric_overview_svg(
-        summary, os.path.join(experiment_dir, "classifier_metric_overview.svg")
+        summary, paths["metric_overview_svg"]
     )
     chunk_alignment_svg = write_chunk_relevance_comparison_svg(
         ranking_rows,
-        os.path.join(experiment_dir, "classifier_chunk_alignment.svg"),
+        paths["chunk_alignment_svg"],
         top_k=int(summary["top_k"]),
         chart_label=summary.get("experiment", "classifier"),
     )
     unique_chunk_alignment_svg = write_chunk_relevance_comparison_svg(
         ranking_rows,
-        os.path.join(experiment_dir, "classifier_unique_chunk_alignment.svg"),
+        paths["unique_chunk_alignment_svg"],
         top_k=int(summary["top_k"]),
         chart_label=summary.get("experiment", "classifier"),
         unique_relevance=True,
     )
     diagnostics_svg = write_strategy_diagnostics_svg(
-        summary, os.path.join(experiment_dir, "classifier_diagnostics.svg")
+        summary, paths["diagnostics_svg"]
     )
     recommendation = build_classifier_improvement_summary(summary)
     showcase_md = write_classifier_showcase_md(
         summary,
-        os.path.join(experiment_dir, "classifier_showcase.md"),
+        paths["showcase_md"],
         recommendation=recommendation,
     )
     return {

@@ -81,18 +81,7 @@ def text_response(
     handler.wfile.write(data)
 
 
-def read_json(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-            return data if isinstance(data, dict) else None
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def read_json_any(path: Path) -> Any:
+def _read_json_file(path: Path) -> Any:
     if not path.exists():
         return None
     try:
@@ -100,6 +89,11 @@ def read_json_any(path: Path) -> Any:
             return json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+    data = _read_json_file(path)
+    return data if isinstance(data, dict) else None
 
 
 def safe_run_name(raw_name: str | None) -> str:
@@ -123,13 +117,9 @@ def safe_upload_name(raw_name: str) -> str:
     return cleaned[:120]
 
 
-def default_run_name() -> str:
-    return "web_eval_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
 def default_question_pdf_paths(questions_path: Path | None = None) -> list[str]:
     path = questions_path or (PROJECT_ROOT / "data" / "questions_by_file.json")
-    payload = read_json_any(path)
+    payload = _read_json_file(path)
     if isinstance(payload, dict) and isinstance(payload.get("questions"), list):
         items = payload["questions"]
     elif isinstance(payload, list):
@@ -2330,14 +2320,16 @@ INDEX_HTML = r"""<!doctype html>
               evidence: `rate=${fmt(item.rate)}; count=${fmt(item.count)}`,
               recommendation: template.recommendation,
               next_experiment: template.next_experiment,
+              tactic: template.tactic || "",
+              why_tactic: template.why_tactic || "",
+              expected_metric_movement: template.expected_metric_movement || "",
             };
           })
       );
       const seen = new Set();
       return items.filter(item => {
         const source = inferRecommendationSource(item);
-        if (!["Graph-aware", "Design attribution"].includes(source)) return false;
-        const key = `${item.priority}|${item.component}|${item.issue}|${item.recommendation}`;
+        const key = `${source}|${item.priority}|${item.component}|${item.issue}|${item.recommendation}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -2373,6 +2365,10 @@ INDEX_HTML = r"""<!doctype html>
           ${item.n_cases ? `<div class="meta">Errors in category: ${fmt(item.n_cases)}</div>` : ""}
           <div>${htmlEscape(item.recommendation || "")}</div>
           ${item.evidence ? `<div class="meta">Evidence: ${htmlEscape(item.evidence)}</div>` : ""}
+          ${item.probable_root_cause ? `<div class="meta">Probable root cause: ${htmlEscape(item.probable_root_cause)}</div>` : ""}
+          ${item.tactic ? `<div class="meta">Tactic: ${htmlEscape(item.tactic)}</div>` : ""}
+          ${item.why_tactic ? `<div class="meta">Why this tactic: ${htmlEscape(item.why_tactic)}</div>` : ""}
+          ${item.expected_metric_movement ? `<div class="meta">Expected metric movement: ${htmlEscape(item.expected_metric_movement)}</div>` : ""}
           ${item.likely_causes ? `<div class="meta">Likely causes: ${htmlEscape(item.likely_causes).replaceAll(" | ", "<br />")}</div>` : ""}
           ${item.next_experiment ? `<div class="meta">Next: ${htmlEscape(item.next_experiment)}</div>` : ""}
         </div>
@@ -2906,7 +2902,7 @@ class EvaluationAdminHandler(BaseHTTPRequestHandler):
             return json_response(self, {"error": "Not found"}, HTTPStatus.NOT_FOUND)
         try:
             payload = self.read_json_body()
-            run_name = safe_run_name(payload.get("run_name") or default_run_name())
+            run_name = safe_run_name(payload.get("run_name"))
             run_dir = DEFAULT_OUTPUT_DIR / run_name
             if run_dir.exists() and (run_dir / "run_summary.json").exists():
                 run_name = safe_run_name(f"{run_name}_{datetime.now().strftime('%H%M%S')}")

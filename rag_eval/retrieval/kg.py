@@ -7,8 +7,6 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Sequence
 
-from rag_eval.evaluation.metrics import text_matches_keyword
-
 
 ENTITY_PATTERNS = {
     "Section": re.compile(r"§\s*\d+[a-zA-Z]?(?:\s*Abs\.\s*\d+)?"),

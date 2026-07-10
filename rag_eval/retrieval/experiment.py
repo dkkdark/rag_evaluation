@@ -47,6 +47,8 @@ from rag_eval.retrieval.engines import build_retriever_with_backend, rerank_with
 from rag_eval.core.text_utils import metadata_value_matches
 from rag_eval.reporting.visualization import (
     write_chunk_relevance_comparison_svg,
+    write_kg_contribution_funnel_svg,
+    write_kg_uplift_scatter_svg,
     write_strategy_score_profile_svg,
     write_strategy_showcase_bundle,
 )
@@ -1739,6 +1741,8 @@ def run_single_experiment(
             "enabled": create_strategy_visualization,
             "strategy_score_profile_svg": None,
             "strategy_chunk_alignment_svg": None,
+            "kg_contribution_funnel_svg": None,
+            "kg_uplift_scatter_svg": None,
         },
         "showcase": {
             "enabled": False,
@@ -1773,6 +1777,8 @@ def run_single_experiment(
             "error_report_md": error_report_md,
             "strategy_score_profile_svg": None,
             "strategy_chunk_alignment_svg": None,
+            "kg_contribution_funnel_svg": None,
+            "kg_uplift_scatter_svg": None,
             "strategy_metric_overview_svg": None,
             "strategy_diagnostics_svg": None,
             "strategy_showcase_md": None,
@@ -1790,6 +1796,22 @@ def run_single_experiment(
     summary["advisor"] = quality_advisor
     summary["outputs"]["quality_advisor_json"] = quality_advisor_json
     summary["outputs"]["quality_report_md"] = quality_report_md
+
+    if create_strategy_visualization or create_strategy_showcase:
+        kg_contribution_funnel_svg = write_kg_contribution_funnel_svg(
+            summary,
+            results,
+            os.path.join(experiment_dir, "kg_contribution_funnel.svg"),
+        )
+        kg_uplift_scatter_svg = write_kg_uplift_scatter_svg(
+            results,
+            os.path.join(experiment_dir, "kg_uplift_scatter.svg"),
+            chart_label=experiment_slug,
+        )
+        summary["visualization"]["kg_contribution_funnel_svg"] = kg_contribution_funnel_svg
+        summary["visualization"]["kg_uplift_scatter_svg"] = kg_uplift_scatter_svg
+        summary["outputs"]["kg_contribution_funnel_svg"] = kg_contribution_funnel_svg
+        summary["outputs"]["kg_uplift_scatter_svg"] = kg_uplift_scatter_svg
 
     if create_strategy_visualization:
         score_profile_svg = write_strategy_score_profile_svg(

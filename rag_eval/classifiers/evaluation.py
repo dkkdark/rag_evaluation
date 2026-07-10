@@ -17,24 +17,19 @@ from typing import Dict, List, Sequence
 from rag_eval.core.models import DiagnosticResult, LLMCallResult, LLMConfig
 from rag_eval.evaluation.advisor import apply_question_recommendations, build_run_advisor, write_quality_report
 from rag_eval.classifiers.cpv_baseline import (
-    CPVRecord,
     build_cpv_chunks,
     build_cpv_chunks_from_db,
     build_cpv_notice_example_chunks_from_db,
     build_parent_lookup,
     load_cpv_catalog_from_ted_corpus_export,
-    load_cpv_catalog,
     load_cpv_catalog_from_db,
     load_queries,
-    merge_cpv_catalogs,
     sync_cpv_profiles_to_db,
 )
 from rag_eval.classifiers.cpv_kg import (
-    ancestor_codes,
     build_cpv_knowledge_graph,
     code_level,
     cpv_kg_metrics,
-    cpv_prefix_code,
     export_cpv_kg_for_neo4j,
     graph_expand_cpv_pool,
     normalize_cpv_code,
@@ -68,7 +63,6 @@ from rag_eval.evaluation.llm import judge_cpv_candidates_with_llm
 from rag_eval.retrieval.query_enrichment import (
     enrich_procurement_query,
     extract_procurement_object,
-    procurement_type_bias,
 )
 from rag_eval.data.ted_data import load_ted_corpus_export_notices, normalize_ted_notice_record
 from rag_eval.data.ted_notice_store import open_ted_notice_db, upsert_ted_notices
@@ -261,230 +255,16 @@ def _extract_procurement_object(query_text: str) -> Dict[str, object]:
     return extract_procurement_object(query_text)
 
 
-def _coarse_procurement_bucket(candidate_procurement_type: str) -> str:
-    normalized = _normalize_free_text(candidate_procurement_type)
-    if any(token in normalized for token in ["service", "consultancy", "software", "maintenance", "repair", "database"]):
-        return "services"
-    if any(token in normalized for token in ["works", "construction", "installation"]):
-        return "works"
-    return "goods"
+def _score_value(row: Dict[str, object], *, key: str = "score") -> float:
+    return float(row.get(key) or 0.0)
 
 
-def _contract_type_feature_summary(query_types: Sequence[str], candidate_types: Sequence[str]) -> tuple[float, float]:
-    query_set = set(query_types)
-    candidate_set = set(candidate_types)
-    overlap = len(query_set & candidate_set)
-    conflict = 1.0 if query_set and candidate_set and not (query_set & candidate_set) else 0.0
-    return float(overlap), conflict
+def _sort_rows_by_score(rows: Sequence[Dict[str, object]], *, key: str = "score") -> List[Dict[str, object]]:
+    return sorted(rows, key=lambda item: _score_value(item, key=key), reverse=True)
 
 
-def _apply_procurement_type_rerank(
-    rows: List[Dict[str, object]],
-    *,
-    primary_selection_bias: str,
-    service_component: bool,
-) -> List[Dict[str, object]]:
-    if not rows or not primary_selection_bias:
-        return rows
-    reranked: List[Dict[str, object]] = []
-    for row in rows:
-        updated = dict(row)
-        bonus = procurement_type_bias(
-            primary_selection_bias=primary_selection_bias,
-            service_component=service_component,
-            candidate_procurement_type=str(updated.get("procurement_type") or ""),
-        )
-        updated["procurement_type_bias"] = bonus
-        updated["score_before_procurement_type"] = float(updated.get("score") or 0.0)
-        updated["score"] = float(updated["score_before_procurement_type"]) + bonus
-        if abs(bonus) > 1e-12:
-            updated["reranker"] = "procurement_type"
-        reranked.append(updated)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return reranked
-
-
-def _infer_contract_types(text: str) -> List[str]:
-    normalized = _normalize_free_text(text)
-    types: List[str] = []
-    for contract_type, patterns in _CONTRACT_TYPE_PATTERNS.items():
-        if any(pattern in normalized for pattern in patterns):
-            types.append(contract_type)
-    return types
-
-
-def _contract_type_bonus(query_types: List[str], candidate_types: List[str]) -> float:
-    if not query_types:
-        return 0.0
-    query_set = set(query_types)
-    candidate_set = set(candidate_types)
-    specific_types = {"maintenance_repair", "installation_work", "consultancy", "security_service", "software_it_service"}
-    penalties = {
-        frozenset({"maintenance_repair", "installation_work"}): -0.14,
-        frozenset({"maintenance_repair", "supply"}): -0.10,
-        frozenset({"installation_work", "consultancy"}): -0.08,
-        frozenset({"supply", "consultancy"}): -0.08,
-        frozenset({"security_service", "supply"}): -0.10,
-    }
-    for query_type in query_set:
-        for candidate_type in candidate_set:
-            penalty = penalties.get(frozenset({query_type, candidate_type}))
-            if penalty is not None:
-                return penalty
-    specific_overlap = (query_set & specific_types) & (candidate_set & specific_types)
-    if specific_overlap:
-        return 0.18
-    if query_set & candidate_set:
-        return 0.06
-    if "maintenance_repair" in query_set and "maintenance_repair" not in candidate_set:
-        return -0.12
-    if "installation_work" in query_set and "installation_work" not in candidate_set:
-        return -0.10
-    if "consultancy" in query_set and "consultancy" not in candidate_set:
-        return -0.08
-    return -0.04 if candidate_set else 0.0
-
-
-def _apply_contract_type_rerank(rows: List[Dict[str, object]], query_text: str) -> List[Dict[str, object]]:
-    if not rows:
-        return []
-    query_types = _infer_contract_types(query_text)
-    reranked: List[Dict[str, object]] = []
-    for row in rows:
-        updated = dict(row)
-        candidate_text = " ".join(
-            str(updated.get(key) or "")
-            for key in ["cpv_label", "title", "text", "description_en", "keywords_en", "cpv_parent_label"]
-        )
-        candidate_types = _infer_contract_types(candidate_text)
-        bonus = _contract_type_bonus(query_types, candidate_types)
-        updated["query_contract_types"] = ",".join(query_types)
-        updated["candidate_contract_types"] = ",".join(candidate_types)
-        updated["contract_type_bonus"] = bonus
-        updated["score_before_contract_type"] = float(updated.get("score") or 0.0)
-        updated["score"] = float(updated["score_before_contract_type"]) + bonus
-        if abs(bonus) > 1e-12:
-            updated["reranker"] = "contract_type"
-        reranked.append(updated)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return reranked
-
-
-def _apply_kg_decision_fusion(
-    rows: List[Dict[str, object]],
-    *,
-    graph,
-    query_text: str,
-    graph_weight: float,
-) -> List[Dict[str, object]]:
-    if not rows or graph is None:
-        return []
-    working = [dict(row) for row in rows]
-    score_norm = min_max_normalize([float(row.get("score") or 0.0) for row in working])
-    lexical_norm = min_max_normalize(
-        [
-            lexical_overlap_score(
-                query_text,
-                "\n".join(
-                    part
-                    for part in [
-                        str(row.get("cpv_label") or ""),
-                        str(row.get("text") or ""),
-                        str(row.get("cpv_parent_label") or ""),
-                    ]
-                    if part.strip()
-                ),
-            )
-            for row in working
-        ]
-    )
-    top_window = working[: min(6, len(working))]
-    dominant_prefixes: Dict[int, str] = {}
-    for prefix_len in (6, 4):
-        prefix_scores: Dict[str, float] = {}
-        prefix_counts: Dict[str, int] = {}
-        for row, norm_score in zip(top_window, score_norm[: len(top_window)]):
-            code = normalize_cpv_code(str(row.get("cpv_code") or ""))
-            if not code:
-                continue
-            prefix = code[:prefix_len]
-            prefix_scores[prefix] = prefix_scores.get(prefix, 0.0) + float(norm_score)
-            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + 1
-        if not prefix_scores:
-            continue
-        best_prefix, best_weight = max(prefix_scores.items(), key=lambda item: item[1])
-        if prefix_counts.get(best_prefix, 0) >= 2 and best_weight >= 0.7:
-            dominant_prefixes[prefix_len] = best_prefix
-
-    top_codes = {normalize_cpv_code(str(row.get("cpv_code") or "")) for row in top_window}
-    top_codes.discard("")
-    score_norm_by_code = {
-        normalize_cpv_code(str(row.get("cpv_code") or "")): float(norm)
-        for row, norm in zip(working, score_norm)
-        if normalize_cpv_code(str(row.get("cpv_code") or ""))
-    }
-    lexical_norm_by_code = {
-        normalize_cpv_code(str(row.get("cpv_code") or "")): float(norm)
-        for row, norm in zip(working, lexical_norm)
-        if normalize_cpv_code(str(row.get("cpv_code") or ""))
-    }
-    sibling_counts: Dict[str, int] = {}
-    for code in top_codes:
-        parent = graph.parent_lookup.get(code, "")
-        if not parent:
-            continue
-        sibling_counts[code] = sum(
-            1
-            for other in top_codes
-            if other != code and graph.parent_lookup.get(other, "") == parent
-        )
-
-    scale = max(0.02, min(0.08, 0.18 * float(graph_weight or 0.0)))
-    reranked: List[Dict[str, object]] = []
-    for row, norm_score, lex_score in zip(working, score_norm, lexical_norm):
-        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
-        if not code:
-            reranked.append(row)
-            continue
-        branch_bonus = 0.0
-        if 6 in dominant_prefixes and code.startswith(dominant_prefixes[6]):
-            branch_bonus += 0.50 * scale
-        elif 4 in dominant_prefixes and code.startswith(dominant_prefixes[4]):
-            branch_bonus += 0.28 * scale
-
-        sibling_bonus = min(0.35 * scale, 0.12 * scale * sibling_counts.get(code, 0))
-
-        specificity_bonus = 0.0
-        specificity_penalty = 0.0
-        parent = graph.parent_lookup.get(code, "")
-        if parent and parent in top_codes:
-            parent_score = score_norm_by_code.get(parent, 0.0)
-            parent_lex = lexical_norm_by_code.get(parent, 0.0)
-            if float(norm_score) >= parent_score - 0.08 and float(lex_score) >= parent_lex - 0.05:
-                specificity_bonus += 0.55 * scale
-
-        child_codes_in_top = [child for child in graph.children_lookup.get(code, []) if child in top_codes]
-        if child_codes_in_top:
-            best_child_score = max(score_norm_by_code.get(child, 0.0) for child in child_codes_in_top)
-            best_child_lex = max(lexical_norm_by_code.get(child, 0.0) for child in child_codes_in_top)
-            if best_child_score >= float(norm_score) - 0.05 and best_child_lex >= float(lex_score) - 0.04:
-                specificity_penalty -= 0.55 * scale
-
-        path_codes = set(ancestor_codes(code, graph.parent_lookup, include_self=True))
-        shared_path_hits = sum(1 for other in top_codes if other != code and other in path_codes)
-        path_bonus = min(0.20 * scale, 0.07 * scale * shared_path_hits) if shared_path_hits else 0.0
-
-        total_bonus = branch_bonus + sibling_bonus + specificity_bonus + specificity_penalty + path_bonus
-        row["kg_decision_bonus"] = total_bonus
-        row["kg_decision_branch_bonus"] = branch_bonus
-        row["kg_decision_sibling_bonus"] = sibling_bonus
-        row["kg_decision_specificity_bonus"] = specificity_bonus + specificity_penalty
-        row["kg_decision_path_bonus"] = path_bonus
-        row["kg_decision_code_level"] = code_level(code)
-        row["score"] = float(row.get("score") or 0.0) + total_bonus
-        reranked.append(row)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return reranked
+def _row_cpv_code(row: Dict[str, object], *, key: str = "cpv_code") -> str:
+    return normalize_cpv_code(str(row.get(key) or ""))
 
 
 def _apply_object_focus_rerank(
@@ -529,8 +309,7 @@ def _apply_object_focus_rerank(
         updated["object_focus_bonus"] = focus_bonus
         updated["score"] = float(updated["score_before_object_focus"]) + focus_bonus
         reranked.append(updated)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return reranked
+    return _sort_rows_by_score(reranked)
 
 
 def _compact_hint_text(value: str, *, max_tokens: int = 6) -> str:
@@ -1140,32 +919,6 @@ def _rank_prepared_candidates(candidates: List[Dict[str, object]]) -> List[Dict[
     )
 
 
-def _dedupe_ranked_candidates(candidates: List[Dict[str, object]]) -> List[Dict[str, object]]:
-    best_by_label: Dict[str, Dict[str, object]] = {}
-    for candidate in candidates:
-        label = str(candidate.get("label") or "").strip()
-        if not label:
-            continue
-        existing = best_by_label.get(label)
-        if existing is None:
-            best_by_label[label] = candidate
-            continue
-        candidate_rank = int(candidate.get("rank") or 999999)
-        existing_rank = int(existing.get("rank") or 999999)
-        candidate_score = float(candidate.get("score") or 0.0)
-        existing_score = float(existing.get("score") or 0.0)
-        if (candidate_rank, -candidate_score) < (existing_rank, -existing_score):
-            best_by_label[label] = candidate
-    return sorted(
-        best_by_label.values(),
-        key=lambda candidate: (
-            int(candidate.get("rank") or 999999),
-            -float(candidate.get("score") or 0.0),
-            int(candidate.get("source_row_index") or 0),
-        ),
-    )
-
-
 def _prepared_candidate_row(
     *,
     query_id: str,
@@ -1296,6 +1049,9 @@ CPV_IRRELEVANT_COLUMNS = [
     "recommended_action",
     "recommendation_reason",
     "recommended_experiment",
+    "recommended_tactic",
+    "recommended_tactic_reason",
+    "recommended_expected_metric_movement",
     "needs_manual_review",
 ]
 
@@ -1319,6 +1075,9 @@ def _clean_cpv_rows(rows: List[Dict[str, object]], *, keep_recommendations: bool
             "recommended_action",
             "recommendation_reason",
             "recommended_experiment",
+            "recommended_tactic",
+            "recommended_tactic_reason",
+            "recommended_expected_metric_movement",
             "needs_manual_review",
         }
     return [
@@ -1386,6 +1145,9 @@ def _standardize_rag_results_columns(df):
         "recommended_action",
         "recommendation_reason",
         "recommended_experiment",
+        "recommended_tactic",
+        "recommended_tactic_reason",
+        "recommended_expected_metric_movement",
         "needs_manual_review",
     ]
     leading = [column for column in leading_columns if column in df.columns]
@@ -2293,6 +2055,32 @@ def _sample_negative_codes(
     return selected[:max_negatives]
 
 
+def _hierarchy_negative_weight(
+    *,
+    gold_code: str,
+    negative_code: str,
+    graph,
+) -> float:
+    gold = normalize_cpv_code(gold_code)
+    negative = normalize_cpv_code(negative_code)
+    if not gold or not negative or gold == negative:
+        return 1.0
+    prefix_len = cpv_common_prefix_length(gold, negative)
+    weight = 1.0
+    if prefix_len >= 6:
+        weight = 4.0
+    elif prefix_len >= 4:
+        weight = 3.0
+    elif prefix_len >= 2:
+        weight = 2.0
+    if graph is not None:
+        gold_parent = graph.parent_lookup.get(gold, "")
+        negative_parent = graph.parent_lookup.get(negative, "")
+        if gold_parent and gold_parent == negative_parent:
+            weight = max(weight, 4.5)
+    return weight
+
+
 def _fit_cpv_label_scorer(
     *,
     ted_corpus_export_path: str,
@@ -2310,7 +2098,7 @@ def _fit_cpv_label_scorer(
         for notice in load_ted_corpus_export_notices(ted_corpus_export_path)
     ]
     rng = random.Random(0)
-    training_rows: List[tuple[Dict[str, float], int]] = []
+    training_rows: List[tuple[Dict[str, float], int, float]] = []
     all_codes = list(chunks_by_code.keys())
     for notice in notices:
         publication_number = str(notice.get("publication_number") or "").strip()
@@ -2334,7 +2122,7 @@ def _fit_cpv_label_scorer(
             row=positive_row,
             graph=graph,
         )
-        training_rows.append((positive_features, 1))
+        training_rows.append((positive_features, 1, 1.0))
         for negative_code in _sample_negative_codes(
             query_text=query_text,
             gold_code=gold_code,
@@ -2355,21 +2143,33 @@ def _fit_cpv_label_scorer(
                 row=negative_row,
                 graph=graph,
             )
-            training_rows.append((negative_features, 0))
+            training_rows.append(
+                (
+                    negative_features,
+                    0,
+                    _hierarchy_negative_weight(
+                        gold_code=gold_code,
+                        negative_code=negative_code,
+                        graph=graph,
+                    ),
+                )
+            )
     if len(training_rows) < 100:
         return None
     feature_names = sorted(training_rows[0][0].keys())
-    X = [[float(features.get(name, 0.0)) for name in feature_names] for features, _ in training_rows]
-    y = [label for _, label in training_rows]
+    X = [[float(features.get(name, 0.0)) for name in feature_names] for features, _, _ in training_rows]
+    y = [label for _, label, _ in training_rows]
+    sample_weights = [weight for _, _, weight in training_rows]
     model = Pipeline(
         [
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=0)),
         ]
     )
-    model.fit(X, y)
+    model.fit(X, y, clf__sample_weight=sample_weights)
     positives = sum(1 for label in y if label == 1)
     negatives = len(y) - positives
+    hard_negative_pairs = sum(1 for _, label, weight in training_rows if label == 0 and weight > 1.0)
     return CPVLabelScorer(
         model=model,
         feature_names=feature_names,
@@ -2378,8 +2178,9 @@ def _fit_cpv_label_scorer(
             "n_pairs": len(y),
             "n_positive_pairs": positives,
             "n_negative_pairs": negatives,
+            "n_hierarchy_hard_negative_pairs": hard_negative_pairs,
             "n_notices_used": positives,
-            "negative_sampling": "hierarchy_plus_confusion_hard_negatives",
+            "negative_sampling": "weighted_hierarchy_plus_confusion_hard_negatives",
             "feature_names": feature_names,
         },
     )
@@ -2435,8 +2236,7 @@ def _apply_learned_cpv_label_scorer(
         updated["candidate_contract_types"] = ""
         updated["reranker"] = "learned_label_scorer"
         rescored.append(updated)
-    rescored.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return rescored
+    return _sort_rows_by_score(rescored)
 
 
 def _apply_primary_pair_scorer(
@@ -2517,9 +2317,7 @@ def _apply_primary_pair_scorer(
         for row in tail_rescored:
             row["pair_scorer_model"] = ce_model_name
             row["pair_scorer_backend"] = "fallback_logistic"
-        enriched.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-        tail_rescored.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-        return enriched + tail_rescored
+        return _sort_rows_by_score(enriched) + _sort_rows_by_score(tail_rescored)
     except Exception:
         fallback_rows = _apply_learned_cpv_label_scorer(
             rows,
@@ -2544,8 +2342,8 @@ def _scorer_only_benchmark_row(
     retrieval_rows: Sequence[Dict[str, object]],
     scorer_rows: Sequence[Dict[str, object]],
 ) -> Dict[str, object]:
-    retrieval_codes = [normalize_cpv_code(str(row.get("cpv_code") or "")) for row in retrieval_rows]
-    scorer_codes = [normalize_cpv_code(str(row.get("cpv_code") or "")) for row in scorer_rows]
+    retrieval_codes = [_row_cpv_code(row) for row in retrieval_rows]
+    scorer_codes = [_row_cpv_code(row) for row in scorer_rows]
     retrieval_codes = [code for code in retrieval_codes if code]
     scorer_codes = [code for code in scorer_codes if code]
     gold = normalize_cpv_code(gold_code)
@@ -2583,7 +2381,7 @@ def _select_hierarchical_candidates_by_learned_score(
     for width in (2, 4, 6):
         prefix_rows: Dict[str, List[Dict[str, object]]] = defaultdict(list)
         for row in current:
-            code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+            code = _row_cpv_code(row)
             if not code:
                 continue
             prefix_rows[code[:width]].append(row)
@@ -2602,7 +2400,7 @@ def _select_hierarchical_candidates_by_learned_score(
         prefixes = [prefix for prefix, _ in scored_prefixes[: LEARNED_HIERARCHY_BEAM_WIDTHS[width]]]
         prefix_score_map = dict(scored_prefixes)
         for row in current:
-            code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+            code = _row_cpv_code(row)
             if not code:
                 continue
             row[f"hierarchy_stage_{width}_score"] = float(prefix_score_map.get(code[:width], 0.0))
@@ -2632,6 +2430,92 @@ def _select_hierarchical_candidates_by_learned_score(
         reverse=True,
     )
     return current[: min(top_k, len(current))], meta
+
+
+def _apply_local_branch_decision(
+    rows: List[Dict[str, object]],
+    *,
+    graph,
+    query_text: str,
+    object_query: str,
+    translated_query: str,
+    procurement_action: str,
+    primary_selection_bias: str,
+    cross_encoder_model: str | None,
+    fallback_scorer: CPVLabelScorer | None,
+    top_k: int,
+) -> tuple[List[Dict[str, object]], Dict[str, object]]:
+    meta: Dict[str, object] = {
+        "local_branch_decision_enabled": False,
+        "local_branch_prefix": "",
+        "local_branch_width": 0,
+        "local_branch_candidate_count": 0,
+    }
+    if not rows or graph is None:
+        return rows, meta
+    ordered = [dict(row) for row in rows]
+    branch_prefix = ""
+    branch_width = 0
+    branch_rows: List[Dict[str, object]] = []
+    for width in (6, 4, 2):
+        prefix = _dominant_branch_prefix(ordered[: min(len(ordered), max(top_k, 8))], width_candidates=[width])
+        if not prefix:
+            continue
+        candidates = [
+            dict(row)
+            for row in ordered
+            if _row_cpv_code(row).startswith(prefix)
+        ]
+        if len(candidates) >= 2:
+            branch_prefix = prefix
+            branch_width = width
+            branch_rows = candidates
+            break
+    if not branch_rows:
+        return rows, meta
+    rescored_branch = _apply_primary_pair_scorer(
+        branch_rows,
+        query_text=query_text,
+        object_query=object_query,
+        translated_query=translated_query,
+        procurement_action=procurement_action,
+        primary_selection_bias=primary_selection_bias,
+        graph=graph,
+        cross_encoder_model=cross_encoder_model,
+        fallback_scorer=fallback_scorer,
+        pair_top_n=len(branch_rows),
+    )
+    local_norm_scores = min_max_normalize([float(row.get("score") or 0.0) for row in rescored_branch])
+    local_bonus_by_code: Dict[str, float] = {}
+    for rank_index, (row, local_norm) in enumerate(zip(rescored_branch, local_norm_scores), start=1):
+        code = _row_cpv_code(row)
+        if not code:
+            continue
+        rank_bonus = max(0.0, 0.08 - (0.01 * (rank_index - 1)))
+        local_bonus_by_code[code] = 0.08 * float(local_norm) + rank_bonus
+    merged: List[Dict[str, object]] = []
+    for row in ordered:
+        updated = dict(row)
+        code = _row_cpv_code(updated)
+        local_bonus = float(local_bonus_by_code.get(code, 0.0))
+        updated["local_branch_prefix"] = branch_prefix
+        updated["local_branch_width"] = branch_width
+        updated["local_branch_decision_bonus"] = local_bonus
+        updated["score_before_local_branch_decision"] = float(updated.get("score") or 0.0)
+        updated["score"] = float(updated["score_before_local_branch_decision"]) + local_bonus
+        if local_bonus > 0.0:
+            updated["reranker"] = "local_branch_decision"
+        merged.append(updated)
+    merged = _sort_rows_by_score(merged)
+    meta.update(
+        {
+            "local_branch_decision_enabled": True,
+            "local_branch_prefix": branch_prefix,
+            "local_branch_width": branch_width,
+            "local_branch_candidate_count": len(branch_rows),
+        }
+    )
+    return merged[: min(len(merged), max(top_k, len(branch_rows)))], meta
 
 
 def _apply_zero_shot_label_scorer(
@@ -2725,10 +2609,8 @@ def _apply_zero_shot_label_scorer(
         row["score"] = float(row["score_before_zero_shot_label"]) + zero_shot_score
         row["reranker"] = "zero_shot_label"
         rescored.append(row)
-    rescored.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    combined = rescored + tail
-    combined.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return combined
+    combined = _sort_rows_by_score(rescored) + tail
+    return _sort_rows_by_score(combined)
 
 
 def _apply_canonical_profile_rerank(
@@ -2773,8 +2655,7 @@ def _apply_canonical_profile_rerank(
         if abs(canonical_bonus) > 1e-12:
             row["reranker"] = "canonical_profile"
         reranked.append(row)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return reranked
+    return _sort_rows_by_score(reranked)
 
 
 def _dominant_branch_prefix(rows: List[Dict[str, object]], *, width_candidates: List[int] | None = None) -> str:
@@ -2787,7 +2668,7 @@ def _dominant_branch_prefix(rows: List[Dict[str, object]], *, width_candidates: 
         prefix_weights: Dict[str, float] = {}
         prefix_counts: Dict[str, int] = {}
         for row, norm in zip(head, norm_scores):
-            code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+            code = _row_cpv_code(row)
             if not code:
                 continue
             prefix = code[:width]
@@ -2812,13 +2693,13 @@ def _apply_specificity_bias(
         return rows
     working = [dict(row) for row in rows]
     by_code = {
-        normalize_cpv_code(str(row.get("cpv_code") or "")): row
+        _row_cpv_code(row): row
         for row in working
-        if normalize_cpv_code(str(row.get("cpv_code") or ""))
+        if _row_cpv_code(row)
     }
     reranked: List[Dict[str, object]] = []
     for row in working:
-        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
+        code = _row_cpv_code(row)
         if not code:
             reranked.append(row)
             continue
@@ -2858,8 +2739,7 @@ def _apply_specificity_bias(
         if abs(specific_bonus + broad_penalty) > 1e-12:
             row["reranker"] = "specificity_bias"
         reranked.append(row)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return reranked
+    return _sort_rows_by_score(reranked)
 
 
 def _apply_branch_local_selector(
@@ -2877,7 +2757,7 @@ def _apply_branch_local_selector(
     reranked: List[Dict[str, object]] = []
     for row in rows:
         updated = dict(row)
-        code = normalize_cpv_code(str(updated.get("cpv_code") or ""))
+        code = _row_cpv_code(updated)
         if not code:
             reranked.append(updated)
             continue
@@ -2900,303 +2780,7 @@ def _apply_branch_local_selector(
         if abs(branch_bonus) > 1e-12:
             updated["reranker"] = "branch_local_selector"
         reranked.append(updated)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return reranked
-
-
-def _preserve_branch_candidates_before_final_selector(
-    rows: List[Dict[str, object]],
-    *,
-    shortlist_n: int = 12,
-    min_branch_candidates: int = 4,
-) -> List[Dict[str, object]]:
-    if not rows:
-        return rows
-    head = [dict(row) for row in rows[: min(shortlist_n, len(rows))]]
-    tail = [dict(row) for row in rows[min(shortlist_n, len(rows)) :]]
-    dominant_prefix = _dominant_branch_prefix(head, width_candidates=[6, 4])
-    if not dominant_prefix:
-        return rows
-    head_branch = [row for row in head if normalize_cpv_code(str(row.get("cpv_code") or "")).startswith(dominant_prefix)]
-    if len(head_branch) >= min_branch_candidates:
-        return rows
-    rescued: List[Dict[str, object]] = []
-    for row in tail:
-        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
-        if code.startswith(dominant_prefix):
-            rescued.append(dict(row))
-        if len(head_branch) + len(rescued) >= min_branch_candidates:
-            break
-    if not rescued:
-        return rows
-    merged_head = head + rescued
-    deduped: List[Dict[str, object]] = []
-    seen_codes: set[str] = set()
-    for row in merged_head:
-        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
-        if code and code in seen_codes:
-            continue
-        if code:
-            seen_codes.add(code)
-        updated = dict(row)
-        if code.startswith(dominant_prefix):
-            updated["branch_preserved_for_final_selector"] = True
-        deduped.append(updated)
-    deduped.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    new_head = deduped[: min(shortlist_n, len(deduped))]
-    head_codes = {
-        normalize_cpv_code(str(row.get("cpv_code") or ""))
-        for row in new_head
-        if normalize_cpv_code(str(row.get("cpv_code") or ""))
-    }
-    new_tail = [
-        dict(row)
-        for row in rows
-        if normalize_cpv_code(str(row.get("cpv_code") or "")) not in head_codes
-    ]
-    return new_head + new_tail
-
-
-def _apply_canonical_only_shortlist_selector(
-    rows: List[Dict[str, object]],
-    *,
-    graph,
-    query_text: str,
-    object_query: str,
-    translated_query: str,
-    shortlist_n: int = 8,
-) -> List[Dict[str, object]]:
-    if not rows:
-        return rows
-    head = [dict(row) for row in rows[: min(shortlist_n, len(rows))]]
-    tail = [dict(row) for row in rows[min(shortlist_n, len(rows)) :]]
-    dominant_prefix = _dominant_branch_prefix(head)
-    head_norm = min_max_normalize([float(row.get("score") or 0.0) for row in head])
-    rescored: List[Dict[str, object]] = []
-    for row, prior_norm in zip(head, head_norm):
-        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
-        canonical_text = _canonical_signal_text(row)
-        canonical_overlap = max(
-            lexical_overlap_score(query_text, canonical_text),
-            lexical_overlap_score(translated_query, canonical_text),
-            lexical_overlap_score(object_query, canonical_text),
-        )
-        use_when_overlap = lexical_overlap_score(query_text, str(row.get("use_when_text") or ""))
-        avoid_penalty = lexical_overlap_score(query_text, str(row.get("do_not_use_when_text") or ""))
-        branch_bonus = 0.04 if (dominant_prefix and code.startswith(dominant_prefix)) else 0.0
-        specificity_bonus = 0.03 if code and code_level(code) >= 8 else 0.0
-        selector_score = (
-            0.52 * canonical_overlap
-            + 0.16 * use_when_overlap
-            + 0.12 * float(prior_norm)
-            + branch_bonus
-            + specificity_bonus
-            - (0.18 * avoid_penalty)
-        )
-        row["canonical_only_selector_score"] = selector_score
-        row["canonical_only_selector_branch_bonus"] = branch_bonus
-        row["canonical_only_selector_specificity_bonus"] = specificity_bonus
-        row["score_before_canonical_only_selector"] = float(row.get("score") or 0.0)
-        row["score"] = float(row["score_before_canonical_only_selector"]) + selector_score
-        row["canonical_only_selector_dominant_branch"] = dominant_prefix
-        row["reranker"] = "canonical_only_selector"
-        rescored.append(row)
-    rescored.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    combined = rescored + tail
-    combined.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return combined
-
-
-def _apply_shortlist_final_selector(
-    rows: List[Dict[str, object]],
-    *,
-    graph,
-    query_text: str,
-    object_query: str,
-    translated_query: str,
-    procurement_action: str,
-    primary_selection_bias: str,
-    service_component: bool,
-    shortlist_n: int = 5,
-) -> List[Dict[str, object]]:
-    if not rows:
-        return rows
-    head = [dict(row) for row in rows[: min(shortlist_n, len(rows))]]
-    tail = [dict(row) for row in rows[min(shortlist_n, len(rows)) :]]
-    dominant_prefix = _dominant_branch_prefix(head, width_candidates=[6, 4, 2])
-    prior_norm = min_max_normalize([float(row.get("score") or 0.0) for row in head])
-    by_code = {
-        normalize_cpv_code(str(row.get("cpv_code") or "")): row
-        for row in head
-        if normalize_cpv_code(str(row.get("cpv_code") or ""))
-    }
-    selector_rows: List[Dict[str, object]] = []
-    winner_code = ""
-    winner_score = float("-inf")
-    for row, prior_score in zip(head, prior_norm):
-        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
-        canonical_text = _canonical_signal_text(row)
-        canonical_overlap = max(
-            lexical_overlap_score(query_text, canonical_text),
-            lexical_overlap_score(object_query, canonical_text),
-            lexical_overlap_score(translated_query, canonical_text),
-        )
-        use_when_overlap = max(
-            lexical_overlap_score(query_text, str(row.get("use_when_text") or "")),
-            lexical_overlap_score(object_query, str(row.get("use_when_text") or "")),
-        )
-        avoid_penalty = max(
-            lexical_overlap_score(query_text, str(row.get("do_not_use_when_text") or "")),
-            lexical_overlap_score(object_query, str(row.get("do_not_use_when_text") or "")),
-        )
-        action_overlap = lexical_overlap_score(procurement_action, canonical_text) if procurement_action else 0.0
-        candidate_procurement_type = str(row.get("procurement_type") or "")
-        procurement_bias_bonus = procurement_type_bias(
-            primary_selection_bias=primary_selection_bias,
-            service_component=service_component,
-            candidate_procurement_type=candidate_procurement_type,
-        ) if primary_selection_bias else 0.0
-        candidate_text = " ".join(
-            str(row.get(key) or "")
-            for key in ["cpv_label", "title", "text", "description_en", "keywords_en", "cpv_parent_label"]
-        )
-        query_types = _infer_contract_types(f"{object_query} {procurement_action}".strip() or query_text)
-        candidate_types = _infer_contract_types(candidate_text)
-        structured_contract_bonus = _contract_type_bonus(query_types, candidate_types)
-        example_dominance_penalty = max(
-            0.0,
-            float(row.get("example_overlap_score") or 0.0) - float(row.get("canonical_overlap_score") or 0.0) - 0.10,
-        )
-        branch_bonus = 0.07 if (dominant_prefix and code.startswith(dominant_prefix)) else 0.0
-        specificity_bonus = 0.06 if code and code_level(code) >= 8 else 0.02 if code and code_level(code) >= 6 else 0.0
-        parent_penalty = 0.0
-        if graph is not None and code:
-            child_codes = [child for child in graph.children_lookup.get(code, []) if child in by_code]
-            if child_codes:
-                best_child_overlap = max(
-                    max(
-                        lexical_overlap_score(query_text, _canonical_signal_text(by_code[child])),
-                        lexical_overlap_score(object_query, _canonical_signal_text(by_code[child])),
-                        lexical_overlap_score(translated_query, _canonical_signal_text(by_code[child])),
-                    )
-                    for child in child_codes
-                )
-                if best_child_overlap >= canonical_overlap - 0.02:
-                    parent_penalty -= 0.10
-        selector_score = (
-            0.18 * float(prior_score)
-            + 0.18 * canonical_overlap
-            + 0.07 * use_when_overlap
-            + 0.04 * action_overlap
-            + (0.45 * procurement_bias_bonus)
-            + (0.35 * structured_contract_bonus)
-            + (0.60 * branch_bonus)
-            + (0.60 * specificity_bonus)
-            - (0.10 * avoid_penalty)
-            - (0.06 * example_dominance_penalty)
-            + (0.60 * parent_penalty)
-        )
-        row["shortlist_final_selector_score"] = selector_score
-        row["shortlist_final_selector_branch_bonus"] = branch_bonus
-        row["shortlist_final_selector_specificity_bonus"] = specificity_bonus
-        row["shortlist_final_selector_parent_penalty"] = parent_penalty
-        row["shortlist_final_selector_example_penalty"] = example_dominance_penalty
-        row["shortlist_final_selector_procurement_bias_bonus"] = procurement_bias_bonus
-        row["shortlist_final_selector_contract_type_bonus"] = structured_contract_bonus
-        selector_rows.append(row)
-        if selector_score > winner_score:
-            winner_score = selector_score
-            winner_code = code
-
-    rescored: List[Dict[str, object]] = []
-    for row in selector_rows:
-        code = normalize_cpv_code(str(row.get("cpv_code") or ""))
-        winner_boost = 0.10 if winner_code and code == winner_code else 0.0
-        selector_bonus = float(row.get("shortlist_final_selector_score") or 0.0) + winner_boost
-        row["shortlist_final_selector_selected"] = 1 if winner_code and code == winner_code else 0
-        row["shortlist_final_selector_bonus"] = selector_bonus
-        row["score_before_shortlist_final_selector"] = float(row.get("score") or 0.0)
-        row["score"] = float(row["score_before_shortlist_final_selector"]) + selector_bonus
-        row["shortlist_final_selector_dominant_branch"] = dominant_prefix
-        if selector_bonus > 0.0:
-            row["reranker"] = "shortlist_final_selector"
-        rescored.append(row)
-
-    rescored.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    combined = rescored + tail
-    combined.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return combined
-
-
-def _apply_division_72_contrastive_selector(
-    rows: List[Dict[str, object]],
-    *,
-    query_text: str,
-    object_query: str,
-    translated_query: str,
-    shortlist_n: int = 8,
-) -> List[Dict[str, object]]:
-    if not rows:
-        return rows
-    head = [dict(row) for row in rows[: min(shortlist_n, len(rows))]]
-    tail = [dict(row) for row in rows[min(shortlist_n, len(rows)) :]]
-    division72_rows = [
-        row for row in head
-        if normalize_cpv_code(str(row.get("cpv_code") or "")).startswith("72")
-    ]
-    if len(division72_rows) < 2:
-        return rows
-
-    query_signals = f"{query_text} {object_query} {translated_query}".casefold()
-    dev_terms = ("software", "application", "development", "system", "platform", "evolution", "program", "digital")
-    support_terms = ("support", "maintenance", "hosting", "cloud", "server", "network", "infrastructure", "operation", "helpdesk")
-    data_terms = ("data", "database", "analytics", "information", "migration")
-    internet_terms = ("internet", "web", "portal", "online", "website", "communication")
-
-    overlap_by_code = {
-        normalize_cpv_code(str(row.get("cpv_code") or "")): max(
-            lexical_overlap_score(query_text, _canonical_signal_text(row)),
-            lexical_overlap_score(object_query, _canonical_signal_text(row)),
-            lexical_overlap_score(translated_query, _canonical_signal_text(row)),
-        )
-        for row in division72_rows
-    }
-
-    reranked: List[Dict[str, object]] = []
-    for row in head:
-        updated = dict(row)
-        code = normalize_cpv_code(str(updated.get("cpv_code") or ""))
-        bonus = 0.0
-        if code.startswith("72"):
-            if code == "72000000":
-                best_specific = max(
-                    (score for other_code, score in overlap_by_code.items() if other_code != "72000000"),
-                    default=0.0,
-                )
-                if best_specific >= overlap_by_code.get(code, 0.0) - 0.02:
-                    bonus -= 0.14
-            if code.startswith("722") and any(term in query_signals for term in dev_terms):
-                bonus += 0.10
-            if code.startswith(("725", "726")) and any(term in query_signals for term in support_terms):
-                bonus += 0.10
-            if code.startswith("723") and any(term in query_signals for term in data_terms):
-                bonus += 0.08
-            if code.startswith("724") and any(term in query_signals for term in internet_terms):
-                bonus += 0.08
-            if code_level(code) >= 8:
-                bonus += 0.03
-        elif any(term in query_signals for term in dev_terms + support_terms + data_terms + internet_terms):
-            bonus -= 0.03
-        updated["division_72_contrastive_bonus"] = bonus
-        updated["score_before_division_72_contrastive"] = float(updated.get("score") or 0.0)
-        updated["score"] = float(updated["score_before_division_72_contrastive"]) + bonus
-        if abs(bonus) > 1e-12:
-            updated["reranker"] = "division_72_contrastive"
-        reranked.append(updated)
-    reranked.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    combined = reranked + tail
-    combined.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
-    return combined
+    return _sort_rows_by_score(reranked)
 
 
 def _sync_ted_notices_to_db_from_corpus_export(
@@ -3679,6 +3263,18 @@ def evaluate_local_ted_cpv_classifier(
             hierarchy_pool_rows,
             top_k=min(max(top_k, ce_top_n, llm_top_n, 16), len(hierarchy_pool_rows)),
         )
+        retrieved, local_branch_decision_meta = _apply_local_branch_decision(
+            retrieved,
+            graph=cpv_graph,
+            query_text=retrieval_query,
+            object_query=object_query,
+            translated_query=translated_query,
+            procurement_action=procurement_action,
+            primary_selection_bias=primary_selection_bias,
+            cross_encoder_model=resolved_cross_encoder_model,
+            fallback_scorer=label_scorer,
+            top_k=min(max(top_k, ce_top_n, llm_top_n, 16), len(retrieved)),
+        )
         scorer_benchmark_rows.append(
             _scorer_only_benchmark_row(
                 question_id=query.id,
@@ -3698,6 +3294,10 @@ def evaluate_local_ted_cpv_classifier(
                 "hierarchy_stage_group_prefixes": hierarchy_selection_meta.get("selected_group_prefixes", []),
                 "hierarchy_stage_class_prefixes": hierarchy_selection_meta.get("selected_class_prefixes", []),
                 "hierarchy_refinement_size": len(retrieved),
+                "local_branch_decision_enabled": bool(local_branch_decision_meta.get("local_branch_decision_enabled")),
+                "local_branch_prefix": local_branch_decision_meta.get("local_branch_prefix", ""),
+                "local_branch_width": local_branch_decision_meta.get("local_branch_width", 0),
+                "local_branch_candidate_count": local_branch_decision_meta.get("local_branch_candidate_count", 0),
             }
         )
 
@@ -4881,6 +4481,9 @@ def evaluate_prepared_rag_results_classifier(
         "recommended_action",
         "recommendation_reason",
         "recommended_experiment",
+        "recommended_tactic",
+        "recommended_tactic_reason",
+        "recommended_expected_metric_movement",
         "needs_manual_review",
     ]
     results_df = _drop_irrelevant_classifier_columns(
